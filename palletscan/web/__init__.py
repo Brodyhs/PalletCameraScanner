@@ -1,0 +1,1 @@
+"""PalletScan web subpackage."""

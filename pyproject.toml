@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "palletscan"
+version = "0.1.0"
+description = "Fixed-camera QR/Data Matrix pallet scanning pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "pyzbar>=0.1.9",
+    "pylibdmtx>=0.1.10",
+    "qrcode>=7.4",
+    "Pillow>=10",
+    "pydantic>=2.5",
+    "PyYAML>=6.0",
+    # pylibdmtx 0.1.10 imports distutils (removed in Python 3.12);
+    # setuptools provides the import shim.
+    "setuptools>=68",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.8",
+    "types-PyYAML",
+]
+
+[project.scripts]
+palletscan = "palletscan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["palletscan*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "acceptance: long-running end-to-end synthetic acceptance tests",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+ignore_missing_imports = true

@@ -1,0 +1,1 @@
+"""PalletScan events subpackage."""
