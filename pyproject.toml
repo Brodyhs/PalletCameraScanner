@@ -17,6 +17,8 @@ dependencies = [
     "Pillow>=10",
     "pydantic>=2.5",
     "PyYAML>=6.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
     # pylibdmtx 0.1.10 imports distutils (removed in Python 3.12);
     # setuptools provides the import shim.
     "setuptools>=68",
@@ -27,6 +29,9 @@ dev = [
     "pytest>=8.0",
     "mypy>=1.8",
     "types-PyYAML",
+    # soak harness RSS sampling only (tools/soak.py); the runtime package
+    # never imports it
+    "psutil>=5.9",
 ]
 
 [project.scripts]
@@ -39,6 +44,7 @@ include = ["palletscan*"]
 testpaths = ["tests"]
 markers = [
     "acceptance: long-running end-to-end synthetic acceptance tests",
+    "soak_short: ~3-minute soak variant (memory flatness, injected failures)",
 ]
 
 [tool.mypy]

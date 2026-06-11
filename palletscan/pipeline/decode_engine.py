@@ -21,6 +21,7 @@ share the motion segment — but the expensive variant fan-out stays off.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -112,11 +113,19 @@ def _variant_task(
 class DecodeEngine:
     """Stateless apart from instrumentation counters; one per pipeline."""
 
-    def __init__(self, cfg: DecodeConfig, executor: Executor) -> None:
+    def __init__(
+        self,
+        cfg: DecodeConfig,
+        executor: Executor,
+        observe_wall_ms: Callable[[float], None] | None = None,
+    ) -> None:
         self._cfg = cfg
         self._executor = executor
         self._pyzbar = PyzbarDecoder()
         self._dmtx = PylibdmtxDecoder()
+        # Metrics hook: per-frame decode wall time, *including* frames that
+        # decoded nothing (successful-only latency would flatter the p95).
+        self._observe_wall_ms = observe_wall_ms
         self.counters = _Counters()
 
     def _results(
@@ -220,5 +229,8 @@ class DecodeEngine:
                     fut.cancel()
         finally:
             ctx.frames_attempted += 1
-            if time.perf_counter() > deadline:
+            ended = time.perf_counter()
+            if ended > deadline:
                 self.counters.budget_overruns += 1
+            if self._observe_wall_ms is not None:
+                self._observe_wall_ms((ended - started) * 1000.0)

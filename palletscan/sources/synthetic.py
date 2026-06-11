@@ -1,9 +1,11 @@
 """SyntheticSource: generated pallet passes with ground truth.
 
-The whole scenario is planned at construction from a seeded RNG; per-pass
-parameters come from child generators (``SeedSequence.spawn``), so pass *i*
-is reproducible regardless of how frames are consumed, and the parameter
-plan is independent of frame size — only compositing geometry changes.
+Pass *i*'s parameters come from its own ``SeedSequence`` child (spawn key
+``(i + 2,)`` under the scenario seed), so it is reproducible regardless of
+how frames are consumed — and therefore plans can be *generated lazily*
+during iteration. Only the current and previous plan are alive at any
+moment (each holds a rendered patch, ~100 KB), which is what makes
+multi-thousand-pass soak runs memory-flat; eager planning would hold GBs.
 
 Decodability is controlled by two dimensionless ratios (see config):
 px/module and blur-in-modules. Pixel scale is derived per pass as
@@ -61,8 +63,11 @@ class SyntheticSource(FrameSource):
         # suits direct/unit-test construction.
         self._tail_s = tail_s
         self.truth: list[GroundTruthRecord] = []
+        # Children 0 and 1 seed the scene and noise streams; pass i uses
+        # child i+2, constructed on demand by spawn key (bit-identical to
+        # SeedSequence.spawn, without materializing a child per pass).
         master = np.random.SeedSequence(cfg.seed)
-        children = master.spawn(cfg.num_passes + 2)
+        children = master.spawn(2)
         scene_rng = np.random.Generator(np.random.PCG64(children[0]))
         self._noise_rng = np.random.Generator(np.random.PCG64(children[1]))
         # Static scene: frozen background texture and one lighting gradient
@@ -74,10 +79,11 @@ class SyntheticSource(FrameSource):
         self._background = render.lighting_gradient(
             np.clip(bg, 0, 255).astype(np.uint8), gradient_amp, gradient_dir
         )
-        self._plans = [
-            self._plan_pass(i, np.random.Generator(np.random.PCG64(children[i + 2])))
-            for i in range(cfg.num_passes)
-        ]
+
+    def _plan(self, i: int) -> _PassPlan:
+        """Plan pass ``i`` from its dedicated seed child (lazy, deterministic)."""
+        child = np.random.SeedSequence(self._cfg.seed, spawn_key=(i + 2,))
+        return self._plan_pass(i, np.random.Generator(np.random.PCG64(child)))
 
     @property
     def source_id(self) -> str:
@@ -210,12 +216,14 @@ class SyntheticSource(FrameSource):
     def frames(self) -> Iterator[Frame]:
         cfg = self._cfg
         idx = 0
-        for j, plan in enumerate(self._plans):
+        prev_plan: _PassPlan | None = None
+        for j in range(cfg.num_passes):
+            plan = self._plan(j)
             sigma = plan.params["noise_sigma"]
             # Idle gaps render with the *previous* pass's plan: the pole is
             # a static scene fixture, so it must not teleport mid-idle while
             # the prior segment is still counting quiet frames to close.
-            idle_plan = self._plans[j - 1] if j > 0 else plan
+            idle_plan = prev_plan if prev_plan is not None else plan
             for _ in range(plan.idle_frames_before):
                 yield self._emit(self._idle_frame(idle_plan), idx)
                 idx += 1
@@ -255,11 +263,12 @@ class SyntheticSource(FrameSource):
                     params=dict(plan.params),
                 )
             )
+            prev_plan = plan
         # Trailing idle so downstream segment close + post-roll can complete
         # before end-of-stream flush.
-        if self._plans:
+        if prev_plan is not None:
             for _ in range(round(self._tail_s * cfg.fps)):
-                yield self._emit(self._idle_frame(self._plans[-1]), idx)
+                yield self._emit(self._idle_frame(prev_plan), idx)
                 idx += 1
 
     def write_truth_jsonl(self, path: Path | str) -> None:
@@ -281,3 +290,29 @@ class SyntheticSource(FrameSource):
                     )
                     + "\n"
                 )
+
+
+_TRUTH_FIXED_KEYS = frozenset(
+    {"pass_id", "payload", "symbology", "first_frame", "last_frame"}
+)
+
+
+def load_truth_jsonl(path: Path | str) -> list[GroundTruthRecord]:
+    """Inverse of :meth:`SyntheticSource.write_truth_jsonl` (replay
+    reconciliation reads recorded truth back)."""
+    records: list[GroundTruthRecord] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        d = json.loads(line)
+        records.append(
+            GroundTruthRecord(
+                pass_id=d["pass_id"],
+                payload=d["payload"],
+                symbology=Symbology(d["symbology"]),
+                first_frame=d["first_frame"],
+                last_frame=d["last_frame"],
+                params={k: v for k, v in d.items() if k not in _TRUTH_FIXED_KEYS},
+            )
+        )
+    return records

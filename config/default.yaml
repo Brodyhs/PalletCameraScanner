@@ -2,7 +2,7 @@
 # synthetic-mode defaults. Unknown keys are rejected.
 
 source:
-  type: synthetic
+  type: synthetic   # synthetic | video
 
 synthetic:
   width: 1280
@@ -27,6 +27,12 @@ synthetic:
   idle_s_range: [0.3, 1.5]
   realtime: false
   payload_prefix: "PLT-"
+
+video:
+  path: ""               # clip to replay when source.type is video
+  fps_override: null     # set when the file's fps metadata is broken
+  speed: 1.0             # wall-clock pacing only: 1.0 as-if-live, >1 faster, 0 unpaced
+  loop: 1                # play count; 0 = loop forever (soak)
 
 motion:
   algorithm: framediff   # framediff | mog2
@@ -64,6 +70,22 @@ sinks:
   console: {enabled: true}
   jsonl: {enabled: true, path: data/events.jsonl}
   sqlite: {enabled: true, path: data/palletscan.db}
+  # Store-and-forward HTTP POST (offline-first). One event per POST, 2xx
+  # acks, at-least-once delivery — receivers dedupe on event_id. Start
+  # `python tools/echo_server.py` for a localhost test endpoint.
+  http:
+    enabled: false
+    url: "http://127.0.0.1:8808/events"
+    headers: {}            # e.g. {Authorization: "Bearer ..."}
+    timeout_s: 5.0
+    outbox_path: data/outbox.db
+    retry: {base_s: 1.0, cap_s: 60.0}
+    max_mb: 200.0          # outbox caps; oldest pruned first, counted+logged
+    max_age_days: 14.0
+
+metrics:
+  window_s: 60.0        # wall-clock window for the fps rate
+  latency_samples: 2048 # decode wall-time reservoir size
 
 logging:
   level: INFO

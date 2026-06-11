@@ -22,13 +22,16 @@ from dataclasses import dataclass, field
 from palletscan.config import AppConfig, ExecutorKind
 from palletscan.events.bus import EventBus
 from palletscan.events.evidence import EvidenceWriter
+from palletscan.events.http_sink import HttpSink
 from palletscan.events.sinks import ConsoleSink, JsonlSink, Sink, SqliteSink
+from palletscan.metrics import MetricsRegistry
 from palletscan.pipeline.decode_engine import DecodeEngine
 from palletscan.pipeline.motion_gate import MotionGate
 from palletscan.pipeline.pass_tracker import PassTracker
 from palletscan.pipeline.rolling_buffer import RollingFrameBuffer
 from palletscan.reliability.queues import SENTINEL, DroppingQueue
 from palletscan.sources.base import FrameSource
+from palletscan.sources.factory import create_source
 from palletscan.sources.synthetic import SyntheticSource
 from palletscan.types import (
     Event,
@@ -69,6 +72,7 @@ class RunSummary:
     sink_errors: int
     frame_errors: int = 0
     reconciliation: Reconciliation | None = None
+    metrics: dict | None = None
 
     @property
     def unaccounted(self) -> int:
@@ -84,6 +88,13 @@ class RunSummary:
         ]
         if self.frame_errors:
             lines.append(f"frame errors     : {self.frame_errors}")
+        if self.metrics is not None:
+            d = self.metrics["decode"]
+            if d["p50_ms"] is not None:
+                lines.append(
+                    f"decode wall time : p50 {d['p50_ms']:.1f} ms / "
+                    f"p95 {d['p95_ms']:.1f} ms ({d['samples']} samples)"
+                )
         if self.reconciliation is not None:
             r = self.reconciliation
             lines += [
@@ -132,15 +143,42 @@ def reconcile_truth(
 
 
 class _ListSink(Sink):
-    """In-memory sink used for run summaries and tests (capped)."""
+    """In-memory sink used for run summaries and tests (capped).
+
+    Overflow is counted, never silent: consumers doing exact accounting
+    (the soak harness) must check :attr:`dropped` before trusting
+    :attr:`events` as the complete record.
+    """
 
     def __init__(self, cap: int = _EVENT_COLLECT_CAP) -> None:
         self.events: list[Event] = []
+        self.dropped = 0
         self._cap = cap
 
     def handle(self, event: Event) -> None:
         if len(self.events) < self._cap:
             self.events.append(event)
+        else:
+            self.dropped += 1
+            if self.dropped == 1:
+                log.warning(
+                    "event collector full (%d); further events are counted "
+                    "but not retained in memory",
+                    self._cap,
+                )
+
+
+class _MetricsSink(Sink):
+    """Feeds pass/miss source timestamps into the metrics rolling windows."""
+
+    def __init__(self, metrics: MetricsRegistry) -> None:
+        self._metrics = metrics
+
+    def handle(self, event: Event) -> None:
+        if isinstance(event, PassEvent):
+            self._metrics.record_pass(event.last_seen_ts)
+        elif isinstance(event, MissEvent):
+            self._metrics.record_miss(event.end_ts)
 
 
 class PipelineRunner:
@@ -150,8 +188,9 @@ class PipelineRunner:
     def __init__(self, cfg: AppConfig, source: FrameSource, sinks: list[Sink]) -> None:
         self._cfg = cfg
         self.source = source
+        self.metrics = MetricsRegistry(cfg.metrics)
         self._collector = _ListSink()
-        self._bus = EventBus(sinks + [self._collector])
+        self._bus = EventBus(sinks + [self._collector, _MetricsSink(self.metrics)])
         self._frame_q = DroppingQueue(maxsize=64)
         self._executor: Executor = (
             ThreadPoolExecutor(
@@ -161,7 +200,9 @@ class PipelineRunner:
             else ProcessPoolExecutor(max_workers=cfg.decode.workers)
         )
         self._gate = MotionGate(cfg.motion, source.source_id)
-        self._engine = DecodeEngine(cfg.decode, self._executor)
+        self._engine = DecodeEngine(
+            cfg.decode, self._executor, observe_wall_ms=self.metrics.record_decode_wall_ms
+        )
         # The tracker snapshots pre-roll/segment evidence while a segment is
         # open, so the buffer only ever serves pre-roll (at open) and
         # post-roll (at the miss deadline) lookbacks.
@@ -180,20 +221,44 @@ class PipelineRunner:
             confirmations=cfg.decode.confirmations,
         )
         self._stop = threading.Event()
+        # Set only when the pipeline (consumer) thread dies: the sentinel
+        # put must keep blocking through a merely-slow consumer, and the
+        # source's own failure must NOT abort it (that exception also lands
+        # in _thread_errors, which is why the sentinel cannot key off it).
+        self._pipeline_dead = threading.Event()
         self._frames_processed = 0
         self.frame_errors = 0
         self._thread_errors: list[BaseException] = []
+        # Existing component counters stay the source of truth; the registry
+        # reads them lazily at snapshot time.
+        self.metrics.register_gauges(
+            frames_processed=lambda: self._frames_processed,
+            frames_dropped=lambda: self._frame_q.dropped,
+            frame_errors=lambda: self.frame_errors,
+            passes_emitted=lambda: self._tracker.passes_emitted,
+            passes_merged=lambda: self._tracker.passes_merged,
+            misses_emitted=lambda: self._tracker.misses_emitted,
+            events_handled=lambda: self._bus.events_handled,
+            sink_errors=lambda: self._bus.sink_errors,
+            pyzbar_calls=lambda: self._engine.counters.pyzbar_calls,
+            dmtx_calls=lambda: self._engine.counters.dmtx_calls,
+            fallback_calls=lambda: self._engine.counters.fallback_calls,
+            budget_overruns=lambda: self._engine.counters.budget_overruns,
+        )
+        self.metrics.register_queue("frames", self._frame_q.qsize)
+        self.metrics.register_queue("events", self._bus.queue.qsize)
+        for sink in sinks:
+            if isinstance(sink, HttpSink):
+                self.metrics.set_outbox_probe(sink.outbox_stats)
 
     @classmethod
-    def from_config(cls, cfg: AppConfig) -> "PipelineRunner":
-        if cfg.source.type != "synthetic":  # pragma: no cover - phase 2/3
-            raise ValueError(f"unsupported source type {cfg.source.type!r}")
-        # The source's trailing idle must outlast segment close + post-roll
-        # or the final pass's miss evidence is truncated at flush.
-        tail_s = (
-            cfg.motion.quiet_frames / cfg.synthetic.fps + cfg.buffer.post_s + 0.5
-        )
-        source = SyntheticSource(cfg.synthetic, tail_s=tail_s)
+    def from_config(
+        cls, cfg: AppConfig, source: FrameSource | None = None
+    ) -> "PipelineRunner":
+        """Build a runner with config-driven sinks. ``source`` overrides the
+        config-selected source (e.g. a FlakySource-wrapped one in soak)."""
+        if source is None:
+            source = create_source(cfg)
         sinks: list[Sink] = []
         if cfg.sinks.console.enabled:
             sinks.append(ConsoleSink())
@@ -201,6 +266,8 @@ class PipelineRunner:
             sinks.append(JsonlSink(cfg.sinks.jsonl.path))
         if cfg.sinks.sqlite.enabled:
             sinks.append(SqliteSink(cfg.sinks.sqlite.path))
+        if cfg.sinks.http.enabled:
+            sinks.append(HttpSink(cfg.sinks.http))
         return cls(cfg, source, sinks)
 
     def stop(self) -> None:
@@ -213,7 +280,7 @@ class PipelineRunner:
         live = self.source.live
 
         def _abort() -> bool:
-            return self._stop.is_set() or bool(self._thread_errors)
+            return self._stop.is_set() or self._pipeline_dead.is_set()
 
         try:
             for frame in self.source.frames():
@@ -231,9 +298,10 @@ class PipelineRunner:
                 self._frame_q.put(SENTINEL)
             else:
                 # Blocking so the stream's tail frames are never displaced;
-                # bail only if the pipeline thread already failed.
+                # bail only if the pipeline thread (the consumer) is dead —
+                # losing this sentinel deadlocks the pipeline in get().
                 self._frame_q.put_blocking(
-                    SENTINEL, abort=lambda: bool(self._thread_errors)
+                    SENTINEL, abort=self._pipeline_dead.is_set
                 )
             self.source.close()
 
@@ -256,6 +324,7 @@ class PipelineRunner:
                 item = self._frame_q.get()
                 if item is SENTINEL:
                     break
+                self.metrics.record_frame(item.ts)
                 try:
                     self._process_frame(item)
                 except Exception:
@@ -265,6 +334,7 @@ class PipelineRunner:
                     log.exception("frame %d failed; continuing", item.frame_index)
                 self._frames_processed += 1
         except Exception as exc:
+            self._pipeline_dead.set()
             self._thread_errors.append(exc)
             log.exception("pipeline thread failed")
         finally:
@@ -281,8 +351,16 @@ class PipelineRunner:
 
     # -- entry point -------------------------------------------------------------
 
-    def run(self) -> RunSummary:
-        """Run to source exhaustion (or :meth:`stop`), drain, and report."""
+    def _stats_loop(self, interval_s: float, stop: threading.Event) -> None:
+        while not stop.wait(interval_s):
+            log.info("metrics", extra={"stats": self.metrics.snapshot()})
+
+    def run(self, stats_interval_s: float | None = None) -> RunSummary:
+        """Run to source exhaustion (or :meth:`stop`), drain, and report.
+
+        ``stats_interval_s`` adds a periodic structured-log line with the
+        metrics snapshot (the ``--stats-interval`` CLI flag).
+        """
         self._bus.start()
         source_t = threading.Thread(
             target=self._source_loop, name="source", daemon=True
@@ -290,12 +368,21 @@ class PipelineRunner:
         pipeline_t = threading.Thread(
             target=self._pipeline_loop, name="pipeline", daemon=True
         )
+        stats_stop = threading.Event()
+        if stats_interval_s is not None and stats_interval_s > 0:
+            threading.Thread(
+                target=self._stats_loop,
+                args=(stats_interval_s, stats_stop),
+                name="stats",
+                daemon=True,
+            ).start()
         source_t.start()
         pipeline_t.start()
         try:
             source_t.join()
             pipeline_t.join()
         finally:
+            stats_stop.set()
             self._executor.shutdown(wait=True)
             self._bus.shutdown()
         if self._thread_errors:
@@ -316,9 +403,15 @@ class PipelineRunner:
             sink_errors=self._bus.sink_errors,
             frame_errors=self.frame_errors,
             reconciliation=reconciliation,
+            metrics=self.metrics.snapshot(),
         )
 
     @property
     def collected_events(self) -> list[Event]:
         """Events seen this run (for tests and the CLI report)."""
         return self._collector.events
+
+    @property
+    def collected_events_dropped(self) -> int:
+        """Events the in-memory collector could not retain (cap overflow)."""
+        return self._collector.dropped

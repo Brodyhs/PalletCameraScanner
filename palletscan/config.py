@@ -8,6 +8,7 @@ Unknown keys are rejected to catch typos early.
 from __future__ import annotations
 
 import enum
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -22,9 +23,47 @@ class _StrictModel(BaseModel):
 
 
 class SourceConfig(_StrictModel):
-    """Which FrameSource to run. Phase 1: synthetic only."""
+    """Which FrameSource to run (Phase 3 adds "camera")."""
 
-    type: Literal["synthetic"] = "synthetic"
+    type: Literal["synthetic", "video"] = "synthetic"
+
+
+class VideoConfig(_StrictModel):
+    """VideoFileSource: replay a recorded clip through the pipeline.
+
+    ``speed`` shapes only wall-clock delivery (1.0 = as-if-live pacing,
+    >1 = accelerated, 0 = unpaced/max rate); frame timestamps always use
+    the file's native clock, so pipeline behavior is identical at any
+    playback speed.
+    """
+
+    path: Path = Path("")
+    fps_override: float | None = None  # for files with broken fps metadata
+    speed: float = 1.0
+    loop: int = 1  # play count; 0 = loop forever (soak runs)
+
+    @field_validator("fps_override")
+    @classmethod
+    def _fps_positive(cls, v: float | None) -> float | None:
+        # NaN compares False to everything, so check finiteness explicitly
+        # or it sails through and poisons every Frame.ts downstream.
+        if v is not None and (not math.isfinite(v) or v <= 0):
+            raise ValueError(f"video.fps_override must be finite and > 0, got {v}")
+        return v
+
+    @field_validator("speed")
+    @classmethod
+    def _speed_non_negative(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(f"video.speed must be finite and >= 0, got {v}")
+        return v
+
+    @field_validator("loop")
+    @classmethod
+    def _loop_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"video.loop must be >= 0 (0 = forever), got {v}")
+        return v
 
 
 class SyntheticConfig(_StrictModel):
@@ -159,10 +198,63 @@ class SqliteSinkConfig(_StrictModel):
     path: Path = Path("data/palletscan.db")
 
 
+class RetryConfig(_StrictModel):
+    """Exponential backoff for the HTTP uploader (jittered, success resets)."""
+
+    base_s: float = 1.0
+    cap_s: float = 60.0
+
+    @field_validator("base_s", "cap_s")
+    @classmethod
+    def _positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"retry delays must be > 0, got {v}")
+        return v
+
+
+class HttpSinkConfig(_StrictModel):
+    """Store-and-forward HTTP POST sink (offline-first; see http_sink.py).
+
+    Delivery contract: one event per POST, body = event JSON, any 2xx is
+    the ack; at-least-once, so the receiver dedupes on ``event_id``.
+    """
+
+    enabled: bool = False
+    url: str = "http://127.0.0.1:8808/events"
+    headers: dict[str, str] = Field(default_factory=dict)
+    timeout_s: float = 5.0
+    outbox_path: Path = Path("data/outbox.db")
+    retry: RetryConfig = Field(default_factory=RetryConfig)
+    max_mb: float = 200.0
+    max_age_days: float = 14.0
+
+
 class SinksConfig(_StrictModel):
     console: ConsoleSinkConfig = Field(default_factory=ConsoleSinkConfig)
     jsonl: JsonlSinkConfig = Field(default_factory=JsonlSinkConfig)
     sqlite: SqliteSinkConfig = Field(default_factory=SqliteSinkConfig)
+    http: HttpSinkConfig = Field(default_factory=HttpSinkConfig)
+
+
+class MetricsConfig(_StrictModel):
+    """Metrics windows and reservoir sizing (see palletscan/metrics.py)."""
+
+    window_s: float = 60.0  # wall-clock window for the fps rate
+    latency_samples: int = 2048  # decode wall-time reservoir size
+
+    @field_validator("window_s")
+    @classmethod
+    def _window_positive(cls, v: float) -> float:
+        if v < 1.0:
+            raise ValueError(f"metrics.window_s must be >= 1, got {v}")
+        return v
+
+    @field_validator("latency_samples")
+    @classmethod
+    def _samples_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"metrics.latency_samples must be >= 1, got {v}")
+        return v
 
 
 class LoggingConfig(_StrictModel):
@@ -172,12 +264,14 @@ class LoggingConfig(_StrictModel):
 class AppConfig(_StrictModel):
     source: SourceConfig = Field(default_factory=SourceConfig)
     synthetic: SyntheticConfig = Field(default_factory=SyntheticConfig)
+    video: VideoConfig = Field(default_factory=VideoConfig)
     motion: MotionConfig = Field(default_factory=MotionConfig)
     decode: DecodeConfig = Field(default_factory=DecodeConfig)
     dedup: DedupConfig = Field(default_factory=DedupConfig)
     buffer: BufferConfig = Field(default_factory=BufferConfig)
     evidence: EvidenceConfig = Field(default_factory=EvidenceConfig)
     sinks: SinksConfig = Field(default_factory=SinksConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
@@ -223,6 +317,9 @@ def apply_overrides(
                 ),
                 "sqlite": cfg.sinks.sqlite.model_copy(
                     update={"path": base / "palletscan.db"}
+                ),
+                "http": cfg.sinks.http.model_copy(
+                    update={"outbox_path": base / "outbox.db"}
                 ),
             }
         )

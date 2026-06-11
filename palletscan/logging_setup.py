@@ -23,6 +23,9 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             entry["exc"] = self.formatException(record.exc_info)
+        stats = getattr(record, "stats", None)
+        if stats is not None:
+            entry["stats"] = stats
         return json.dumps(entry, ensure_ascii=False)
 
 
