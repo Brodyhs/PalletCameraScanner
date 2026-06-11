@@ -78,6 +78,15 @@ class SyntheticConfig(_StrictModel):
             raise ValueError(f"range must be (low, high), got {v}")
         return v
 
+    @field_validator("speed_mph_range")
+    @classmethod
+    def _speed_positive(cls, v: tuple[float, float]) -> tuple[float, float]:
+        # Pass planning divides by px-per-frame, which is proportional to
+        # speed; zero speed means a pass that never crosses the frame.
+        if v[0] <= 0:
+            raise ValueError(f"speed_mph_range must be > 0, got {v}")
+        return v
+
 
 class MotionAlgorithm(enum.StrEnum):
     FRAMEDIFF = "framediff"

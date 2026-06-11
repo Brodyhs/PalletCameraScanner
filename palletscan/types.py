@@ -14,9 +14,18 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
+
+
+def now_iso() -> str:
+    """Wall-clock UTC timestamp (ISO 8601) for event and evidence records.
+
+    The single formatter keeps event ``wall_time_iso`` and evidence
+    ``written_utc`` correlatable."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 class Symbology(enum.StrEnum):

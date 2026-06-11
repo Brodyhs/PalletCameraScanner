@@ -20,6 +20,17 @@ class FrameSource(ABC):
     def source_id(self) -> str:
         """Stable identifier for this source (used in events and stats)."""
 
+    @property
+    def nominal_fps(self) -> float | None:
+        """Nominal frame rate if the source knows it (e.g. buffer sizing)."""
+        return None
+
+    @property
+    def live(self) -> bool:
+        """True for live capture (drop frames under backpressure rather than
+        stall the device); False for finite replay (block, never drop)."""
+        return False
+
     @abstractmethod
     def frames(self) -> Iterator[Frame]:
         """Yield frames in order. Single-use: call once per source instance.

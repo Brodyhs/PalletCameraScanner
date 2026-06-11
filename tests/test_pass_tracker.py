@@ -64,7 +64,7 @@ def _feed_frames(tracker: PassTracker, buffer: RollingFrameBuffer, rng: range) -
     for i in rng:
         f = Frame(image=_IMG, ts=i / FPS, frame_index=i, source_id="cam0")
         buffer.append(f)
-        tracker.on_frame_ts(f.ts)
+        tracker.on_frame(f)
 
 
 def test_many_decodes_one_pass_event(setup) -> None:

@@ -12,14 +12,12 @@ from types import ModuleType
 
 import numpy as np
 
+from palletscan._compat import LIB_HELP, import_pylibdmtx
 from palletscan.types import Roi, Symbology
 
-_LIB_HELP = (
-    "{lib} native library failed to load ({err}). "
-    "macOS: `brew install {pkg}`; if loading still fails: "
-    "`export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib`. "
-    "Windows: the pip wheel bundles the DLL — reinstall the package."
-)
+#: More than one pallet face can share a motion segment, so never cap at 1;
+#: the cap (with the native timeout) still bounds worst-case scan time.
+_DM_MAX_COUNT = 4
 
 
 def _import_pyzbar() -> ModuleType:
@@ -28,18 +26,7 @@ def _import_pyzbar() -> ModuleType:
 
         return pyzbar
     except Exception as exc:
-        raise RuntimeError(_LIB_HELP.format(lib="zbar", pkg="zbar", err=exc)) from exc
-
-
-def _import_pylibdmtx() -> ModuleType:
-    try:
-        from palletscan._compat import import_pylibdmtx
-
-        return import_pylibdmtx()
-    except Exception as exc:
-        raise RuntimeError(
-            _LIB_HELP.format(lib="libdmtx", pkg="libdmtx", err=exc)
-        ) from exc
+        raise RuntimeError(LIB_HELP.format(lib="zbar", pkg="zbar", err=exc)) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,11 +73,13 @@ class PylibdmtxDecoder:
     symbology = Symbology.DATAMATRIX
 
     def __init__(self) -> None:
-        self._pylibdmtx = _import_pylibdmtx()
+        self._pylibdmtx = import_pylibdmtx()
 
     def decode(self, gray: np.ndarray, timeout_ms: int) -> list[RawDecode]:
         results = self._pylibdmtx.decode(
-            np.ascontiguousarray(gray), timeout=max(1, int(timeout_ms)), max_count=1
+            np.ascontiguousarray(gray),
+            timeout=max(1, int(timeout_ms)),
+            max_count=_DM_MAX_COUNT,
         )
         h = int(gray.shape[0])
         out = []

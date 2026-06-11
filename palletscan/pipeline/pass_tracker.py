@@ -3,9 +3,14 @@ miss path.
 
 One pallet produces many decodes across frames; the tracker collapses them
 by payload within a dedup window into a single PassEvent. A motion segment
-that closes with zero decodes becomes a MissEvent — but only after its
-post-roll deadline passes, so the evidence burst can include frames from
-after the segment closed.
+in which no payload reaches the confirmation threshold becomes a MissEvent
+— but only after its post-roll deadline passes, so the evidence burst can
+include frames from after the segment closed.
+
+Miss evidence is assembled from three pieces: a pre-roll snapshot taken
+when the segment opens (a long segment outlives the rolling buffer's
+horizon), a bounded in-segment frame reservoir, and the post-roll pulled
+from the rolling buffer at the deadline.
 
 Single-threaded by design: called only from the pipeline thread, in frame
 order. All clocks are the frame source clock (``Frame.ts``).
@@ -17,7 +22,6 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 from palletscan.config import BufferConfig, DedupConfig
 from palletscan.events.evidence import EvidenceWriter
@@ -26,16 +30,39 @@ from palletscan.pipeline.rolling_buffer import RollingFrameBuffer
 from palletscan.types import (
     DecodeResult,
     Event,
+    Frame,
     MissEvent,
     PassEvent,
     SegmentEvent,
+    now_iso,
 )
 
 log = logging.getLogger(__name__)
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+class _FrameReservoir:
+    """Bounded, order-preserving sample of a growing frame sequence.
+
+    Keeps every ``stride``-th frame; when the kept list exceeds ``cap`` it
+    drops every other kept frame and doubles the stride, so an arbitrarily
+    long segment yields evenly spaced evidence in bounded memory.
+    """
+
+    __slots__ = ("_cap", "_stride", "_seen", "frames")
+
+    def __init__(self, cap: int = 256) -> None:
+        self._cap = cap
+        self._stride = 1
+        self._seen = 0
+        self.frames: list[Frame] = []
+
+    def add(self, frame: Frame) -> None:
+        if self._seen % self._stride == 0:
+            self.frames.append(frame)
+            if len(self.frames) > self._cap:
+                self.frames = self.frames[::2]
+                self._stride *= 2
+        self._seen += 1
 
 
 @dataclass(slots=True)
@@ -45,6 +72,8 @@ class _SegmentState:
     open_ts: float
     ctx: PassDecodeContext = field(default_factory=PassDecodeContext)
     decodes: list[DecodeResult] = field(default_factory=list)
+    payload_counts: dict[str, int] = field(default_factory=dict)
+    evidence: _FrameReservoir = field(default_factory=_FrameReservoir)
 
 
 @dataclass(slots=True)
@@ -56,6 +85,7 @@ class _PendingMiss:
     close_frame: int
     close_ts: float
     deadline_ts: float
+    frames: list[Frame]
 
 
 class PassTracker:
@@ -69,6 +99,7 @@ class PassTracker:
         buffer: RollingFrameBuffer,
         emit: Callable[[Event], None],
         source_id: str,
+        confirmations: int = 1,
     ) -> None:
         self._dedup = dedup_cfg
         self._buffer_cfg = buffer_cfg
@@ -76,6 +107,7 @@ class PassTracker:
         self._buffer = buffer
         self._emit = emit
         self._source_id = source_id
+        self._confirmations = max(1, int(confirmations))
         self._open: _SegmentState | None = None
         self._recent: dict[str, float] = {}  # payload -> last_seen_ts
         self._pending: list[_PendingMiss] = []
@@ -97,14 +129,31 @@ class PassTracker:
         self._open = _SegmentState(
             candidate_id=ev.candidate_id, open_frame=ev.frame_index, open_ts=ev.ts
         )
+        # Snapshot the pre-roll now: by the time a long segment closes and
+        # its post-roll deadline passes, these frames are long evicted from
+        # the rolling buffer.
+        for f in self._buffer.extract(
+            ev.ts - self._buffer_cfg.pre_s, float("inf")
+        ):
+            self._open.evidence.add(f)
         return self._open.ctx
+
+    @property
+    def open_ctx(self) -> PassDecodeContext | None:
+        """Decode context of the currently open segment, if any."""
+        return self._open.ctx if self._open is not None else None
 
     def on_decode(self, results: list[DecodeResult]) -> None:
         """Attach decode results from the current frame to the open segment."""
         if self._open is None or not results:
             return
-        self._open.decodes.extend(results)
-        self._open.ctx.confirmed = True
+        seg = self._open
+        seg.decodes.extend(results)
+        for d in results:
+            n = seg.payload_counts.get(d.payload, 0) + 1
+            seg.payload_counts[d.payload] = n
+            if n >= self._confirmations:
+                seg.ctx.confirmed = True
 
     def on_segment_close(self, ev: SegmentEvent) -> None:
         if self._open is None or self._open.candidate_id != ev.candidate_id:
@@ -112,6 +161,12 @@ class PassTracker:
             return
         self._finalize_segment(self._open, ev.frame_index, ev.ts)
         self._open = None
+
+    def on_frame(self, frame: Frame) -> None:
+        """Per-frame hook: collect in-segment evidence, then advance the clock."""
+        if self._open is not None:
+            self._open.evidence.add(frame)
+        self.on_frame_ts(frame.ts)
 
     def on_frame_ts(self, ts: float) -> None:
         """Advance the clock: finalize pending misses whose post-roll is full."""
@@ -134,7 +189,15 @@ class PassTracker:
     def _finalize_segment(
         self, seg: _SegmentState, close_frame: int, close_ts: float
     ) -> None:
-        if not seg.decodes:
+        by_payload: dict[str, list[DecodeResult]] = {}
+        for d in seg.decodes:
+            by_payload.setdefault(d.payload, []).append(d)
+        confirmed = {
+            p: ds
+            for p, ds in by_payload.items()
+            if len(ds) >= self._confirmations
+        }
+        if not confirmed:
             self._pending.append(
                 _PendingMiss(
                     candidate_id=seg.candidate_id,
@@ -144,15 +207,12 @@ class PassTracker:
                     close_frame=close_frame,
                     close_ts=close_ts,
                     deadline_ts=close_ts + self._buffer_cfg.post_s,
+                    frames=seg.evidence.frames,
                 )
             )
             return
-        by_payload: dict[str, list[DecodeResult]] = {}
-        for d in seg.decodes:
-            by_payload.setdefault(d.payload, []).append(d)
-        for payload, decodes in by_payload.items():
+        for payload, decodes in confirmed.items():
             last_seen = self._recent.get(payload)
-            self._recent[payload] = close_ts
             if last_seen is not None and close_ts - last_seen <= self._dedup.window_s:
                 self.passes_merged += 1
                 log.info(
@@ -161,6 +221,9 @@ class PassTracker:
                     close_ts - last_seen,
                 )
                 continue
+            # Refresh the window only on emit: merged sightings must not
+            # keep extending suppression indefinitely.
+            self._recent[payload] = close_ts
             first = decodes[0]
             self._emit(
                 PassEvent(
@@ -173,7 +236,7 @@ class PassTracker:
                     best_frame=(first.source_id, first.frame_index),
                     candidate_ids=[seg.candidate_id],
                     event_id=str(uuid.uuid4()),
-                    wall_time_iso=_now_iso(),
+                    wall_time_iso=now_iso(),
                 )
             )
             self.passes_emitted += 1
@@ -182,10 +245,16 @@ class PassTracker:
         self._recent = {p: t for p, t in self._recent.items() if t >= cutoff}
 
     def _finalize_miss(self, miss: _PendingMiss) -> None:
-        frames = self._buffer.extract(
-            miss.open_ts - self._buffer_cfg.pre_s,
-            miss.close_ts + self._buffer_cfg.post_s,
-        )
+        # Pre-roll + segment frames were captured while the segment was
+        # open; only the post-roll still lives in the rolling buffer.
+        post = [
+            f
+            for f in self._buffer.extract(
+                miss.close_ts, miss.close_ts + self._buffer_cfg.post_s
+            )
+            if f.ts > miss.close_ts
+        ]
+        frames = miss.frames + post
         ref = self._evidence.write_burst(
             miss.candidate_id,
             frames,
@@ -207,7 +276,7 @@ class PassTracker:
                 evidence_dir=str(ref.directory),
                 evidence_frame_count=ref.frame_count,
                 event_id=str(uuid.uuid4()),
-                wall_time_iso=_now_iso(),
+                wall_time_iso=now_iso(),
             )
         )
         self.misses_emitted += 1

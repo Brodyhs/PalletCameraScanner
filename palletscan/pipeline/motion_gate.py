@@ -27,6 +27,7 @@ class MotionGate:
             if cfg.algorithm is MotionAlgorithm.MOG2
             else None
         )
+        self._mog2_primed = False
         self._kernel = np.ones((3, 3), np.uint8)
         # Segment state
         self._segment_count = 0
@@ -40,6 +41,11 @@ class MotionGate:
         """Binary motion mask on the downscaled frame, or None on warm-up."""
         if self._mog2 is not None:
             raw = self._mog2.apply(small)
+            if not self._mog2_primed:
+                # MOG2 has no background model yet on the first frame and
+                # reports the entire frame as foreground.
+                self._mog2_primed = True
+                return None
             return cv2.dilate((raw > 0).astype(np.uint8), self._kernel)
         prev, self._prev_small = self._prev_small, small
         if prev is None:
@@ -61,7 +67,9 @@ class MotionGate:
         motion_frac = 0.0
         if mask is not None:
             motion_frac = float(np.count_nonzero(mask)) / mask.size
-            if motion_frac >= cfg.min_area_frac:
+            # The > 0 guard keeps min_area_frac: 0 from reducing an empty
+            # mask (np.nonzero -> empty arrays -> min() raises).
+            if motion_frac >= cfg.min_area_frac and motion_frac > 0.0:
                 ys, xs = np.nonzero(mask)
                 scale = w / sw
                 roi = Roi(

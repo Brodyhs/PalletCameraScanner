@@ -72,14 +72,22 @@ def test_blurred_qr_recovered_by_fallback_after_n_frames(executor) -> None:
     assert ctx.fallback_runs >= 1
 
 
-def test_early_exit_skips_all_work(executor) -> None:
-    engine = DecodeEngine(DecodeConfig(), executor)
+def test_confirmed_keeps_inline_cascade_but_skips_fallback(executor) -> None:
+    cfg = DecodeConfig(fallback_after_frames=0)
+    engine = DecodeEngine(cfg, executor)
+    # A decodable symbol must still decode after confirmation — a second
+    # pallet can share the motion segment.
     frame, roi = _frame_with(render_qr(PAYLOAD, 4.0).image)
     ctx = PassDecodeContext(confirmed=True)
-    assert engine.decode_frame(frame, roi, ctx) == []
-    assert engine.counters.pyzbar_calls == 0
-    assert engine.counters.dmtx_calls == 0
-    assert ctx.frames_attempted == 0
+    hits = engine.decode_frame(frame, roi, ctx)
+    assert [r.payload for r in hits] == [PAYLOAD]
+    assert engine.counters.pyzbar_calls == 1
+    # Undecodable noise: the expensive variant fan-out stays off while
+    # the pass is confirmed.
+    noise = np.random.default_rng(0).integers(0, 255, (200, 200), np.uint8)
+    nframe, nroi = _frame_with(noise)
+    assert engine.decode_frame(nframe, nroi, ctx) == []
+    assert engine.counters.fallback_calls == 0
 
 
 def test_qr_only_priority_never_calls_pylibdmtx(executor) -> None:

@@ -26,8 +26,9 @@ def _add_synth_parser(sub: "argparse._SubParsersAction") -> None:
     p.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("data"),
-        help="base directory for events.jsonl / palletscan.db / evidence",
+        default=None,
+        help="rebase events.jsonl / palletscan.db / evidence under this "
+        "directory (default: keep the paths from the config file)",
     )
 
 
@@ -43,10 +44,18 @@ def _cmd_synth(args: argparse.Namespace) -> int:
     )
     setup_logging(cfg.logging.level)
     runner = PipelineRunner.from_config(cfg)
-    signal.signal(signal.SIGINT, lambda *_: runner.stop())
+
+    def _on_sigint(*_: object) -> None:
+        # First Ctrl-C drains gracefully; restoring the default handler
+        # lets a second Ctrl-C force-quit a wedged shutdown.
+        runner.stop()
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    signal.signal(signal.SIGINT, _on_sigint)
     summary = runner.run()
     if isinstance(runner.source, SyntheticSource):
-        truth_path = Path(args.data_dir) / "truth.jsonl"
+        truth_dir = args.data_dir if args.data_dir is not None else Path("data")
+        truth_path = truth_dir / "truth.jsonl"
         runner.source.write_truth_jsonl(truth_path)
         print(f"truth written to {truth_path}")
     print(summary.format())

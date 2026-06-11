@@ -51,9 +51,15 @@ class _PassPlan:
 class SyntheticSource(FrameSource):
     """Renders QR/Data Matrix pallet passes moving across the frame."""
 
-    def __init__(self, cfg: SyntheticConfig, source_id: str = "synth0") -> None:
+    def __init__(
+        self, cfg: SyntheticConfig, source_id: str = "synth0", tail_s: float = 1.0
+    ) -> None:
         self._cfg = cfg
         self._source_id = source_id
+        # Trailing idle after the last pass. The composition root sizes this
+        # from downstream config (quiet frames + post-roll); the default only
+        # suits direct/unit-test construction.
+        self._tail_s = tail_s
         self.truth: list[GroundTruthRecord] = []
         master = np.random.SeedSequence(cfg.seed)
         children = master.spawn(cfg.num_passes + 2)
@@ -76,6 +82,16 @@ class SyntheticSource(FrameSource):
     @property
     def source_id(self) -> str:
         return self._source_id
+
+    @property
+    def nominal_fps(self) -> float:
+        return self._cfg.fps
+
+    @property
+    def live(self) -> bool:
+        # Realtime mode emulates a paced live camera; otherwise this is a
+        # finite replay whose frames must all reach the pipeline.
+        return self._cfg.realtime
 
     def _plan_pass(self, i: int, rng: np.random.Generator) -> _PassPlan:
         cfg = self._cfg
@@ -194,25 +210,36 @@ class SyntheticSource(FrameSource):
     def frames(self) -> Iterator[Frame]:
         cfg = self._cfg
         idx = 0
-        for plan in self._plans:
+        for j, plan in enumerate(self._plans):
             sigma = plan.params["noise_sigma"]
+            # Idle gaps render with the *previous* pass's plan: the pole is
+            # a static scene fixture, so it must not teleport mid-idle while
+            # the prior segment is still counting quiet frames to close.
+            idle_plan = self._plans[j - 1] if j > 0 else plan
             for _ in range(plan.idle_frames_before):
-                yield self._emit(self._idle_frame(plan), idx)
+                yield self._emit(self._idle_frame(idle_plan), idx)
                 idx += 1
             first_frame = idx
             ph, pw = plan.patch.shape
             for k in range(plan.num_frames):
                 x = int(round(-pw + plan.px_per_frame * k))
                 frame = self._background.copy()
-                # Clip the patch to the frame.
+                # Clip the patch to the frame on both axes (a face taller
+                # than the frame would otherwise break the blend shapes).
                 fx0, fx1 = max(0, x), min(cfg.width, x + pw)
-                if fx1 > fx0:
+                fy0 = max(0, plan.y_top)
+                fy1 = min(cfg.height, plan.y_top + ph)
+                if fx1 > fx0 and fy1 > fy0:
                     px0 = fx0 - x
-                    y0, y1 = plan.y_top, plan.y_top + ph
-                    region = frame[y0:y1, fx0:fx1].astype(np.float32)
-                    a = plan.alpha[:, px0 : px0 + (fx1 - fx0)]
-                    p = plan.patch[:, px0 : px0 + (fx1 - fx0)].astype(np.float32)
-                    frame[y0:y1, fx0:fx1] = (
+                    py0 = fy0 - plan.y_top
+                    region = frame[fy0:fy1, fx0:fx1].astype(np.float32)
+                    a = plan.alpha[
+                        py0 : py0 + (fy1 - fy0), px0 : px0 + (fx1 - fx0)
+                    ]
+                    p = plan.patch[
+                        py0 : py0 + (fy1 - fy0), px0 : px0 + (fx1 - fx0)
+                    ].astype(np.float32)
+                    frame[fy0:fy1, fx0:fx1] = (
                         region * (1.0 - a) + p * a
                     ).astype(np.uint8)
                 self._draw_pole(frame, plan)
@@ -231,7 +258,7 @@ class SyntheticSource(FrameSource):
         # Trailing idle so downstream segment close + post-roll can complete
         # before end-of-stream flush.
         if self._plans:
-            for _ in range(round(1.0 * cfg.fps)):
+            for _ in range(round(self._tail_s * cfg.fps)):
                 yield self._emit(self._idle_frame(self._plans[-1]), idx)
                 idx += 1
 

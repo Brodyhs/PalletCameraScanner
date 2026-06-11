@@ -21,15 +21,14 @@ from pathlib import Path
 import pytest
 
 from palletscan.app import PipelineRunner
-from palletscan.config import AppConfig, SyntheticConfig
+from palletscan.config import AppConfig, SyntheticConfig, apply_overrides
 
 NUM_PASSES = 400
 SEED = 20260610
 
 
 def _acceptance_config(tmp_path: Path) -> AppConfig:
-    cfg = AppConfig()
-    return cfg.model_copy(
+    cfg = AppConfig().model_copy(
         update={
             "synthetic": SyntheticConfig(
                 width=960,
@@ -47,14 +46,15 @@ def _acceptance_config(tmp_path: Path) -> AppConfig:
                 occlusion_max_frac=0.15,
                 idle_s_range=(0.3, 0.8),
             ),
-            "evidence": cfg.evidence.model_copy(update={"dir": tmp_path / "evidence"}),
+        }
+    )
+    cfg = apply_overrides(cfg, data_dir=tmp_path)
+    return cfg.model_copy(
+        update={
             "sinks": cfg.sinks.model_copy(
                 update={
                     "console": cfg.sinks.console.model_copy(
                         update={"enabled": False}
-                    ),
-                    "jsonl": cfg.sinks.jsonl.model_copy(
-                        update={"path": tmp_path / "events.jsonl"}
                     ),
                     "sqlite": cfg.sinks.sqlite.model_copy(
                         update={"enabled": False}

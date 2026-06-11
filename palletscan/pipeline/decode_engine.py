@@ -13,8 +13,9 @@ The frame budget is a *soft* deadline: an in-flight C call cannot be
 cancelled, so worst-case overshoot is bounded by ROI size and libdmtx's own
 timeout; overshoots are counted in :attr:`budget_overruns`.
 
-Early-exit happens one level up: once a pass is confirmed, the pipeline
-skips ``decode_frame`` entirely for its remaining frames.
+Once a pass is confirmed (``decode.confirmations`` corroborating decodes of
+one payload), the cheap inline cascade keeps running — a second pallet can
+share the motion segment — but the expensive variant fan-out stays off.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import numpy as np
 
@@ -44,12 +46,42 @@ class PassDecodeContext:
     fallback_runs: int = 0
 
 
+#: Once a pass is confirmed, the Data Matrix probe — which burns its full
+#: native timeout whenever no symbol is present — runs only every Nth frame;
+#: pyzbar stays per-frame. A second pallet sharing the segment is still
+#: caught within ~N frames of becoming decodable.
+_CONFIRMED_DM_STRIDE = 5
+
+
 @dataclass(slots=True)
 class _Counters:
     pyzbar_calls: int = 0
     dmtx_calls: int = 0
     fallback_calls: int = 0
     budget_overruns: int = 0
+
+
+def _decode_sym(
+    pyzbar_dec: PyzbarDecoder,
+    dmtx_dec: PylibdmtxDecoder,
+    sym: Symbology,
+    img: np.ndarray,
+    dm_timeout_ms: int,
+) -> tuple[str, list[RawDecode]]:
+    """The one symbology -> decoder dispatch, shared by the inline cascade
+    and the preprocessing-variant tasks."""
+    if sym is Symbology.QR:
+        return "pyzbar", pyzbar_dec.decode(img)
+    if sym is Symbology.DATAMATRIX:
+        return "pylibdmtx", dmtx_dec.decode(img, dm_timeout_ms)
+    return "", []
+
+
+@lru_cache(maxsize=1)
+def _task_decoders() -> tuple[PyzbarDecoder, PylibdmtxDecoder]:
+    """Stateless decoder singletons for variant tasks (each worker process
+    lazily builds its own pair)."""
+    return PyzbarDecoder(), PylibdmtxDecoder()
 
 
 def _variant_task(
@@ -60,17 +92,20 @@ def _variant_task(
 ) -> tuple[str, str, list[RawDecode]]:
     """Run one preprocessing variant + decoders. Top-level for picklability
     (process executor support)."""
-    fn = dict(preprocess.VARIANTS)[variant_name]
-    processed = fn(crop)
+    processed = preprocess.VARIANTS_BY_NAME[variant_name](crop)
+    pyzbar_dec, dmtx_dec = _task_decoders()
     for sym in symbologies:
-        if sym is Symbology.QR:
-            hits = PyzbarDecoder().decode(processed)
-            if hits:
-                return variant_name, f"pyzbar+{variant_name}", hits
-        elif sym is Symbology.DATAMATRIX:
-            hits = PylibdmtxDecoder().decode(processed, dm_timeout_ms)
-            if hits:
-                return variant_name, f"pylibdmtx+{variant_name}", hits
+        name, hits = _decode_sym(pyzbar_dec, dmtx_dec, sym, processed, dm_timeout_ms)
+        if hits:
+            mapped = [
+                RawDecode(
+                    payload=h.payload,
+                    symbology=h.symbology,
+                    roi=preprocess.map_roi_back(variant_name, h.roi, crop.shape),
+                )
+                for h in hits
+            ]
+            return variant_name, f"{name}+{variant_name}", mapped
     return variant_name, "", []
 
 
@@ -108,41 +143,46 @@ class DecodeEngine:
             for r in raw
         ]
 
+    def _count_call(self, sym: Symbology) -> None:
+        if sym is Symbology.QR:
+            self.counters.pyzbar_calls += 1
+        elif sym is Symbology.DATAMATRIX:
+            self.counters.dmtx_calls += 1
+
     def decode_frame(
         self, frame: Frame, roi: Roi, ctx: PassDecodeContext
     ) -> list[DecodeResult]:
         """Run the cascade on one frame's ROI. Returns [] if nothing decoded."""
-        if ctx.confirmed:
-            return []
         cfg = self._cfg
         started = time.perf_counter()
         deadline = started + cfg.frame_budget_ms / 1000.0
-        crop = roi.clamp(frame.image.shape).crop(frame.image)
-        origin = (roi.clamp(frame.image.shape).x, roi.clamp(frame.image.shape).y)
+        c = roi.clamp(frame.image.shape)
+        # One contiguous copy up front: the per-decoder ascontiguousarray
+        # calls then become no-ops instead of copying the crop per decoder.
+        crop = np.ascontiguousarray(frame.image[c.y : c.y + c.h, c.x : c.x + c.w])
+        origin = (c.x, c.y)
 
         try:
-            # Steps 1+2: plain decoders in priority order.
+            # Steps 1+2: plain decoders in priority order. These keep
+            # running after confirmation — a second pallet can share the
+            # motion segment.
             for sym in cfg.symbology_priority:
-                if sym is Symbology.QR:
-                    self.counters.pyzbar_calls += 1
-                    hits = self._pyzbar.decode(crop)
-                    if hits:
-                        return self._results(hits, frame, origin, "pyzbar", started)
-                elif sym is Symbology.DATAMATRIX:
+                dm_ms = cfg.dm_timeout_ms
+                if sym is Symbology.DATAMATRIX:
+                    if ctx.confirmed and ctx.frames_attempted % _CONFIRMED_DM_STRIDE:
+                        continue
                     remaining_ms = (deadline - time.perf_counter()) * 1000.0
                     if remaining_ms <= 1:
                         break
-                    self.counters.dmtx_calls += 1
-                    hits = self._dmtx.decode(
-                        crop, min(cfg.dm_timeout_ms, int(remaining_ms))
-                    )
-                    if hits:
-                        return self._results(
-                            hits, frame, origin, "pylibdmtx", started
-                        )
+                    dm_ms = min(cfg.dm_timeout_ms, int(remaining_ms))
+                self._count_call(sym)
+                name, hits = _decode_sym(self._pyzbar, self._dmtx, sym, crop, dm_ms)
+                if hits:
+                    return self._results(hits, frame, origin, name, started)
 
-            # Step 3: preprocessing variants, only for a stubborn pass.
-            if ctx.frames_attempted < cfg.fallback_after_frames:
+            # Step 3: preprocessing variants, only for a stubborn and still
+            # unconfirmed pass.
+            if ctx.confirmed or ctx.frames_attempted < cfg.fallback_after_frames:
                 return []
             remaining_s = deadline - time.perf_counter()
             if remaining_s <= 0.002:
@@ -150,10 +190,11 @@ class DecodeEngine:
             ctx.fallback_runs += 1
             self.counters.fallback_calls += 1
             symbologies = tuple(cfg.symbology_priority)
+            # Variants get what is left of this frame's budget, not a fresh
+            # full dm timeout each.
+            dm_ms = min(cfg.dm_timeout_ms, max(1, int(remaining_s * 1000.0)))
             futures = [
-                self._executor.submit(
-                    _variant_task, name, crop, symbologies, cfg.dm_timeout_ms
-                )
+                self._executor.submit(_variant_task, name, crop, symbologies, dm_ms)
                 for name, _ in preprocess.VARIANTS
             ]
             try:

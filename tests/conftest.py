@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from palletscan.config import AppConfig, SyntheticConfig
+from palletscan.config import AppConfig, SyntheticConfig, apply_overrides
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -38,8 +38,7 @@ def pytest_configure(config: pytest.Config) -> None:
 @pytest.fixture()
 def fast_synth_config(tmp_path: Path) -> AppConfig:
     """Small, deterministic synthetic config with outputs under tmp_path."""
-    cfg = AppConfig()
-    return cfg.model_copy(
+    cfg = AppConfig().model_copy(
         update={
             "synthetic": SyntheticConfig(
                 width=640,
@@ -54,18 +53,6 @@ def fast_synth_config(tmp_path: Path) -> AppConfig:
                 occlusion_max_frac=0.0,
                 idle_s_range=(0.4, 0.6),
             ),
-            "evidence": cfg.evidence.model_copy(
-                update={"dir": tmp_path / "evidence"}
-            ),
-            "sinks": cfg.sinks.model_copy(
-                update={
-                    "jsonl": cfg.sinks.jsonl.model_copy(
-                        update={"path": tmp_path / "events.jsonl"}
-                    ),
-                    "sqlite": cfg.sinks.sqlite.model_copy(
-                        update={"path": tmp_path / "palletscan.db"}
-                    ),
-                }
-            ),
         }
     )
+    return apply_overrides(cfg, data_dir=tmp_path)

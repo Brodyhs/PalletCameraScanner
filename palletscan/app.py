@@ -23,7 +23,7 @@ from palletscan.config import AppConfig, ExecutorKind
 from palletscan.events.bus import EventBus
 from palletscan.events.evidence import EvidenceWriter
 from palletscan.events.sinks import ConsoleSink, JsonlSink, Sink, SqliteSink
-from palletscan.pipeline.decode_engine import DecodeEngine, PassDecodeContext
+from palletscan.pipeline.decode_engine import DecodeEngine
 from palletscan.pipeline.motion_gate import MotionGate
 from palletscan.pipeline.pass_tracker import PassTracker
 from palletscan.pipeline.rolling_buffer import RollingFrameBuffer
@@ -67,6 +67,7 @@ class RunSummary:
     misses: int
     events_handled: int
     sink_errors: int
+    frame_errors: int = 0
     reconciliation: Reconciliation | None = None
 
     @property
@@ -81,6 +82,8 @@ class RunSummary:
             f"miss events      : {self.misses}",
             f"events handled   : {self.events_handled} (sink errors {self.sink_errors})",
         ]
+        if self.frame_errors:
+            lines.append(f"frame errors     : {self.frame_errors}")
         if self.reconciliation is not None:
             r = self.reconciliation
             lines += [
@@ -106,12 +109,17 @@ def reconcile_truth(
     decoded = 0
     missed = 0
     unaccounted: list[str] = []
+    # Slack covers only per-frame boundary wiggle (backdated opens, a close
+    # that trails by a frame). It must stay below the smallest idle gap
+    # between passes, or a neighbor's miss vouches for a silently dropped
+    # pass and defeats the very check this exists for.
+    slack = 2.0 / fps
     for rec in truth:
         if rec.payload in decoded_payloads:
             decoded += 1
             continue
         t0, t1 = rec.first_frame / fps, rec.last_frame / fps
-        if any(m.start_ts - 1.0 <= t1 and m.end_ts + 1.0 >= t0 for m in misses):
+        if any(m.start_ts - slack <= t1 and m.end_ts + slack >= t0 for m in misses):
             missed += 1
         else:
             unaccounted.append(rec.payload)
@@ -154,8 +162,14 @@ class PipelineRunner:
         )
         self._gate = MotionGate(cfg.motion, source.source_id)
         self._engine = DecodeEngine(cfg.decode, self._executor)
+        # The tracker snapshots pre-roll/segment evidence while a segment is
+        # open, so the buffer only ever serves pre-roll (at open) and
+        # post-roll (at the miss deadline) lookbacks.
         horizon = cfg.buffer.pre_s + cfg.buffer.post_s + 1.0
-        self._buffer = RollingFrameBuffer(horizon_s=horizon)
+        fps = source.nominal_fps or 30.0
+        self._buffer = RollingFrameBuffer(
+            horizon_s=horizon, maxlen=max(512, int(horizon * fps * 1.25))
+        )
         self._tracker = PassTracker(
             dedup_cfg=cfg.dedup,
             buffer_cfg=cfg.buffer,
@@ -163,16 +177,23 @@ class PipelineRunner:
             buffer=self._buffer,
             emit=self._bus.publish,
             source_id=source.source_id,
+            confirmations=cfg.decode.confirmations,
         )
         self._stop = threading.Event()
         self._frames_processed = 0
+        self.frame_errors = 0
         self._thread_errors: list[BaseException] = []
 
     @classmethod
     def from_config(cls, cfg: AppConfig) -> "PipelineRunner":
         if cfg.source.type != "synthetic":  # pragma: no cover - phase 2/3
             raise ValueError(f"unsupported source type {cfg.source.type!r}")
-        source = SyntheticSource(cfg.synthetic)
+        # The source's trailing idle must outlast segment close + post-roll
+        # or the final pass's miss evidence is truncated at flush.
+        tail_s = (
+            cfg.motion.quiet_frames / cfg.synthetic.fps + cfg.buffer.post_s + 0.5
+        )
+        source = SyntheticSource(cfg.synthetic, tail_s=tail_s)
         sinks: list[Sink] = []
         if cfg.sinks.console.enabled:
             sinks.append(ConsoleSink())
@@ -189,49 +210,74 @@ class PipelineRunner:
     # -- threads ---------------------------------------------------------------
 
     def _source_loop(self) -> None:
+        live = self.source.live
+
+        def _abort() -> bool:
+            return self._stop.is_set() or bool(self._thread_errors)
+
         try:
             for frame in self.source.frames():
                 if self._stop.is_set():
                     break
-                self._frame_q.put(frame)
+                if live:
+                    self._frame_q.put(frame)
+                elif not self._frame_q.put_blocking(frame, abort=_abort):
+                    break
         except Exception as exc:
             self._thread_errors.append(exc)
             log.exception("source thread failed")
         finally:
-            self._frame_q.put(SENTINEL)
+            if live:
+                self._frame_q.put(SENTINEL)
+            else:
+                # Blocking so the stream's tail frames are never displaced;
+                # bail only if the pipeline thread already failed.
+                self._frame_q.put_blocking(
+                    SENTINEL, abort=lambda: bool(self._thread_errors)
+                )
             self.source.close()
 
-    def _process_frame(self, frame: Frame, ctx_holder: list[PassDecodeContext | None]) -> None:
+    def _process_frame(self, frame: Frame) -> None:
         self._buffer.append(frame)
-        self._tracker.on_frame_ts(frame.ts)
+        self._tracker.on_frame(frame)
         result, seg_event = self._gate.update(frame)
         if seg_event is not None and seg_event.kind is SegmentKind.OPEN:
-            ctx_holder[0] = self._tracker.on_segment_open(seg_event)
-        ctx = ctx_holder[0]
+            self._tracker.on_segment_open(seg_event)
+        ctx = self._tracker.open_ctx
         if result.active and result.roi is not None and ctx is not None:
-            if not ctx.confirmed:
-                decodes = self._engine.decode_frame(frame, result.roi, ctx)
-                self._tracker.on_decode(decodes)
+            decodes = self._engine.decode_frame(frame, result.roi, ctx)
+            self._tracker.on_decode(decodes)
         if seg_event is not None and seg_event.kind is SegmentKind.CLOSE:
             self._tracker.on_segment_close(seg_event)
-            ctx_holder[0] = None
 
     def _pipeline_loop(self) -> None:
-        ctx_holder: list[PassDecodeContext | None] = [None]
         try:
             while True:
                 item = self._frame_q.get()
                 if item is SENTINEL:
                     break
-                self._process_frame(item, ctx_holder)
+                try:
+                    self._process_frame(item)
+                except Exception:
+                    # One bad frame must not abort the stream: the pallets
+                    # behind it still need accounting.
+                    self.frame_errors += 1
+                    log.exception("frame %d failed; continuing", item.frame_index)
                 self._frames_processed += 1
-            tail = self._gate.flush()
-            if tail is not None:
-                self._tracker.on_segment_close(tail)
-            self._tracker.flush()
         except Exception as exc:
             self._thread_errors.append(exc)
             log.exception("pipeline thread failed")
+        finally:
+            # Always flush: pending misses must become events even when the
+            # loop died, or open segments vanish without a trace.
+            try:
+                tail = self._gate.flush()
+                if tail is not None:
+                    self._tracker.on_segment_close(tail)
+                self._tracker.flush()
+            except Exception as exc:
+                self._thread_errors.append(exc)
+                log.exception("pipeline flush failed")
 
     # -- entry point -------------------------------------------------------------
 
@@ -268,6 +314,7 @@ class PipelineRunner:
             misses=self._tracker.misses_emitted,
             events_handled=self._bus.events_handled,
             sink_errors=self._bus.sink_errors,
+            frame_errors=self.frame_errors,
             reconciliation=reconciliation,
         )
 

@@ -19,7 +19,7 @@ from typing import Any
 import cv2
 
 from palletscan.config import EvidenceConfig
-from palletscan.types import Frame
+from palletscan.types import Frame, now_iso
 
 log = logging.getLogger(__name__)
 
@@ -50,49 +50,65 @@ class EvidenceWriter:
         target = self._root / day / candidate_id
         target.mkdir(parents=True, exist_ok=True)
         kept = frames[:: max(1, cfg.frame_stride)]
+        written: list[Frame] = []
         for f in kept:
-            cv2.imwrite(
-                str(target / f"frame_{f.frame_index:08d}.jpg"),
-                f.image,
-                [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality],
+            path = target / f"frame_{f.frame_index:08d}.jpg"
+            # cv2.imwrite signals failure (full disk, lost permission,
+            # encoder error) by returning False, not raising.
+            if cv2.imwrite(
+                str(path), f.image, [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality]
+            ):
+                written.append(f)
+            else:
+                log.error("evidence frame write failed: %s", path)
+        if len(written) < len(kept):
+            log.error(
+                "evidence burst %s incomplete: %d/%d frames written",
+                candidate_id,
+                len(written),
+                len(kept),
             )
         payload = {
             "candidate_id": candidate_id,
-            "frame_count": len(kept),
-            "frame_indices": [f.frame_index for f in kept],
+            "frame_count": len(written),
+            "frame_indices": [f.frame_index for f in written],
             "ts_range": [frames[0].ts, frames[-1].ts] if frames else None,
-            "written_utc": datetime.now(timezone.utc).isoformat(),
+            "written_utc": now_iso(),
             **meta,
         }
         (target / "meta.json").write_text(
             json.dumps(payload, indent=2), encoding="utf-8"
         )
-        self.prune()
-        return EvidenceRef(directory=target, frame_count=len(kept))
+        self.prune(keep=target)
+        return EvidenceRef(directory=target, frame_count=len(written))
 
-    def _candidate_dirs(self) -> list[Path]:
-        """All candidate directories, oldest first (by mtime)."""
+    def _candidate_dirs(self) -> list[tuple[Path, float]]:
+        """All candidate directories with their mtime, oldest first."""
         dirs = [
-            c
+            (c, c.stat().st_mtime)
             for day in self._root.iterdir()
             if day.is_dir()
             for c in day.iterdir()
             if c.is_dir()
         ]
-        return sorted(dirs, key=lambda d: d.stat().st_mtime)
+        return sorted(dirs, key=lambda it: it[1])
 
     @staticmethod
     def _dir_size(path: Path) -> int:
         return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
-    def prune(self) -> None:
-        """Enforce the age cap, then the total-size cap (oldest first)."""
+    def prune(self, keep: Path | None = None) -> None:
+        """Enforce the age cap, then the total-size cap (oldest first).
+
+        ``keep`` is never deleted: a burst must survive its own post-write
+        prune so the MissEvent's evidence_dir stays valid. Its size still
+        counts toward the total, so older bursts go first.
+        """
         cfg = self._cfg
         now = time.time()
-        dirs = self._candidate_dirs()
-        survivors = []
-        for d in dirs:
-            if now - d.stat().st_mtime > cfg.max_age_days * 86400:
+        survivors: list[Path] = []
+        for d, mtime in self._candidate_dirs():
+            if d != keep and now - mtime > cfg.max_age_days * 86400:
                 shutil.rmtree(d, ignore_errors=True)
                 log.info("evidence pruned by age: %s", d)
             else:
@@ -103,6 +119,8 @@ class EvidenceWriter:
         for d in survivors:
             if total <= cap:
                 break
+            if d == keep:
+                continue
             total -= sizes[d]
             shutil.rmtree(d, ignore_errors=True)
             log.info("evidence pruned by size: %s", d)

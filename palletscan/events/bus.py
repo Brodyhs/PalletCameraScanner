@@ -11,12 +11,12 @@ import queue
 import threading
 
 from palletscan.events.sinks import Sink
+from palletscan.reliability.queues import SENTINEL
 from palletscan.types import Event
 
 log = logging.getLogger(__name__)
 
-#: End-of-stream marker for queues (identity-compared).
-SENTINEL: object = object()
+__all__ = ["SENTINEL", "EventBus"]
 
 
 class EventBus:

@@ -23,9 +23,26 @@ def ensure_distutils() -> None:
         _distutils_hack.add_shim()
 
 
+LIB_HELP = (
+    "{lib} native library failed to load ({err}). "
+    "macOS: `brew install {pkg}`; if loading still fails: "
+    "`export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib`. "
+    "Windows: the pip wheel bundles the DLL — reinstall the package."
+)
+
+
 def import_pylibdmtx() -> ModuleType:
-    """Import and return ``pylibdmtx.pylibdmtx`` with the distutils shim."""
-    ensure_distutils()
-    from pylibdmtx import pylibdmtx
+    """Import and return ``pylibdmtx.pylibdmtx`` with the distutils shim.
+
+    Raises an actionable :class:`RuntimeError` (install/remediation steps)
+    instead of a bare ImportError when the native library fails to load.
+    """
+    try:
+        ensure_distutils()
+        from pylibdmtx import pylibdmtx
+    except Exception as exc:
+        raise RuntimeError(
+            LIB_HELP.format(lib="libdmtx", pkg="libdmtx", err=exc)
+        ) from exc
 
     return pylibdmtx
