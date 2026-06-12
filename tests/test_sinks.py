@@ -248,3 +248,74 @@ def test_bus_isolates_failing_sink_and_drains_on_shutdown() -> None:
     assert bus.sink_errors == 10
     assert bus.events_handled == 10
     assert good.closed
+
+
+# -- REVIEW_SYSTEM_0c30c77 finding 11 ------------------------------------------
+
+
+def test_wedged_sink_makes_shutdown_report_undrained() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 11 (repro: one hung sink write let
+    shutdown() time out silently; everything still queued died with the
+    daemon thread at exit 0). The caller must be able to fail the run."""
+    import threading
+
+    release = threading.Event()
+
+    class _WedgedSink(Sink):
+        def handle(self, event: Event) -> None:
+            release.wait(timeout=30.0)
+
+    bus = EventBus([_WedgedSink()], join_timeout_s=0.3)
+    bus.start()
+    for _ in range(3):
+        bus.publish(_pass("PLT-WEDGE"))
+    try:
+        assert bus.shutdown() is False
+        assert bus.events_lost >= 1, "the lost tail must be counted"
+    finally:
+        release.set()
+
+
+def test_clean_shutdown_reports_drained() -> None:
+    """Finding 11 control: a healthy sink set drains and reports True."""
+    seen: list[Event] = []
+
+    class _ListSink(Sink):
+        def handle(self, event: Event) -> None:
+            seen.append(event)
+
+    bus = EventBus([_ListSink()], join_timeout_s=5.0)
+    bus.start()
+    bus.publish(_pass("PLT-OK"))
+    assert bus.shutdown() is True
+    assert bus.events_lost == 0
+    assert len(seen) == 1
+
+
+def test_publish_after_shutdown_is_counted_never_silent() -> None:
+    """Finding 11, station variant: the business SENTINEL could overtake a
+    straggling per-camera bus still submitting through the deduper —
+    events behind the SENTINEL were never handled while counters kept
+    incrementing. The overtake is now counted and logged."""
+    import threading
+
+    release = threading.Event()
+
+    class _SlowSink(Sink):
+        def handle(self, event: Event) -> None:
+            release.wait(timeout=30.0)
+
+    bus = EventBus([_SlowSink()], join_timeout_s=0.3)
+    bus.start()
+    bus.publish(_pass("PLT-1"))  # parks the bus thread in the sink
+    shutdown_result: list[bool] = []
+    shutdown_thread = threading.Thread(
+        target=lambda: shutdown_result.append(bus.shutdown())
+    )
+    shutdown_thread.start()
+    while not bus._shutdown_started:
+        pass
+    bus.publish(_pass("PLT-LATE"))  # behind the SENTINEL: unreachable
+    release.set()
+    shutdown_thread.join(timeout=5.0)
+    assert bus.published_after_shutdown == 1

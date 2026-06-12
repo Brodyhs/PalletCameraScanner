@@ -31,6 +31,7 @@ and ``max_outage_s`` (off by default).
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import queue
 import random
@@ -98,6 +99,13 @@ class WatchdogSource(FrameSource):
         self._started = False
         self._attempt = 0  # resets only when a frame is actually yielded
         self._outage_start: float | None = None
+        # Set on every successful recovery; the next yielded frame carries
+        # discontinuity=True so the motion gate can break any segment that
+        # was open across the outage — a segment spanning a reconnect glues
+        # two different pallets together and a decoded one silently
+        # swallows the other's MissEvent (REVIEW finding 2, critical). The
+        # ts anchor is NOT touched (ASSUMPTIONS #29).
+        self._pending_discontinuity = False
         self.stalls_detected = 0
         self.reconnects = 0
         self.reopen_failures = 0
@@ -116,6 +124,22 @@ class WatchdogSource(FrameSource):
     @property
     def live(self) -> bool:
         return self.inner.live
+
+    @property
+    def epoch_wall(self) -> float | None:
+        """Wall-clock instant of the inner source's ts == 0 (None for
+        sources without a wall anchor). Forwarded explicitly: runners only
+        ever hold this wrapper, so an attribute that stops here is
+        invisible in exactly the production mode that needs it."""
+        wall = getattr(self.inner, "epoch_wall", None)
+        return float(wall) if wall is not None else None
+
+    @property
+    def connect_mismatches(self) -> int:
+        """Inner source's warn-level (re)connect divergences (0 for
+        sources without the counter); same forwarding rationale as
+        epoch_wall."""
+        return int(getattr(self.inner, "connect_mismatches", 0))
 
     def frames(self) -> Iterator[Frame]:
         """Yield frames forever across reopens; strictly single-use toward
@@ -143,6 +167,9 @@ class WatchdogSource(FrameSource):
             if kind == "frame":
                 self._attempt = 0
                 self._outage_start = None
+                if self._pending_discontinuity:
+                    self._pending_discontinuity = False
+                    payload = dataclasses.replace(payload, discontinuity=True)
                 yield payload
             elif kind == "error":
                 self._recover(f"reader failed: {payload!r}")
@@ -253,6 +280,10 @@ class WatchdogSource(FrameSource):
             self._drain()  # anything left belongs to dead generations
             self._spawn_reader()
             self.reconnects += 1
+            # Mark the boundary: motion continuity across the outage is
+            # unknowable, so the first frame of the new connection must
+            # break any open segment downstream (REVIEW finding 2).
+            self._pending_discontinuity = True
             log.info(
                 "watchdog %s: source reopened (reconnect #%d, %d zombie "
                 "reader(s) abandoned so far)",

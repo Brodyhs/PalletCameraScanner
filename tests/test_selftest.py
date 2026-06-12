@@ -24,10 +24,14 @@ def _disk(free_bytes: int = 100 * _GB):
     )
 
 
-def _lister_for(*names: str):
+def _lister_for(*names: str, backend: int | None = None):
     from palletscan.sources.devices import devices_from_names
 
-    return lambda: devices_from_names(list(names), int(cv2.CAP_MSMF))
+    # Default flag matches the test configs' explicit `backend: msmf`: an
+    # explicit backend that is NOT the enumeration backend is a hard
+    # resolve failure since REVIEW finding 8 (see the dedicated test).
+    flag = backend if backend is not None else int(cv2.CAP_MSMF)
+    return lambda: devices_from_names(list(names), flag)
 
 
 def _camera_cfg(tmp_path: Path, fps: float = 30.0) -> AppConfig:
@@ -185,7 +189,9 @@ def test_controls_warn_not_fail_on_avfoundation(tmp_path: Path) -> None:
     report = run_selftest(
         cfg,
         capture_factory=factory,
-        device_lister=_lister_for("FaceTime"),
+        # The dev-Mac scenario: enumeration backend IS AVFoundation, so the
+        # explicit backend matches (finding 8's mismatch rule stays quiet).
+        device_lister=_lister_for("FaceTime", backend=int(cv2.CAP_AVFOUNDATION)),
         disk_usage=_disk(),
         clock=clock,
         data_dir=tmp_path / "scratch",
@@ -295,3 +301,84 @@ def test_selftest_cli_exit_codes(tmp_path: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert rc == 1
     assert "refusing to run blind" in out
+
+
+# -- REVIEW_SYSTEM_0c30c77 findings b10 and 8 (selftest side) ------------------
+
+
+def test_decode_check_never_touches_production_evidence(tmp_path: Path) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b10 (repro: pointing --data-dir at
+    the live station data dir aimed the decode-check's burst at the
+    production evidence tree, and the unconditional post-write prune
+    deleted the oldest REAL miss bursts against the shared cap): the
+    check's outputs live in an isolated <data-dir>/selftest subtree."""
+    data = tmp_path / "data"
+    real_burst = data / "evidence" / "2026-06-01" / "cam-a-000007"
+    real_burst.mkdir(parents=True)
+    marker = real_burst / "frame_00000001.jpg"
+    marker.write_bytes(b"real miss evidence")
+
+    cfg = AppConfig.model_validate(
+        {
+            "evidence": {"dir": str(data / "evidence"), "max_total_mb": 0.0001},
+            "sinks": {"http": {"outbox_path": str(data / "outbox.db")}},
+        }
+    )
+    report = run_selftest(
+        cfg, skip_camera=True, disk_usage=_disk(), data_dir=data
+    )
+    decode = next(c for c in report.checks if c.name == "pipeline/decode")
+    assert decode.ok, decode.detail
+    assert marker.read_bytes() == b"real miss evidence"
+    assert real_burst.exists(), (
+        "the selftest run pruned a production miss burst (finding b10)"
+    )
+    assert (data / "selftest").exists()
+
+
+def test_explicit_backend_mismatch_fails_resolve_without_fallback(
+    tmp_path: Path,
+) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 8, selftest side: the gate must fail
+    the same configuration the run path refuses, instead of green-lighting
+    a station that opens DSHOW-ordered indexes under MSMF."""
+    clock = FakeClock()
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(clock=clock, real_fps=30.0)
+    )
+    cfg = _camera_cfg(tmp_path)  # backend msmf
+    report = run_selftest(
+        cfg,
+        capture_factory=factory,
+        device_lister=_lister_for("See3CAM_24CUG", backend=int(cv2.CAP_DSHOW)),
+        disk_usage=_disk(),
+        clock=clock,
+        data_dir=tmp_path / "scratch",
+    )
+    resolve = next(c for c in report.checks if c.name.endswith("/resolve"))
+    assert not resolve.ok
+    assert "enumeration backend" in resolve.detail
+    assert not report.ok
+
+
+def test_explicit_backend_with_fallback_index_resolves(tmp_path: Path) -> None:
+    """Finding 8, selftest side: the pinned-index escape hatch passes the
+    resolve check and probes the pinned index under the explicit flag."""
+    clock = FakeClock()
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(clock=clock, real_fps=30.0)
+    )
+    cfg = _camera_cfg(tmp_path)
+    cam = cfg.cameras[0].model_copy(update={"fallback_index": 1})
+    cfg = cfg.model_copy(update={"cameras": [cam]})
+    report = run_selftest(
+        cfg,
+        capture_factory=factory,
+        device_lister=_lister_for("See3CAM_24CUG", backend=int(cv2.CAP_DSHOW)),
+        disk_usage=_disk(),
+        clock=clock,
+        data_dir=tmp_path / "scratch",
+    )
+    resolve = next(c for c in report.checks if c.name.endswith("/resolve"))
+    assert resolve.ok, resolve.detail
+    assert factory.calls and factory.calls[0] == (1, int(cv2.CAP_MSMF))

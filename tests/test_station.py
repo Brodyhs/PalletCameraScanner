@@ -310,7 +310,7 @@ def test_failed_second_camera_closes_the_first(
     )
     opened: list[_RecordingSource] = []
 
-    def fake_create_source(per_cam_cfg):
+    def fake_create_source(per_cam_cfg, *, epoch=None, epoch_wall=None):
         if per_cam_cfg.source.camera == "camB":
             raise RuntimeError("camB: no matching device (unplugged)")
         source = _RecordingSource(per_cam_cfg.source.camera)
@@ -477,3 +477,108 @@ def test_business_view_takes_max_revision() -> None:
     view = _business_view([base, merged, base])
     assert len(view) == 1
     assert view[0].decode_count == 5
+
+
+# -- REVIEW_SYSTEM_0c30c77 findings b8 and 10 (station wiring) ----------------
+
+
+def test_station_passes_one_shared_epoch_to_every_camera(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b8: per-camera ts epochs were anchored
+    at each source's construction, so sequential connects (seconds apart)
+    skewed every cross-camera ts comparison. StationRunner must sample ONE
+    (monotonic, wall) pair before any device opens and hand it to all."""
+    import palletscan.station as station_mod
+
+    cfg = _station_cfg(tmp_path).model_copy(
+        update={
+            "source": SourceConfig(type="camera", cameras=["camA", "camB"]),
+            "cameras": [
+                CameraConfig(id="camA", name="a"),
+                CameraConfig(id="camB", name="b"),
+            ],
+        }
+    )
+    received: list[tuple] = []
+
+    def fake_create_source(per_cam_cfg, *, epoch=None, epoch_wall=None):
+        received.append((per_cam_cfg.source.camera, epoch, epoch_wall))
+        return _RecordingSource(per_cam_cfg.source.camera)
+
+    monkeypatch.setattr(station_mod, "create_source", fake_create_source)
+    StationRunner(cfg)
+    assert [r[0] for r in received] == ["camA", "camB"]
+    epochs = {r[1] for r in received}
+    walls = {r[2] for r in received}
+    assert len(epochs) == 1 and None not in epochs
+    assert len(walls) == 1 and None not in walls
+
+
+def test_station_seeds_deduper_from_previous_runs_store(tmp_path: Path) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 10 (repro: camB decodes the pallet
+    8 s after camA's pre-restart emit -> second business PassEvent) +
+    design-review fix: the seeding must engage THROUGH StationRunner's
+    construction gate (sources carrying epoch_wall + sqlite sink), not
+    just in a bare deduper."""
+    import dataclasses
+    import time
+    import uuid
+
+    from palletscan.events.sinks import SqliteSink
+    from palletscan.types import Symbology, iso_at
+
+    cfg = _station_cfg(tmp_path)
+    epoch_wall = time.time()
+    # The previous run stored a pass ~5 s before this process's ts=0.
+    prev = PassEvent(
+        payload="PLT-RESTART",
+        symbology=Symbology.QR,
+        first_seen_ts=100.0,
+        last_seen_ts=101.0,
+        decode_count=2,
+        cameras={"camA": 2},
+        best_frame=("camA", 7),
+        candidate_ids=["camA-x-000001"],
+        event_id=str(uuid.uuid4()),
+        wall_time_iso=iso_at(epoch_wall - 5.0),
+    )
+    sink = SqliteSink(cfg.sinks.sqlite.path)
+    sink.handle(prev)
+    sink.close()
+
+    class _WallSource(_RecordingSource):
+        def __init__(self, source_id: str, wall: float) -> None:
+            super().__init__(source_id)
+            self.epoch_wall = wall
+
+    station = StationRunner(
+        cfg,
+        sources=[_WallSource("camA", epoch_wall), _WallSource("camB", epoch_wall)],
+    )
+    # camB re-sights the pallet 3 s into the new run (8 s after the stored
+    # emit, inside the 12 s window): suppressed, counted, no publish.
+    resight = dataclasses.replace(
+        prev,
+        cameras={"camB": 1},
+        event_id=str(uuid.uuid4()),
+        first_seen_ts=2.5,
+        last_seen_ts=3.0,
+    )
+    station.deduper.submit(resight)
+    stats = station.deduper.stats()
+    assert stats["restart_repeats_suppressed"] == 1
+    assert stats["passes_emitted"] == 0
+    for runner in station.runners.values():
+        runner.stop()
+
+
+def test_station_does_not_seed_without_wall_anchor(tmp_path: Path) -> None:
+    """Finding 10 scope guard: synthetic/replay sources carry no
+    epoch_wall — their determinism must never depend on a previous run's
+    store."""
+    cfg = _station_cfg(tmp_path)
+    station, _ = _build_station(cfg)
+    assert station.deduper.stats()["restart_repeats_suppressed"] == 0
+    assert station.deduper._state == {}
+    station.stop()

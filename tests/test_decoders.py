@@ -69,3 +69,44 @@ def test_missing_native_lib_error_is_actionable(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setitem(sys.modules, "pyzbar", None)  # forces ImportError
     with pytest.raises(RuntimeError, match="brew install"):
         _import_pyzbar()
+
+
+# -- REVIEW_SYSTEM_0c30c77 finding 14 ------------------------------------------
+
+
+def test_decode_payload_utf8_round_trips() -> None:
+    from palletscan.pipeline.decoders import decode_payload
+
+    assert decode_payload(b"PLT-000123") == "PLT-000123"
+    assert decode_payload("PLT-MÜNCHEN-0042".encode("utf-8")) == "PLT-MÜNCHEN-0042"
+
+
+def test_decode_payload_latin1_fallback_never_replaces() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 14 (repro: the stored payload was
+    PLT-M�NCHEN-0042 and reconciliation bucketed the pallet as missing
+    AND unexpected forever): non-UTF-8 symbol bytes decode via Latin-1 —
+    ISO/IEC 16022's default interpretation, a total 1:1 mapping — so no
+    byte sequence ever becomes U+FFFD."""
+    from palletscan.pipeline.decoders import decode_payload
+
+    assert decode_payload(b"PLT-M\xdcNCHEN-0042") == "PLT-MÜNCHEN-0042"
+    for raw in (b"\x80\x81\xfe\xff", b"PLT-\xa0\xa1", bytes(range(128, 256))):
+        decoded = decode_payload(raw)
+        assert "�" not in decoded
+        assert decoded.encode("latin-1") == raw  # lossless
+
+
+def test_latin1_dm_label_decodes_to_manifest_matchable_payload() -> None:
+    """Finding 14 end-to-end: a spec-compliant DM printer emitting Latin-1
+    produces a symbol whose decoded payload equals the strict-UTF-8
+    manifest string — the headline trial number stops deflating."""
+    from palletscan._compat import import_pylibdmtx
+
+    pylibdmtx = import_pylibdmtx()
+    expected = "PLT-MÜNCHEN-0042"
+    encoded = pylibdmtx.encode(expected.encode("latin-1"))
+    img = np.frombuffer(encoded.pixels, np.uint8).reshape(
+        encoded.height, encoded.width, 3
+    )[:, :, 0]
+    decodes = PylibdmtxDecoder().decode(np.ascontiguousarray(img), timeout_ms=2000)
+    assert [r.payload for r in decodes] == [expected]

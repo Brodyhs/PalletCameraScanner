@@ -175,9 +175,24 @@ def _check_cameras(
         try:
             if devices:
                 dev = find_device(devices, cam.name)
-                index, flag = dev.index, (
-                    dev.backend if cam.backend.value == "auto" else backend_flag(cam.backend)
-                )
+                if cam.backend.value == "auto":
+                    index, flag = dev.index, dev.backend
+                else:
+                    flag = backend_flag(cam.backend)
+                    if flag != dev.backend:
+                        # Same rule as CameraSource._resolve (REVIEW
+                        # finding 8): a name-resolved index is only valid
+                        # under its enumeration backend.
+                        if cam.fallback_index is None:
+                            raise ValueError(
+                                f"explicit backend {cam.backend} is not the "
+                                "enumeration backend and no fallback_index "
+                                "is pinned; a name-resolved index under "
+                                "another backend can open the wrong camera"
+                            )
+                        index = cam.fallback_index
+                    else:
+                        index = dev.index
             elif cam.fallback_index is not None:
                 index, flag = cam.fallback_index, backend_flag(cam.backend)
             else:
@@ -278,8 +293,13 @@ def _check_pipeline_decode(
             )
         images.append(img)
         expected.add(payload)
+    # Always an isolated subtree: pointing --data-dir at the live station
+    # data dir must never aim this check's evidence burst (and its
+    # unconditional post-write prune) at the production evidence tree —
+    # the prune would delete the oldest *real* miss bursts against the
+    # shared cap (REVIEW finding b10).
     scratch = (
-        Path(data_dir)
+        Path(data_dir) / "selftest"
         if data_dir is not None
         else Path(tempfile.mkdtemp(prefix="palletscan-selftest-"))
     )

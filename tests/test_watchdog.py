@@ -575,3 +575,73 @@ def test_real_clock_recovery_well_under_the_10s_gate() -> None:
     assert wd.reconnects == 1
     assert wd.zombie_readers == 0  # release() unblocked the hung read
     assert recovery_s < 5.0, f"recovery took {recovery_s:.2f}s (gate is 10s)"
+
+
+def test_first_frame_after_recovery_carries_discontinuity_flag() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 2 (critical), watchdog half: after a
+    reopen, frames() resumed yielding with NO discontinuity signal, so a
+    motion segment open at the stall glued onto post-reconnect motion and
+    a decoded pallet on the far side swallowed the pre-gap pallet's
+    MissEvent. Exactly the first new-generation frame is marked; the ts
+    anchor is untouched (ASSUMPTIONS #29)."""
+    clock = FakeClock()
+    src, _ = _camera(
+        [_cap(clock, ["ok", "ok", RuntimeError("usb reset")])], clock
+    )
+    wd = WatchdogSource(
+        src, _wcfg(), rng=_FixedRng(), sleeper=_RecordingSleeper()
+    )
+    got = list(itertools.islice(wd.frames(), 5))
+    wd.close()
+    assert wd.reconnects == 1
+    assert [f.discontinuity for f in got] == [False, False, True, False, False]
+    ts = [f.ts for f in got]
+    assert ts == sorted(ts) and len(set(ts)) == len(ts), (
+        "ts must stay monotonic across the reconnect, never re-anchored"
+    )
+
+
+def test_every_recovery_marks_a_discontinuity() -> None:
+    """Finding 2: two outages -> two marked boundary frames (the flag is
+    per-recovery, not once-ever)."""
+    clock = FakeClock()
+    factory_caps = [
+        _cap(clock, ["ok", RuntimeError("reset 1")]),
+        _cap(clock, ["ok", RuntimeError("reset 2")]),
+    ]
+    src, _ = _camera(factory_caps, clock)
+    wd = WatchdogSource(
+        src, _wcfg(), rng=_FixedRng(), sleeper=_RecordingSleeper()
+    )
+    got = list(itertools.islice(wd.frames(), 4))
+    wd.close()
+    assert wd.reconnects == 2
+    assert [f.discontinuity for f in got] == [False, True, True, False]
+
+
+def test_wrapper_forwards_epoch_wall_and_connect_mismatches() -> None:
+    """Design-review fix for findings 3/10/b12: runners only ever hold the
+    WatchdogSource wrapper, so epoch_wall and connect_mismatches must
+    forward from the inner camera or the wall-bridge seeding and the
+    health gauge are silently dead in exactly the production mode."""
+    clock = FakeClock()
+    src, _ = _camera([_cap(clock, [])], clock)
+    wd = WatchdogSource(src, _wcfg())
+    assert wd.epoch_wall == src.epoch_wall
+    assert wd.connect_mismatches == src.connect_mismatches
+    wd.close()
+
+    class _BareReopenable(FrameSource):
+        @property
+        def source_id(self) -> str:
+            return "bare"
+
+        def frames(self) -> Iterator[Frame]:  # pragma: no cover
+            return iter(())
+
+        def reopen(self) -> None:  # pragma: no cover
+            pass
+
+    bare = WatchdogSource(_BareReopenable(), _wcfg())
+    assert bare.epoch_wall is None
+    assert bare.connect_mismatches == 0

@@ -55,10 +55,12 @@ _KNOWN_GAUGES = frozenset(
         "dmtx_calls",
         "fallback_calls",
         "budget_overruns",
+        "evidence_failures",
         "source_stalls",
         "source_reconnects",
         "source_reopen_failures",
         "source_zombie_readers",
+        "source_connect_mismatches",
     }
 )
 
@@ -253,12 +255,22 @@ class MetricsRegistry:
                 "merged": self._gauge("passes_merged"),
                 "per_hour": round(per_hour, 2),
             },
-            "misses": {"emitted": self._gauge("misses_emitted")},
+            "misses": {
+                "emitted": self._gauge("misses_emitted"),
+                # Misses whose evidence burst could not be stored (full
+                # disk): the event still emits, flagged — this surfaces the
+                # degraded state on the dashboard (REVIEW finding 1).
+                "evidence_failures": self._gauge("evidence_failures"),
+            },
             "source": {
                 "stalls": self._gauge("source_stalls"),
                 "reconnects": self._gauge("source_reconnects"),
                 "reopen_failures": self._gauge("source_reopen_failures"),
                 "zombie_readers": self._gauge("source_zombie_readers"),
+                # Warn-level (re)connect divergences (unverified controls,
+                # negotiated-vs-configured fourcc): the camera runs, but not
+                # exactly as locked (REVIEW findings 3/8 policy).
+                "connect_mismatches": self._gauge("source_connect_mismatches"),
             },
             "read_rate_1h": read_rate,
             "read_rate_24h": read_rate_24h,

@@ -381,6 +381,20 @@ class LoggingConfig(_StrictModel):
     level: str = "INFO"
     file: LogFileConfig = Field(default_factory=LogFileConfig)
 
+    @field_validator("level")
+    @classmethod
+    def _level_known(cls, v: str) -> str:
+        # An unknown name would otherwise blow up inside setup_logging's
+        # setLevel with a raw traceback (exit 1); making it a validation
+        # error keeps it on the documented exit-2 fix-the-config path.
+        name = v.upper()
+        known = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+        if name not in known:
+            raise ValueError(
+                f"logging.level must be one of {sorted(known)}, got {v!r}"
+            )
+        return name
+
 
 class LockConfig(_StrictModel):
     """Single-instance lock (see ``reliability/instance_lock.py``).
@@ -575,7 +589,8 @@ def resolve_camera(cfg: AppConfig) -> CameraConfig:
     if not cfg.cameras:
         raise ValueError(
             "source.type=camera requires at least one cameras[] entry "
-            "(run `palletscan calibrate --save` to create one)"
+            "(create one with `palletscan calibrate --camera <id> "
+            "--name '<device-name substring>' --save --config <file>`)"
         )
     if cfg.source.camera is None:
         if len(cfg.cameras) == 1:

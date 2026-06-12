@@ -38,7 +38,9 @@ if TYPE_CHECKING:
 
 def _add_synth_parser(sub: "argparse._SubParsersAction") -> None:
     p = sub.add_parser(
-        "synth", help="run the pipeline on generated synthetic pallet passes"
+        "synth",
+        allow_abbrev=False,
+        help="run the pipeline on generated synthetic pallet passes",
     )
     p.add_argument("--config", type=Path, default=None, help="YAML config path")
     p.add_argument("--passes", type=int, default=None, help="number of passes")
@@ -135,7 +137,9 @@ def _start_dashboard(
 
 def _add_replay_parser(sub: "argparse._SubParsersAction") -> None:
     p = sub.add_parser(
-        "replay", help="replay a recorded .mp4/.avi clip through the pipeline"
+        "replay",
+        allow_abbrev=False,
+        help="replay a recorded .mp4/.avi clip through the pipeline",
     )
     p.add_argument("file", type=Path, help="video file to replay")
     p.add_argument("--config", type=Path, default=None, help="YAML config path")
@@ -178,7 +182,9 @@ def _add_replay_parser(sub: "argparse._SubParsersAction") -> None:
 
 def _add_run_parser(sub: "argparse._SubParsersAction") -> None:
     p = sub.add_parser(
-        "run", help="run the pipeline on the configured source (live cameras)"
+        "run",
+        allow_abbrev=False,
+        help="run the pipeline on the configured source (live cameras)",
     )
     p.add_argument("--config", type=Path, default=None, help="YAML config path")
     p.add_argument(
@@ -201,6 +207,7 @@ def _add_run_parser(sub: "argparse._SubParsersAction") -> None:
 def _add_dashboard_parser(sub: "argparse._SubParsersAction") -> None:
     p = sub.add_parser(
         "dashboard",
+        allow_abbrev=False,
         help="serve the dashboard read-only against an existing events DB "
         "(no runners; how a finished trial gets reviewed)",
     )
@@ -217,6 +224,7 @@ def _add_dashboard_parser(sub: "argparse._SubParsersAction") -> None:
 def _add_calibrate_parser(sub: "argparse._SubParsersAction") -> None:
     p = sub.add_parser(
         "calibrate",
+        allow_abbrev=False,
         help="probe camera modes, verify controls, lock-and-save settings",
     )
     p.add_argument("--config", type=Path, default=None, help="YAML config path")
@@ -255,6 +263,7 @@ def _add_calibrate_parser(sub: "argparse._SubParsersAction") -> None:
 def _add_supervise_parser(sub: "argparse._SubParsersAction") -> None:
     p = sub.add_parser(
         "supervise",
+        allow_abbrev=False,
         help="restart a writer command on any nonzero exit, with crash-loop "
         "backoff, countable exit codes (logs/restarts.jsonl) and a "
         "stop-file stop channel (what the Windows scheduled task runs)",
@@ -298,7 +307,9 @@ def _add_supervise_parser(sub: "argparse._SubParsersAction") -> None:
 
 def _add_selftest_parser(sub: "argparse._SubParsersAction") -> None:
     p = sub.add_parser(
-        "selftest", help="startup checks: cameras, full-pipeline decode, disk"
+        "selftest",
+        allow_abbrev=False,
+        help="startup checks: cameras, full-pipeline decode, disk",
     )
     p.add_argument("--config", type=Path, default=None, help="YAML config path")
     p.add_argument(
@@ -388,6 +399,51 @@ def _hold_lock_and_file_logging(
     return _WriterLease(lock, handler)
 
 
+def _start_parent_watch_if_supervised(
+    runner: "PipelineRunner | StationRunner",
+) -> "object | None":
+    """When spawned by `palletscan supervise` (SUPERVISOR_PID_ENV set),
+    watch the supervisor and gracefully self-stop if it dies: an orphaned
+    writer holds the instance lock, ignores every stop channel, and keeps
+    scanning under a stale config until killed by hand (REVIEW finding 6).
+    Returns the watch (caller must ``stop()`` it in its finally — main()
+    runs in-process under pytest and must not leak threads), or None."""
+    from palletscan.reliability.supervisor import SUPERVISOR_PID_ENV, ParentWatch
+
+    raw = os.environ.get(SUPERVISOR_PID_ENV)
+    if not raw:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    watch = ParentWatch(pid, runner.stop)
+    watch.start()
+    return watch
+
+
+def _stop_parent_watch(watch: "object | None") -> None:
+    if watch is not None:
+        watch.stop()  # type: ignore[attr-defined]
+
+
+def _load_config_checked(path: Path | None, command: str) -> AppConfig | None:
+    """Load the YAML config; any load/validation failure becomes the
+    documented exit-2 contract (clean message, no traceback) instead of an
+    exit-1 raw pydantic dump — the supervisor's dedicated exit-2
+    "fix the config" branch depends on it (REVIEW finding b2). Returns
+    None after printing; the caller returns 2."""
+    try:
+        return load_config(path)
+    except Exception as exc:
+        print(
+            f"{command}: invalid config {path}: {exc}\n"
+            f"{command}: fix the config file and retry",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _exit_code_for(exc: BaseException) -> int:
     """Map a pipeline failure to its exit code (3 = watchdog escalation,
     ruling #5: 'USB stack wedged, check cable/hub' vs 'software crashed,
@@ -401,7 +457,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     from palletscan.app import PipelineRunner
     from palletscan.station import StationRunner
 
-    cfg = load_config(args.config)
+    cfg = _load_config_checked(args.config, "run")
+    if cfg is None:
+        return 2
     cfg = apply_overrides(cfg, data_dir=args.data_dir)
     if args.camera is not None:
         # An explicit --camera narrows an A/B config to one arm.
@@ -416,6 +474,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     lease = _hold_lock_and_file_logging(cfg, "run")
     if lease is None:
         return 4
+    watch = None
     try:
         try:
             runner: PipelineRunner | StationRunner = (
@@ -429,6 +488,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"run: {exc}", file=sys.stderr)
             return 1
         _install_stop_signals(runner)
+        watch = _start_parent_watch_if_supervised(runner)
         dashboard = None
         if args.dashboard or cfg.web.enabled:
             if isinstance(runner, StationRunner):
@@ -451,13 +511,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(summary.format())
         return 0
     finally:
+        _stop_parent_watch(watch)
         lease.release()
 
 
 def _cmd_calibrate(args: argparse.Namespace) -> int:
     from palletscan.calibrate import CalibrateOptions, run_calibration
 
-    cfg = load_config(args.config)
+    cfg = _load_config_checked(args.config, "calibrate")
+    if cfg is None:
+        return 2
     setup_logging(cfg.logging.level)
     opts = CalibrateOptions(
         list_only=args.list,
@@ -481,7 +544,14 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
 def _cmd_selftest(args: argparse.Namespace) -> int:
     from palletscan.selftest import run_selftest
 
-    cfg = load_config(args.config)
+    cfg = _load_config_checked(args.config, "selftest")
+    if cfg is None:
+        return 2
+    # Rebase exactly like _cmd_run does: the disk gate must probe the
+    # volumes the deployed station actually writes to, not the config
+    # file's cwd-relative defaults (REVIEW finding 12 — the only disk
+    # check in the system was green while the real volume filled).
+    cfg = apply_overrides(cfg, data_dir=args.data_dir)
     setup_logging(cfg.logging.level)
     report = run_selftest(
         cfg, skip_camera=args.skip_camera, data_dir=args.data_dir
@@ -494,7 +564,20 @@ def _cmd_synth(args: argparse.Namespace) -> int:
     from palletscan.app import PipelineRunner
     from palletscan.sources.synthetic import SyntheticSource
 
-    cfg = load_config(args.config)
+    cfg = _load_config_checked(args.config, "synth")
+    if cfg is None:
+        return 2
+    # Pin the synthetic source no matter what the config declares (the
+    # same pin replay applies to video): `synth` on a camera config must
+    # never silently open the real cameras and write real passes into
+    # production sinks under the synth banner (REVIEW finding b13).
+    cfg = cfg.model_copy(
+        update={
+            "source": cfg.source.model_copy(
+                update={"type": "synthetic", "camera": None, "cameras": None}
+            )
+        }
+    )
     cfg = apply_overrides(
         cfg, num_passes=args.passes, seed=args.seed, data_dir=args.data_dir
     )
@@ -504,6 +587,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
     lease = _hold_lock_and_file_logging(cfg, "synth")
     if lease is None:
         return 4
+    watch = None
     try:
         if args.ab:
             from palletscan.sources.factory import synthetic_tail_s
@@ -519,6 +603,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
             ]
             station = StationRunner(cfg, sources=sources)
             _install_stop_signals(station)
+            watch = _start_parent_watch_if_supervised(station)
             dashboard = None
             if args.dashboard or cfg.web.enabled:
                 try:
@@ -548,6 +633,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
             return 0 if station_summary.unaccounted == 0 else 1
         runner = PipelineRunner.from_config(cfg)
         _install_stop_signals(runner)
+        watch = _start_parent_watch_if_supervised(runner)
         dashboard = None
         if args.dashboard or cfg.web.enabled:
             try:
@@ -568,6 +654,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
         print(summary.format())
         return 0 if summary.unaccounted == 0 else 1
     finally:
+        _stop_parent_watch(watch)
         lease.release()
 
 
@@ -595,6 +682,19 @@ def _install_supervise_signals(sup: "Supervisor") -> None:
             signal.signal(sig, _on_directed)
 
 
+def _child_carries_data_dir(child: list[str]) -> bool:
+    """True when the child args set their own data dir, in either argparse
+    spelling (``--data-dir X`` or ``--data-dir=X``). The ``=`` form used to
+    slip past an exact-token check, get the supervisor's own ``--data-dir``
+    appended after it, and argparse-last-wins silently ran the child on the
+    supervisor's directory (REVIEW finding b1). Abbreviations like
+    ``--data`` are no longer a spelling: the CLI parses with
+    ``allow_abbrev=False``, so they fail loudly in the child instead."""
+    return any(
+        tok == "--data-dir" or tok.startswith("--data-dir=") for tok in child
+    )
+
+
 def _cmd_supervise(args: argparse.Namespace) -> int:
     from palletscan.config import LogFileConfig
     from palletscan.logging_setup import add_rotating_file_handler
@@ -611,7 +711,7 @@ def _cmd_supervise(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if "--data-dir" not in child:
+    if not _child_carries_data_dir(child):
         # The diagram in the RUNBOOK holds by construction: the child's
         # lock/sinks/logs land under the supervisor's data-dir.
         child += ["--data-dir", str(args.data_dir)]
@@ -663,7 +763,9 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     from palletscan.web.server import DashboardServer, DashboardServerError
     from palletscan.web.store import ReadStore, ReadStoreError
 
-    cfg = load_config(args.config)
+    cfg = _load_config_checked(args.config, "dashboard")
+    if cfg is None:
+        return 2
     cfg = apply_overrides(cfg, data_dir=args.data_dir)
     setup_logging(cfg.logging.level)
     if not cfg.sinks.sqlite.enabled:
@@ -719,7 +821,9 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     from palletscan.config import VideoConfig
     from palletscan.sources.synthetic import load_truth_jsonl
 
-    cfg = load_config(args.config)
+    cfg = _load_config_checked(args.config, "replay")
+    if cfg is None:
+        return 2
     cfg = apply_overrides(cfg, data_dir=args.data_dir)
     video_update: dict = {"path": args.file}
     if args.speed is not None:
@@ -754,9 +858,11 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     lease = _hold_lock_and_file_logging(cfg, "replay")
     if lease is None:
         return 4
+    watch = None
     try:
         runner = PipelineRunner.from_config(cfg)
         _install_stop_signals(runner)
+        watch = _start_parent_watch_if_supervised(runner)
         dashboard = None
         if args.dashboard or cfg.web.enabled:
             try:
@@ -779,13 +885,18 @@ def _cmd_replay(args: argparse.Namespace) -> int:
         print(summary.format())
         return 0 if summary.unaccounted == 0 else 1
     finally:
+        _stop_parent_watch(watch)
         lease.release()
 
 
 def main(argv: list[str] | None = None) -> int:
+    # No option abbreviations anywhere: an abbreviated --data-dir spelling
+    # ("--data") used to slip past supervise's append gate and silently run
+    # the child on the wrong data dir (REVIEW finding b1).
     parser = argparse.ArgumentParser(
         prog="palletscan",
         description="Fixed-camera QR/Data Matrix pallet scanning pipeline",
+        allow_abbrev=False,
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("version", help="print version")

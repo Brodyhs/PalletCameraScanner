@@ -467,7 +467,195 @@ def test_forwarding_sink_routes_and_close_is_noop(deduper) -> None:
         "passes_emitted": 1,
         "cross_camera_merges": 0,
         "repeats_suppressed": 0,
+        "restart_repeats_suppressed": 0,
         "reemits": 0,
         "misses_forwarded": 1,
         "forced_evictions": 0,
     }
+
+
+# -- REVIEW_SYSTEM_0c30c77 findings 9 and 10 -----------------------------------
+
+
+def _business_rows(published: list[Event]) -> dict[str, PassEvent]:
+    """Max-revision view per event_id (what SqliteSink's guarded upsert
+    stores)."""
+    rows: dict[str, PassEvent] = {}
+    for ev in published:
+        if not isinstance(ev, PassEvent):
+            continue
+        prev = rows.get(ev.event_id)
+        if prev is None or ev.revision >= prev.revision:
+            rows[ev.event_id] = ev
+    return rows
+
+
+def test_stale_lagging_event_merges_into_the_old_pass_not_the_new(deduper) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 9 (executed repro: two physical
+    passes 62 s apart collapsed into ONE business row spanning
+    first_seen=33->105). camB's outage-deferred, backdated pass-1 sighting
+    must merge into pass-1's retained entry — never be absorbed into the
+    newer pass and never collapse the two rows. (The declared camera set
+    is what retains the entry — #51's slowest-camera rule — exactly as
+    StationRunner wires it.)"""
+    published: list[Event] = []
+    d = CrossCameraDeduper(published.append, WINDOW_S, cameras=["camA", "camB"])
+    d.submit(_pass("PLT-9", "camA", first_seen=33.0, last_seen=43.0))   # pass 1
+    d.submit(_pass("PLT-9", "camA", first_seen=100.0, last_seen=105.0))  # pass 2
+    # camB stalled since pass 1; its backdated close arrives last.
+    stale = _pass("PLT-9", "camB", first_seen=33.0, last_seen=33.5)
+    d.submit(stale)
+    stats = d.stats()
+    assert stats["passes_emitted"] == 2, "two physical passes, two rows"
+    assert stats["cross_camera_merges"] == 1
+    assert stats["repeats_suppressed"] == 0
+    rows = _business_rows(published)
+    assert len(rows) == 2
+    spans = sorted((r.first_seen_ts, r.last_seen_ts) for r in rows.values())
+    # pass 1's row gained camB's detail but stayed in its own window; pass
+    # 2's row is untouched.
+    assert spans[0][0] == 33.0 and spans[0][1] <= 43.0
+    assert spans[1] == (100.0, 105.0)
+    merged_row = next(r for r in rows.values() if "camB" in r.cameras)
+    assert merged_row.first_seen_ts == 33.0 and merged_row.last_seen_ts <= 43.0
+
+
+def test_lagging_cameras_next_genuine_sighting_is_not_suppressed(deduper) -> None:
+    """Finding 9, aggravator 2: after the (formerly bogus) merge put camB
+    into the wrong entry's camera set, camB's REAL pass-2 sighting was
+    dropped as a same-camera repeat. With per-entry matching it must merge
+    into pass-2's entry."""
+    published: list[Event] = []
+    d = CrossCameraDeduper(published.append, WINDOW_S, cameras=["camA", "camB"])
+    d.submit(_pass("PLT-10", "camA", first_seen=0.0, last_seen=0.5))    # pass 1
+    d.submit(_pass("PLT-10", "camA", first_seen=13.0, last_seen=13.5))  # pass 2
+    d.submit(_pass("PLT-10", "camB", first_seen=6.0, last_seen=6.0))    # lagging pass 1
+    d.submit(_pass("PLT-10", "camB", first_seen=14.0, last_seen=14.0))  # genuine pass 2
+    stats = d.stats()
+    assert stats["passes_emitted"] == 2
+    assert stats["cross_camera_merges"] == 2, (
+        "camB's pass-2 sighting must merge, not be suppressed"
+    )
+    assert stats["repeats_suppressed"] == 0
+    rows = _business_rows(published)
+    assert all(set(r.cameras) == {"camA", "camB"} for r in rows.values())
+
+
+def test_event_matching_two_anchors_picks_the_nearest(deduper) -> None:
+    """Finding 9, design-review fix: anchors pairwise > window apart can
+    still BOTH be within the window of one event (spacing in (w, 2w]);
+    the nearest anchor wins deterministically."""
+    published: list[Event] = []
+    d = CrossCameraDeduper(
+        published.append, WINDOW_S, cameras=["camA", "camB", "camC"]
+    )
+    d.submit(_pass("PLT-11", "camA", first_seen=0.0, last_seen=0.0))
+    d.submit(_pass("PLT-11", "camA", first_seen=13.0, last_seen=13.0))
+    d.submit(_pass("PLT-11", "camB", first_seen=6.0, last_seen=6.0))   # nearest: 0
+    d.submit(_pass("PLT-11", "camC", first_seen=10.0, last_seen=10.0))  # nearest: 13
+    rows = _business_rows(published)
+    by_anchor = {r.last_seen_ts: r for r in rows.values()}
+    assert set(by_anchor[6.0].cameras) == {"camA", "camB"}
+    assert set(by_anchor[13.0].cameras) == {"camA", "camC"}
+
+
+def test_restart_seed_suppresses_within_window_and_counts(deduper) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 10 (executed repro: camB decodes the
+    pallet 8 s after camA's pre-restart emit -> second business PassEvent,
+    inflation with no detectable trace). A seeded anchor from the previous
+    run suppresses the re-sighting, counted and logged — and never
+    refreshes (parked-pallet rule)."""
+    d, published = deduper
+    d.seed({"PLT-12": -5.0})
+    d.submit(_pass("PLT-12", "camB", first_seen=4.5, last_seen=5.0))  # 10 s later
+    assert published == []
+    assert d.stats()["restart_repeats_suppressed"] == 1
+    # Anchor not refreshed: a sighting beyond the seed's window emits.
+    d.submit(_pass("PLT-12", "camB", first_seen=8.0, last_seen=8.0))  # 13 s later
+    assert len(published) == 1
+    assert d.stats()["passes_emitted"] == 1
+
+
+def test_without_seed_the_restart_pass_double_counts(deduper) -> None:
+    """Finding 10 control (the review's executed control was the inverse:
+    same sequence WITHOUT restart yields 1): a fresh deduper without the
+    seed emits the re-sighting as a new business pass — the exact
+    inflation the seed exists to stop."""
+    d, published = deduper
+    d.submit(_pass("PLT-13", "camB", first_seen=4.5, last_seen=5.0))
+    assert len(published) == 1  # would be the double-count after a restart
+
+
+def test_seed_and_live_entry_matched_in_one_pass(deduper) -> None:
+    """Finding 10, design-review fix: seeds must compete with live entries
+    by distance, not be checked first — a sighting nearer a live entry
+    merges into it (camera detail preserved) instead of being swallowed by
+    the seed."""
+    d, published = deduper
+    d.seed({"PLT-14": -5.0})
+    d.submit(_pass("PLT-14", "camA", first_seen=7.5, last_seen=8.0))  # beyond seed: emits
+    assert d.stats()["passes_emitted"] == 1
+    d.submit(_pass("PLT-14", "camB", first_seen=6.0, last_seen=6.0))  # nearest: live @8
+    stats = d.stats()
+    assert stats["cross_camera_merges"] == 1
+    assert stats["restart_repeats_suppressed"] == 0
+    rows = _business_rows(published)
+    assert set(next(iter(rows.values())).cameras) == {"camA", "camB"}
+
+
+def test_load_restart_seeds_missing_db_returns_empty_and_creates_nothing(
+    tmp_path: Path,
+) -> None:
+    """Finding 10, design-review fix: a fresh data dir (first boot) has no
+    DB; the loader must neither raise nor create the file (SqliteSink owns
+    migration)."""
+    from palletscan.events.dedup import load_restart_seeds
+
+    db = tmp_path / "palletscan.db"
+    assert load_restart_seeds(db, WINDOW_S, time.time()) == {}
+    assert not db.exists()
+
+
+def test_load_restart_seeds_unmigrated_db_returns_empty(tmp_path: Path) -> None:
+    """Finding 10, design-review fix: a zero-schema DB file (lazy
+    migration never ran) must yield no seeds, not an OperationalError at
+    station construction."""
+    from palletscan.events.dedup import load_restart_seeds
+
+    db = tmp_path / "palletscan.db"
+    sqlite3.connect(db).close()  # creates an empty, table-less database
+    assert load_restart_seeds(db, WINDOW_S, time.time()) == {}
+
+
+def test_load_restart_seeds_bridges_clamps_and_filters(tmp_path: Path) -> None:
+    """Finding 10: the wall bridge end to end through SqliteSink rows —
+    MAX wall per payload, anchors <= 0, future-stamped rows discarded
+    (clock stepped backward), camera filter via the stored cameras map."""
+    from palletscan.events.dedup import load_restart_seeds
+    from palletscan.types import iso_at
+
+    db = tmp_path / "palletscan.db"
+    sink = SqliteSink(db)
+    epoch_wall = 1_000_000.0
+
+    def _stamped(payload: str, camera: str, wall: float) -> PassEvent:
+        ev = _pass(payload, camera, first_seen=1.0, last_seen=2.0)
+        import dataclasses
+
+        return dataclasses.replace(ev, wall_time_iso=iso_at(wall))
+
+    sink.handle(_stamped("PLT-A", "camA", epoch_wall - 10.0))
+    sink.handle(_stamped("PLT-A", "camA", epoch_wall - 4.0))   # newest wins
+    sink.handle(_stamped("PLT-B", "camB", epoch_wall - 6.0))
+    sink.handle(_stamped("PLT-OLDER", "camA", epoch_wall - 500.0))  # outside cutoff
+    sink.handle(_stamped("PLT-FUTURE", "camA", epoch_wall + 30.0))  # clock step
+    sink.close()
+
+    seeds = load_restart_seeds(db, WINDOW_S, epoch_wall)
+    assert seeds.keys() == {"PLT-A", "PLT-B"}
+    assert seeds["PLT-A"] == pytest.approx(-4.0, abs=0.01)
+    assert seeds["PLT-B"] == pytest.approx(-6.0, abs=0.01)
+    assert all(v <= 0 for v in seeds.values())
+
+    only_b = load_restart_seeds(db, WINDOW_S, epoch_wall, camera="camB")
+    assert only_b.keys() == {"PLT-B"}

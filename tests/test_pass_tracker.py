@@ -176,6 +176,180 @@ def test_flush_closes_open_decoded_segment(setup) -> None:
     assert events[0].payload == "PLT-000009"
 
 
+class _ExplodingWriter:
+    """Evidence writer whose write_burst always raises (non-OSError, so it
+    exercises the tracker's belt-and-braces layer, not the writer's own
+    OSError tolerance)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def write_burst(self, candidate_id, frames, meta):
+        self.calls += 1
+        raise RuntimeError("simulated evidence failure")
+
+
+class _RecordingWriter:
+    """Captures the frames handed to write_burst without touching disk."""
+
+    def __init__(self) -> None:
+        self.bursts: list[list[Frame]] = []
+
+    def write_burst(self, candidate_id, frames, meta):
+        from palletscan.events.evidence import EvidenceRef
+
+        self.bursts.append(list(frames))
+        return EvidenceRef(directory=Path("/dev/null"), frame_count=len(frames))
+
+
+def _tracker_with_writer(writer, ts_to_wall=None):
+    events: list = []
+    buffer = RollingFrameBuffer(horizon_s=5.0)
+    tracker = PassTracker(
+        dedup_cfg=DedupConfig(window_s=12.0),
+        buffer_cfg=BufferConfig(pre_s=2.0, post_s=2.0),
+        evidence=writer,
+        buffer=buffer,
+        emit=events.append,
+        source_id="cam0",
+        ts_to_wall=ts_to_wall,
+    )
+    return tracker, buffer, events
+
+
+def test_evidence_write_failure_still_emits_flagged_miss() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 1 (reproduced there): the pending miss
+    was destructively popped before the emit, so a raising evidence write
+    swallowed the MissEvent permanently — even a one-shot transient fault
+    recovered nothing. The miss must emit evidence-less and flagged."""
+    tracker, buffer, events = _tracker_with_writer(_ExplodingWriter())
+    _feed_frames(tracker, buffer, range(0, 30))
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 30))
+    _feed_frames(tracker, buffer, range(30, 50))
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 50))
+    _feed_frames(tracker, buffer, range(50, 50 + int(2.0 * FPS) + 2))
+    assert len(events) == 1
+    miss = events[0]
+    assert isinstance(miss, MissEvent)
+    assert miss.evidence_error is not None
+    assert miss.evidence_dir == ""
+    assert miss.evidence_frame_count == 0
+    assert tracker.misses_emitted == 1
+    assert tracker.evidence_failures == 1
+
+
+def test_flush_drain_survives_evidence_failures() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 1, shutdown variant: the same raise
+    aborted the flush drain loop, discarding ALL remaining pending misses
+    at once. Every pending miss must emit."""
+    tracker, buffer, events = _tracker_with_writer(_ExplodingWriter())
+    for n, (o, c) in enumerate([(10, 20), (40, 50), (70, 80)], start=1):
+        cid = f"cam0-{n:06d}"
+        tracker.on_segment_open(_seg(SegmentKind.OPEN, cid, o))
+        tracker.on_segment_close(_seg(SegmentKind.CLOSE, cid, c))
+    tracker.flush()
+    misses = [e for e in events if isinstance(e, MissEvent)]
+    assert len(misses) == 3
+    assert all(m.evidence_error is not None for m in misses)
+    assert tracker.evidence_failures == 3
+
+
+def test_post_roll_excludes_frames_already_in_reservoir() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b11 (reproduced there): quiet-gap
+    frames (ts > close_ts, observed while the segment wound down) sat in
+    BOTH miss.frames and the post-roll re-extract, double-writing the same
+    frame and overstating evidence_frame_count."""
+    writer = _RecordingWriter()
+    tracker, buffer, _ = _tracker_with_writer(writer)
+    # Segment closes backdated to frame 40 (last active); frames 41..49
+    # are the quiet gap: ts > close_ts AND captured by on_frame while the
+    # segment was still open AND still in the rolling buffer at finalize.
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 30))
+    _feed_frames(tracker, buffer, range(30, 50))
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 40))
+    _feed_frames(tracker, buffer, range(50, 50 + int(2.0 * FPS) + 2))
+    assert len(writer.bursts) == 1
+    indices = [f.frame_index for f in writer.bursts[0]]
+    assert len(indices) == len(set(indices)), (
+        f"burst double-includes frames: {sorted(indices)}"
+    )
+
+
+def test_deferred_miss_wall_time_is_close_time_not_finalize_time() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b12 (reproduced there): wall_time_iso
+    was stamped at deferred finalize time, attributing an outage-deferred
+    miss to the reconnect's report window instead of the window where the
+    pallet passed."""
+    from palletscan.types import iso_at
+
+    writer = _RecordingWriter()
+    tracker, buffer, events = _tracker_with_writer(
+        writer, ts_to_wall=lambda ts: iso_at(1000.0 + ts)
+    )
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 120))
+    _feed_frames(tracker, buffer, range(120, 150))
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 150))
+    # Outage: the next frame arrives 115 s later (source clock), far past
+    # the post-roll deadline — the finalize is deferred until now.
+    late = Frame(
+        image=_IMG, ts=150 / FPS + 115.0, frame_index=151, source_id="cam0"
+    )
+    buffer.append(late)
+    tracker.on_frame(late)
+    assert len(events) == 1
+    miss = events[0]
+    assert isinstance(miss, MissEvent)
+    assert miss.wall_time_iso == iso_at(1000.0 + 150 / FPS)
+
+
+def test_pass_wall_time_uses_close_ts_mapping() -> None:
+    """Finding b12, pass side: PassEvent wall stamps go through the same
+    close-ts mapping so windowed A/B reports bucket consistently."""
+    from palletscan.types import iso_at
+
+    tracker, buffer, events = _tracker_with_writer(
+        _RecordingWriter(), ts_to_wall=lambda ts: iso_at(2000.0 + ts)
+    )
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))
+    tracker.on_decode([_decode("PLT-000020", 12)])
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 20))
+    assert len(events) == 1
+    assert events[0].wall_time_iso == iso_at(2000.0 + 20 / FPS)
+
+
+def test_seed_recent_bridges_restart_window() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 10, tracker half: the payload window
+    seeded from the previous run's stored passes (anchors mapped into this
+    process's clock, negative) merges a restart-spanning re-sighting
+    instead of double-counting it; beyond the window it emits."""
+    tracker, buffer, events = _tracker_with_writer(_RecordingWriter())
+    tracker.seed_recent({"PLT-RESTART": -5.0})
+    # Re-sighting closing at ts 5.0: 10 s since the stored pass <= 12.
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 148))
+    tracker.on_decode([_decode("PLT-RESTART", 149)])
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 150))
+    assert events == []
+    assert tracker.passes_merged == 1
+    # A different payload is unaffected.
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000002", 160))
+    tracker.on_decode([_decode("PLT-FRESH", 161)])
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000002", 170))
+    assert [e.payload for e in events if isinstance(e, PassEvent)] == ["PLT-FRESH"]
+
+
+def test_seed_recent_beyond_window_emits() -> None:
+    """Finding 10 control: a sighting beyond the window of the seeded
+    anchor is a genuine new business pass."""
+    tracker, buffer, events = _tracker_with_writer(_RecordingWriter())
+    tracker.seed_recent({"PLT-RESTART": -5.0})
+    close = int(8.0 * FPS)  # close_ts 8.0: 13 s since the stored pass > 12
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", close - 10))
+    tracker.on_decode([_decode("PLT-RESTART", close - 5)])
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", close))
+    assert len([e for e in events if isinstance(e, PassEvent)]) == 1
+    assert tracker.passes_merged == 0
+
+
 def test_two_payloads_in_one_segment_emit_two_events(setup) -> None:
     tracker, buffer, events = setup
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))

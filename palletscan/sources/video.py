@@ -28,6 +28,34 @@ from palletscan.types import Frame
 log = logging.getLogger(__name__)
 
 
+#: Packed 2-channel YUV layouts and the channel index of their luma plane.
+#: ONLY formats that deliver HxWx2 raw frames belong here; everything else
+#: (GREY/Y8/Y16/MJPG/...) returns None — "no packed interpretation", which
+#: callers must treat explicitly (passing None into ``to_gray`` would be a
+#: numpy newaxis, silently yielding a 4-D array).
+_PACKED_LUMA_CHANNEL = {
+    "UYVY": 1,
+    "UYNV": 1,
+    "YUY2": 0,
+    "YUYV": 0,
+    "YUNV": 0,
+}
+
+
+def packed_luma_channel_for(fourcc: str | None) -> int | None:
+    """Luma plane index for a packed 2-channel YUV fourcc, else None.
+
+    Used to derive the channel from the format a device actually
+    NEGOTIATED (readback), never assumed from the configured value alone —
+    a UYVY config running on a device that silently fell back to YUY2 would
+    otherwise read the chroma plane as "grayscale" and go blind
+    (REVIEW_SYSTEM_0c30c77 finding 3).
+    """
+    if fourcc is None:
+        return None
+    return _PACKED_LUMA_CHANNEL.get(fourcc.strip().upper())
+
+
 def to_gray(img: np.ndarray, *, packed_luma_channel: int = 0) -> np.ndarray:
     """Normalize any capture layout to 2-D uint8 grayscale, once, at ingest.
 

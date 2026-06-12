@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import queue
 from collections.abc import Callable
 from typing import Any
@@ -28,6 +29,14 @@ class DroppingQueue:
     def __init__(self, maxsize: int) -> None:
         self._q: queue.Queue = queue.Queue(maxsize=maxsize)
         self.dropped = 0
+        # Level-triggered discontinuity carry-over: drop-oldest is premised
+        # on every frame being redundant, but the one frame marked
+        # discontinuity=True is not — dropping it would silently lose the
+        # segment-break signal under exactly the post-reconnect backlog
+        # that produces drops (REVIEW finding 2). When a marked item is
+        # discarded, the flag rides on the next item handed out instead.
+        # Single-producer/single-consumer; bool flips are GIL-atomic.
+        self._pending_discontinuity = False
 
     def put(self, item: Any) -> None:
         while True:
@@ -36,8 +45,10 @@ class DroppingQueue:
                 return
             except queue.Full:
                 try:
-                    self._q.get_nowait()
+                    victim = self._q.get_nowait()
                     self.dropped += 1
+                    if getattr(victim, "discontinuity", False):
+                        self._pending_discontinuity = True
                 except queue.Empty:  # consumer drained it meanwhile
                     pass
 
@@ -55,7 +66,12 @@ class DroppingQueue:
                     return False
 
     def get(self, timeout: float | None = None) -> Any:
-        return self._q.get(timeout=timeout)
+        item = self._q.get(timeout=timeout)
+        if self._pending_discontinuity and hasattr(item, "discontinuity"):
+            self._pending_discontinuity = False
+            if not item.discontinuity:
+                item = dataclasses.replace(item, discontinuity=True)
+        return item
 
     def qsize(self) -> int:
         return self._q.qsize()

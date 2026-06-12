@@ -35,7 +35,17 @@ palletscan calibrate --camera cam-mono  --seconds 3
 ```
 
 - [ ] Run with `backend: dshow` and again with `backend: msmf` in the
-  config; **paste both probe tables here**.
+  config; **paste both probe tables here**. Probing/locking `msmf`
+  requires `cameras[].fallback_index` (name enumeration is
+  DirectShow-only; a DSHOW-ordered index under MSMF can open the wrong
+  camera, so the code refuses the combination without a pinned index —
+  REVIEW_SYSTEM_0c30c77 finding 8). Discover each camera's MSMF index by
+  opening indexes 0..N with a trivial cv2 snippet under CAP_MSMF and
+  checking the picture (point one camera at the ceiling).
+- [ ] If you lock `msmf`: **record here that name stability is
+  forfeited** — after replug/reboot the pinned index may point at the
+  other camera; the connect log warns on every (re)connect. Weigh that
+  against msmf's probe advantage; prefer `dshow`/`auto` when comparable.
 - [ ] Confirm the headline modes: 1920×1200@120 (UYVY or MJPG) on the
   24CUG; 2064×1552@72 (GREY/Y8) on the 37CUGM. If a mode is missing,
   extend `candidates_for()` in `palletscan/sources/probe.py`.
@@ -61,8 +71,11 @@ palletscan calibrate --camera cam-mono  --seconds 3
 
 ## 5. Selftest gate
 
-- [ ] `palletscan selftest --config <file>` is fully green, including the
-  achieved-fps ≥ 0.85× check on both cameras.
+- [ ] `palletscan selftest --config <file> --data-dir <the service's
+  data dir>` is fully green, including the achieved-fps ≥ 0.85× check on
+  both cameras. Always pass the deployed `--data-dir`: the disk gate
+  probes the volumes the station actually writes to (REVIEW finding 12),
+  and a bare invocation checks the repo volume instead.
 
 ## 6. Unplug/replug recovery (the watchdog's reason to exist)
 
@@ -97,9 +110,16 @@ palletscan calibrate --camera cam-mono  --seconds 3
   counts per pass between UYVY and MJPG at the same fps).
 - [ ] The 37CUGM's mono pixel layout: confirm which of Y8/Y16/YUV-wrapped
   arrives with `convert_rgb: false`, and that the luma plane is right —
-  `to_gray` picks channel 1 for UYVY and channel 0 otherwise, derived
-  from `cameras[].fourcc` (see `CameraSource._luma_channel`); if grays
-  look like flat static, the plane choice is wrong for this device.
+  the channel is derived from the fourcc the device NEGOTIATES at each
+  (re)connect (UYVY → 1, YUY2/YUYV → 0; see
+  `CameraSource._apply_negotiated_format` and
+  `packed_luma_channel_for`), falling back to `cameras[].fourcc` when
+  readback is unverifiable. A 2-channel frame with no derivable layout
+  now fails the connection loudly instead of scanning chroma
+  (REVIEW_SYSTEM_0c30c77 finding 3); verify the fourcc readback on these
+  devices is truthful so the fallback path stays unused. Watch
+  `source.connect_mismatches` in `/stats.json` — nonzero means the
+  device negotiated something other than the locked mode.
 - [ ] Mode changes resetting controls: after `apply_mode`, do the
   settings still read back? (`apply_settings` runs after it on purpose.)
 
@@ -113,12 +133,34 @@ These were designed conservatively on macOS and need one Windows pass
   auto-logon), reboot, and confirm frames flow (dashboard live view, fps
   in `/stats.json`). This validates the run-as-interactive-user decision
   (D8) — capture under session 0/SYSTEM is the failure mode it avoids.
-- [ ] **CTRL_BREAK stop end-to-end.** `deploy\stop_palletscan.ps1` while
-  scanning: the child must *drain* (run summary in
-  `logs\palletscan.jsonl`, `reason: "stop-requested"` in
-  `logs\restarts.jsonl`), the stop-file must vanish, and the supervisor
-  exit 0 — within ~20 s. This validates CTRL_BREAK delivery to the
-  `CREATE_NEW_PROCESS_GROUP` child and the SIGBREAK handler.
+- [ ] **CTRL_BREAK stop end-to-end (verified-dead protocol).**
+  `deploy\stop_palletscan.ps1` while scanning: the child must *drain*
+  (run summary in `logs\palletscan.jsonl`, `reason: "stop-requested"` in
+  `logs\restarts.jsonl`), the script must print the **verified** stop
+  message (lock probes free), and the stop latch must REMAIN until
+  `start_palletscan.ps1` removes it. This validates CTRL_BREAK delivery
+  to the `CREATE_NEW_PROCESS_GROUP` child, the SIGBREAK handler, and the
+  lock-probe semantics (`FileStream.Lock` conflict on the held byte at
+  0x100000) on the target NTFS volume — the probe is the script's whole
+  basis for "stopped", so verify a held lock probes HELD (run the script
+  while scanning and check it does NOT claim stopped prematurely).
+- [ ] **Stop latch honored across a revival.** With the station stopped
+  (latch present), `Start-ScheduledTask PalletScan` by hand: the
+  supervisor must exit 0 WITHOUT scanning and append a
+  `stop-honored-at-startup` line; then `start_palletscan.ps1` must
+  remove the latch and bring the station up (REVIEW findings 13/15).
+- [ ] **Job-object tree-kill + orphan protection.** While scanning,
+  `taskkill /F` the SUPERVISOR pid (not the child): the pipeline child
+  must die with it (job object; check `palletscan.lock` releases within
+  seconds). If the child survives (job assignment failed), the
+  child-side parent watch must self-stop it within ~5 s — either way no
+  orphan keeps the lock (REVIEW finding 6). Then confirm Task Scheduler
+  revives the supervisor and scanning resumes.
+- [ ] **Hard stop kills an orphan.** Manufacture an orphan if possible
+  (suspend the parent watch by killing the supervisor while the child is
+  mid-burst) and run `stop_palletscan.ps1 -Hard`: the script must find
+  the writer-lock holder pid and kill it, then report verified-stopped
+  (REVIEW finding 7).
 - [ ] **Exit-4 contention message after `taskkill`.** With the service
   running, try `palletscan run` on the same data dir → exit 4 naming the
   holder. Then `taskkill /F` the child: the supervised replacement must

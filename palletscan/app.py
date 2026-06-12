@@ -43,6 +43,7 @@ from palletscan.types import (
     MissEvent,
     PassEvent,
     SegmentKind,
+    iso_at,
 )
 
 if TYPE_CHECKING:
@@ -231,6 +232,15 @@ class PipelineRunner:
         self._buffer = RollingFrameBuffer(
             horizon_s=horizon, maxlen=max(512, int(horizon * fps * 1.25))
         )
+        # Sources with a wall anchor (cameras, incl. the watchdog wrapper's
+        # forwarding property) stamp events with the wall time of their
+        # close ts (finding b12) and seed the payload window from the
+        # previous run's stored passes (finding 10). Synthetic/replay carry
+        # no anchor: their determinism must not depend on prior runs.
+        epoch_wall = getattr(source, "epoch_wall", None)
+        ts_to_wall = None
+        if epoch_wall is not None:
+            ts_to_wall = lambda ts, _e=float(epoch_wall): iso_at(_e + ts)  # noqa: E731
         self._tracker = PassTracker(
             dedup_cfg=cfg.dedup,
             buffer_cfg=cfg.buffer,
@@ -239,7 +249,25 @@ class PipelineRunner:
             emit=self._bus.publish,
             source_id=source.source_id,
             confirmations=cfg.decode.confirmations,
+            ts_to_wall=ts_to_wall,
         )
+        if epoch_wall is not None and cfg.sinks.sqlite.enabled:
+            from palletscan.events.dedup import load_restart_seeds
+
+            seeds = load_restart_seeds(
+                cfg.sinks.sqlite.path,
+                cfg.dedup.window_s,
+                float(epoch_wall),
+                camera=source.source_id,
+            )
+            if seeds:
+                self._tracker.seed_recent(seeds)
+                log.info(
+                    "seeded %s pass-dedup window with %d payload(s) from the "
+                    "previous run (restart-spanning suppression)",
+                    source.source_id,
+                    len(seeds),
+                )
         #: Optional dashboard live-view tap; assigned before run() by the
         #: CLI when the dashboard is enabled. None costs one check per frame.
         self.preview: "LivePreview | None" = None
@@ -261,6 +289,7 @@ class PipelineRunner:
             passes_emitted=lambda: self._tracker.passes_emitted,
             passes_merged=lambda: self._tracker.passes_merged,
             misses_emitted=lambda: self._tracker.misses_emitted,
+            evidence_failures=lambda: self._tracker.evidence_failures,
             events_handled=lambda: self._bus.events_handled,
             sink_errors=lambda: self._bus.sink_errors,
             pyzbar_calls=lambda: self._engine.counters.pyzbar_calls,
@@ -276,6 +305,7 @@ class PipelineRunner:
                 source_reconnects=lambda: source.reconnects,
                 source_reopen_failures=lambda: source.reopen_failures,
                 source_zombie_readers=lambda: source.zombie_readers,
+                source_connect_mismatches=lambda: source.connect_mismatches,
             )
         self.metrics.register_queue("frames", self._frame_q.qsize)
         self.metrics.register_queue("events", self._bus.queue.qsize)
@@ -313,7 +343,11 @@ class PipelineRunner:
 
         try:
             for frame in self.source.frames():
-                if self._stop.is_set():
+                # _abort, not just _stop: a dead pipeline thread must stop
+                # the live producer too, or run() blocks forever on the
+                # source join while the station scans into the void
+                # (REVIEW finding 4).
+                if _abort():
                     break
                 if live:
                     self._frame_q.put(frame)
@@ -335,8 +369,22 @@ class PipelineRunner:
             self.source.close()
 
     def _process_frame(self, frame: Frame) -> None:
-        self._buffer.append(frame)
+        if frame.discontinuity:
+            # Source recovery boundary (watchdog reconnect): close any open
+            # segment at its pre-gap last-active frame and finalize pending
+            # misses NOW, before this post-gap frame enters the buffer —
+            # post-gap frames are never pallet-exit evidence, and a segment
+            # spanning the gap would let a decoded pallet on this side
+            # swallow the pre-gap pallet's MissEvent (REVIEW finding 2).
+            broke = self._gate.break_segment()
+            if broke is not None:
+                self._tracker.on_segment_close(broke)
+            self._tracker.flush_pending()
+        # Deadline work runs BEFORE this frame enters the rolling buffer: a
+        # large ts jump would otherwise evict the post-roll frames one call
+        # before _finalize_miss harvests them (REVIEW finding b4).
         self._tracker.on_frame(frame)
+        self._buffer.append(frame)
         result, seg_event = self._gate.update(frame)
         if seg_event is not None and seg_event.kind is SegmentKind.OPEN:
             self._tracker.on_segment_open(seg_event)
@@ -369,6 +417,12 @@ class PipelineRunner:
             self._pipeline_dead.set()
             self._thread_errors.append(exc)
             log.exception("pipeline thread failed")
+            # Mirror stop(): a watchdog-wrapped source mid-outage never
+            # yields, so the source thread cannot observe _pipeline_dead
+            # between frames; without this close, run() hangs at the
+            # source join with the pipeline dead (REVIEW finding 4).
+            if isinstance(self.source, WatchdogSource):
+                self.source.close()
         finally:
             # Always flush: pending misses must become events even when the
             # loop died, or open segments vanish without a trace.
@@ -410,15 +464,23 @@ class PipelineRunner:
             ).start()
         source_t.start()
         pipeline_t.start()
+        drained = False
         try:
             source_t.join()
             pipeline_t.join()
         finally:
             stats_stop.set()
             self._executor.shutdown(wait=True)
-            self._bus.shutdown()
+            drained = self._bus.shutdown()
         if self._thread_errors:
             raise RuntimeError("pipeline thread failure") from self._thread_errors[0]
+        if not drained:
+            # A clean exit 0 here would silently lose the queue tail; fail
+            # loudly so the supervisor restarts and ops sees it (finding 11).
+            raise RuntimeError(
+                "event bus failed to drain: "
+                f"~{self._bus.events_lost} event(s) undelivered (wedged sink?)"
+            )
 
         reconciliation = None
         if isinstance(self.source, SyntheticSource):

@@ -139,13 +139,29 @@ def test_resolves_by_name_with_auto_backend_from_enumeration() -> None:
     src.close()
 
 
-def test_explicit_backend_overrides_enumeration_flag(
+def test_explicit_backend_mismatch_without_fallback_is_fatal() -> None:
+    """REVIEW finding 8 (repro-derived): opening a DSHOW-enumerated index
+    under an explicit MSMF-style backend silently captured whatever device
+    sat at that slot after a replug shifted the order — warn-and-open is
+    now a hard connect error."""
+    with pytest.raises(CameraConnectError, match="enumeration backend"):
+        _source(_cfg(backend=Backend.DSHOW), backend=MSMF)
+
+
+def test_explicit_backend_with_fallback_index_uses_pinned_index(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """The sanctioned escape hatch for finding 8: an explicit
+    non-enumeration backend requires a pinned index, opens (index, explicit
+    flag), and says loudly that name stability is forfeited."""
     with caplog.at_level(logging.WARNING, logger="palletscan.sources.camera"):
-        src, factory, _ = _source(_cfg(backend=Backend.DSHOW), backend=MSMF)
-    assert factory.calls[0][1] == DSHOW
-    assert any("differs from the enumeration backend" in r.message for r in caplog.records)
+        src, factory, _ = _source(
+            _cfg(backend=Backend.DSHOW, fallback_index=1), backend=MSMF
+        )
+    assert factory.calls[0] == (1, DSHOW)  # pinned index, explicit backend
+    assert any(
+        "name resolution is forfeited" in r.message for r in caplog.records
+    )
     src.close()
 
 
@@ -419,3 +435,206 @@ def test_to_gray_all_camera_layouts() -> None:
     bgr = np.zeros((4, 4, 3), np.uint8)
     bgr[..., 2] = 255  # pure red -> luma ~76
     assert int(to_gray(bgr)[0, 0]) == pytest.approx(76, abs=3)
+
+
+# -- REVIEW_SYSTEM_0c30c77 findings 3, b8 + the first-frame gates ---------------
+
+
+def _packed_frame_factory(luma_channel: int):
+    """HxWx2 frames: the given channel carries a bright luma plane (~200),
+    the other a flat 128 chroma plane."""
+
+    def factory(cap: FakeCapture) -> np.ndarray:
+        h = int(cap.props[cv2.CAP_PROP_FRAME_HEIGHT])
+        w = int(cap.props[cv2.CAP_PROP_FRAME_WIDTH])
+        img = np.full((h, w, 2), 128, np.uint8)
+        img[:, :, luma_channel] = 200
+        return img
+
+    return factory
+
+
+def test_negotiated_fourcc_overrides_configured_luma_channel() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 3 (repro: 0 active frames vs 18 for
+    the identical scene on the correct channel): a UYVY config running on
+    a device that silently negotiated YUY2 read the interleaved chroma
+    plane as 'grayscale' — a blind camera that emitted neither passes nor
+    misses while every health signal looked good. The luma channel must
+    follow the NEGOTIATED format."""
+    from palletscan.sources.controls import fourcc_float
+
+    clock = FakeClock()
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(
+            # The device "accepts" the UYVY request but silently snaps to
+            # the sibling packed format — probe.py's "UVC devices lie".
+            hooks={cv2.CAP_PROP_FOURCC: lambda v: fourcc_float("YUY2")},
+            props={cv2.CAP_PROP_FOURCC: fourcc_float("YUY2")},
+            clock=clock,
+            real_fps=30.0,
+            frame_factory=_packed_frame_factory(0),  # YUY2 luma = channel 0
+        )
+    )
+    src = CameraSource(
+        _cfg(fourcc="UYVY", convert_rgb=False),
+        capture_factory=factory,
+        device_lister=_lister(),
+        clock=clock,
+    )
+    frame = next(src.frames())
+    src.close()
+    assert float(frame.image.mean()) == pytest.approx(200.0, abs=1.0), (
+        "the configured-UYVY channel (chroma on this device) was scanned"
+    )
+    assert src.connect_mismatches >= 1  # the divergence was counted
+
+
+def test_unverifiable_fourcc_readback_falls_back_to_configured() -> None:
+    """Finding 3: a backend whose fourcc readback is 0.0 cannot confirm
+    the format; the configured value is the best remaining knowledge —
+    used, warned about, and counted."""
+    clock = FakeClock()
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(
+            # set() rejected and readback stuck at 0.0: nothing to verify.
+            hooks={cv2.CAP_PROP_FOURCC: lambda v: None},
+            props={cv2.CAP_PROP_FOURCC: 0.0},
+            clock=clock,
+            real_fps=30.0,
+            frame_factory=_packed_frame_factory(1),  # UYVY luma = channel 1
+        )
+    )
+    src = CameraSource(
+        _cfg(fourcc="UYVY", convert_rgb=False),
+        capture_factory=factory,
+        device_lister=_lister(),
+        clock=clock,
+    )
+    frame = next(src.frames())
+    src.close()
+    assert float(frame.image.mean()) == pytest.approx(200.0, abs=1.0)
+    assert src.connect_mismatches >= 1
+
+
+def test_unknown_packed_format_refuses_to_scan_chroma() -> None:
+    """Findings 3/8 policy: 2-channel frames with NO known luma layout
+    (nothing configured, readback unverifiable) must fail loudly into the
+    watchdog's retry path instead of silently scanning a chroma plane."""
+    clock = FakeClock()
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(
+            hooks={cv2.CAP_PROP_FOURCC: lambda v: None},
+            props={cv2.CAP_PROP_FOURCC: 0.0},
+            clock=clock,
+            real_fps=30.0,
+            frame_factory=_packed_frame_factory(1),
+        )
+    )
+    src = CameraSource(
+        _cfg(fourcc=None, convert_rgb=False),
+        capture_factory=factory,
+        device_lister=_lister(),
+        clock=clock,
+    )
+    with pytest.raises(CameraReadError, match="luma"):
+        next(src.frames())
+    src.close()
+
+
+def test_delivered_geometry_mismatch_fails_loudly() -> None:
+    """Findings 3/8 policy: the delivered frame is the format oracle — a
+    device delivering a different geometry than the locked mode corrupts
+    the optics envelope and must fail the connection, not stream."""
+    clock = FakeClock()
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(
+            # The device ignores the resolution set and keeps delivering
+            # its native 640x480 — readback would lie; the frame does not.
+            hooks={
+                cv2.CAP_PROP_FRAME_WIDTH: lambda v: None,
+                cv2.CAP_PROP_FRAME_HEIGHT: lambda v: None,
+            },
+            clock=clock,
+            real_fps=30.0,
+        )
+    )
+    src = CameraSource(
+        _cfg(width=1920, height=1200),
+        capture_factory=factory,
+        device_lister=_lister(),
+        clock=clock,
+    )
+    with pytest.raises(CameraReadError, match="1920x1200"):
+        next(src.frames())
+    src.close()
+    # Without locked dimensions the same device streams fine.
+    src2 = CameraSource(
+        _cfg(),
+        capture_factory=FakeCaptureFactory(
+            default=lambda i, b: FakeCapture(clock=clock, real_fps=30.0)
+        ),
+        device_lister=_lister(),
+        clock=clock,
+    )
+    assert next(src2.frames()) is not None
+    src2.close()
+
+
+def test_shared_epoch_aligns_cross_camera_timestamps() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b8 (per-camera ts epochs anchored at
+    construction; sequential connects skewed every cross-camera ts
+    comparison): a shared epoch makes the skew zero by construction."""
+    clock = FakeClock(1000.0)
+    epoch = clock()  # sampled before any device opens
+
+    def build() -> CameraSource:
+        return CameraSource(
+            _cfg(),
+            capture_factory=FakeCaptureFactory(
+                default=lambda i, b: FakeCapture(clock=clock, real_fps=30.0)
+            ),
+            device_lister=_lister(),
+            clock=clock,
+            epoch=epoch,
+        )
+
+    cam_a = build()
+    clock.advance(3.0)  # camA's slow connect-verify, mode apply, ...
+    cam_b = build()
+    frame_b = next(cam_b.frames())
+    # Without the shared epoch camB's first frame would sit near ts 1/30;
+    # with it, both cameras measure the same instant identically.
+    assert frame_b.ts == pytest.approx(3.0 + 1 / 30.0, abs=0.01)
+    cam_a.close()
+    cam_b.close()
+
+
+def test_epoch_wall_pairs_with_the_monotonic_anchor() -> None:
+    """Finding b8/10 bridge: epoch_wall is the wall instant of ts=0 —
+    computed from the paired samples, or stored verbatim when given."""
+    clock = FakeClock(1000.0)
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(clock=clock, real_fps=30.0)
+    )
+    src = CameraSource(
+        _cfg(),
+        capture_factory=factory,
+        device_lister=_lister(),
+        clock=clock,
+        wall_clock=lambda: 5000.0,
+        epoch=990.0,
+    )
+    assert src.epoch_wall == pytest.approx(5000.0 - (1000.0 - 990.0))
+    src.close()
+    src2 = CameraSource(
+        _cfg(),
+        capture_factory=FakeCaptureFactory(
+            default=lambda i, b: FakeCapture(clock=clock, real_fps=30.0)
+        ),
+        device_lister=_lister(),
+        clock=clock,
+        epoch=990.0,
+        epoch_wall=123.0,
+    )
+    assert src2.epoch_wall == 123.0
+    src2.close()

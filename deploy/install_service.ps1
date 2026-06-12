@@ -51,5 +51,5 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Force | Out-Null
 
 Write-Host "Installed scheduled task '$TaskName' (runs as $User at logon)."
-Write-Host "Start it now:    .\start_palletscan.ps1"
-Write-Host "Stop gracefully: .\stop_palletscan.ps1 -DataDir `"$DataDir`""
+Write-Host "Start it now:    .\start_palletscan.ps1   (derives -DataDir from the task)"
+Write-Host "Stop (verified): .\stop_palletscan.ps1    (derives -DataDir from the task)"

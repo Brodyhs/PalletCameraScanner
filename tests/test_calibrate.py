@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 
 import cv2
@@ -262,3 +263,110 @@ def test_exit_codes_for_failure_paths() -> None:
         AppConfig(), CalibrateOptions(), FakeCaptureFactory(), _lister(), clock
     )
     assert rc == 2 and "at least one" in out
+
+
+# -- REVIEW_SYSTEM_0c30c77 findings b3, b9 and 8 (calibrate side) -------------
+
+
+def test_bootstrap_without_name_prints_actionable_recipe() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b3 (repro: the day-one calibration
+    command against the bootstrapped `cameras: []` config failed exit 2
+    with a circular error whose suggested remedy was the same failing
+    command): the error must hand the operator the --name recipe."""
+    clock = FakeClock()
+    cfg = AppConfig.model_validate(
+        {"source": {"type": "camera"}, "cameras": []}
+    )
+    rc, out = _run(
+        cfg,
+        CalibrateOptions(camera="cam-color", save=True, seconds=0),
+        _see3cam_factory(clock),
+        _lister(),
+        clock,
+    )
+    assert rc == 2
+    assert "--name" in out
+    assert "calibrate --list" in out
+
+
+def test_explicit_backend_mismatch_without_fallback_refuses() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 8, calibrate side: calibrating the
+    wrong physical device would persist its settings under this camera's
+    id; mixing a name-resolved index with another backend is refused."""
+    clock = FakeClock()
+
+    def dshow_lister():
+        return devices_from_names(["See3CAM_24CUG"], int(cv2.CAP_DSHOW))
+
+    rc, out = _run(
+        _cfg(),  # backend msmf, enumeration DSHOW
+        CalibrateOptions(camera="cam-color", seconds=0),
+        _see3cam_factory(clock),
+        dshow_lister,
+        clock,
+    )
+    assert rc == 1
+    assert "enumeration backend" in out
+    assert "fallback_index" in out
+
+
+def test_explicit_backend_with_fallback_uses_pinned_index() -> None:
+    """Finding 8, calibrate side: the sanctioned escape hatch — pinned
+    index under the explicit backend flag, with the forfeit said out
+    loud."""
+    clock = FakeClock()
+
+    def dshow_lister():
+        return devices_from_names(["See3CAM_24CUG"], int(cv2.CAP_DSHOW))
+
+    factory = _see3cam_factory(clock)
+    rc, out = _run(
+        _cfg(fallback_index=1),
+        CalibrateOptions(camera="cam-color", fourcc="MJPG", seconds=0),
+        factory,
+        dshow_lister,
+        clock,
+    )
+    assert rc == 0, out
+    assert "fallback_index 1" in out
+    assert all(call[0] == 1 for call in factory.calls)
+    assert all(call[1] == MSMF for call in factory.calls)
+
+
+def test_metrics_loop_reads_negotiated_luma_plane() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b9 (repro: for raw packed-YUV modes
+    the metrics loop read the chroma plane — decodes always [], garbage
+    focus/brightness — steering the operator away from a working mode):
+    the loop must read the luma plane of the format the device actually
+    negotiated."""
+    clock = FakeClock()
+
+    def packed_frame(cap: FakeCapture) -> np.ndarray:
+        h = int(cap.props[cv2.CAP_PROP_FRAME_HEIGHT])
+        w = int(cap.props[cv2.CAP_PROP_FRAME_WIDTH])
+        img = np.empty((h, w, 2), np.uint8)
+        img[:, :, 0] = 128  # chroma plane (flat — what the bug measured)
+        img[:, :, 1] = 200  # UYVY luma plane
+        return img
+
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(
+            props={cv2.CAP_PROP_FOURCC: fourcc_float("UYVY")},
+            clock=clock,
+            real_fps=30.0,
+            frame_factory=packed_frame,
+        )
+    )
+    rc, out = _run(
+        _cfg(fourcc="UYVY", convert_rgb=False),
+        CalibrateOptions(camera="cam-color", fourcc="UYVY", seconds=1),
+        factory,
+        _lister(),
+        clock,
+    )
+    assert rc == 0, out
+    brightness = re.search(r"brightness\s+([0-9.]+)", out)
+    assert brightness is not None, out
+    assert float(brightness.group(1)) == pytest.approx(200.0, abs=2.0), (
+        "metrics read the chroma plane, not the negotiated luma"
+    )

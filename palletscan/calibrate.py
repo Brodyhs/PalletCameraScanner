@@ -40,6 +40,7 @@ from palletscan.sources.controls import (
     all_verified,
     apply_mode,
     apply_settings,
+    fourcc_str,
     log_reports,
     measure_achieved_fps,
     quirks_for,
@@ -54,7 +55,7 @@ from palletscan.sources.probe import (
     format_probe_table,
     probe_modes,
 )
-from palletscan.sources.video import to_gray
+from palletscan.sources.video import packed_luma_channel_for, to_gray
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +134,17 @@ def run_calibration(
         entry = _resolve_entry(cfg, opts)
     except ValueError as exc:
         say(f"calibrate: {exc}")
+        if opts.name is None:
+            # Day-one bootstrap (cameras: [] or an unknown id): without
+            # this recipe the error's only remedy was the same failing
+            # command — a circular arrival-day blocker (REVIEW finding b3).
+            say(
+                "calibrate: to create a new cameras[] entry, pass the "
+                "device name too:\n"
+                f"  palletscan calibrate --camera {opts.camera or '<id>'} "
+                "--name '<device-name substring>' --save --config <file>\n"
+                "(list device names with: palletscan calibrate --list)"
+            )
         return 2
 
     if devices:
@@ -141,8 +153,31 @@ def run_calibration(
         except ValueError as exc:
             say(f"calibrate: {exc}")
             return 1
-        index = dev.index
-        flag = dev.backend if entry.backend is Backend.AUTO else backend_flag(entry.backend)
+        if entry.backend is Backend.AUTO:
+            index, flag = dev.index, dev.backend
+        else:
+            flag = backend_flag(entry.backend)
+            if flag != dev.backend:
+                # Same rule as the run path (REVIEW finding 8): calibrating
+                # the wrong physical device would persist its settings under
+                # this camera's id.
+                if entry.fallback_index is None:
+                    say(
+                        f"calibrate: explicit backend {entry.backend} is not "
+                        "the enumeration backend; a name-resolved index "
+                        "under another backend can open the wrong camera. "
+                        "Pin cameras[].fallback_index to calibrate under "
+                        f"{entry.backend} (forfeits name stability)."
+                    )
+                    return 1
+                index = entry.fallback_index
+                say(
+                    f"warning: using pinned fallback_index {index} under "
+                    f"{entry.backend} — name resolution forfeited; index "
+                    "order is NOT stable across replugs"
+                )
+            else:
+                index = dev.index
     elif entry.fallback_index is not None:
         index, flag = entry.fallback_index, backend_flag(entry.backend)
         say(f"warning: no device names; using fallback index {index}")
@@ -244,12 +279,22 @@ def run_calibration(
 
         # -- live metrics loop -------------------------------------------------
         decoders = _build_decoders(cfg)
+        # The metrics must read the same luma plane production will read,
+        # derived from the format the device actually NEGOTIATED: for raw
+        # packed-YUV modes, to_gray() without the channel reads the chroma
+        # plane — decodes always [], garbage focus/brightness — steering
+        # the operator away from a working mode (REVIEW finding b9).
+        luma = packed_luma_channel_for(
+            fourcc_str(cap.get(cv2.CAP_PROP_FOURCC))
+        )
+        if luma is None:
+            luma = packed_luma_channel_for(locked.fourcc)
         for _ in range(max(0, opts.seconds)):
             m = measure_achieved_fps(cap, sample_s=1.0, warmup_frames=0, clock=clock)
             ok, img = cap.read()
             line = f"fps {m.fps:6.1f}"
             if ok and img is not None:
-                gray = to_gray(img)
+                gray = to_gray(img, packed_luma_channel=0 if luma is None else luma)
                 payloads = [
                     p for decode in decoders for p in decode(gray)
                 ]

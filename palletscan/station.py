@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -35,7 +36,11 @@ from palletscan.app import (
 )
 from palletscan.config import AppConfig
 from palletscan.events.bus import EventBus
-from palletscan.events.dedup import CrossCameraDeduper, ForwardingSink
+from palletscan.events.dedup import (
+    CrossCameraDeduper,
+    ForwardingSink,
+    load_restart_seeds,
+)
 from palletscan.events.http_sink import HttpSink
 from palletscan.sources.base import FrameSource
 from palletscan.sources.factory import create_source
@@ -117,8 +122,22 @@ class StationRunner:
         opened: list[FrameSource] = list(sources) if sources is not None else []
         try:
             if sources is None:
+                # One shared clock anchor for every camera, sampled as an
+                # adjacent (monotonic, wall) pair BEFORE any device opens:
+                # per-camera construction takes seconds (enumeration, mode
+                # apply, connect-verify), and per-source anchors would skew
+                # every cross-camera ts comparison by exactly that much
+                # (REVIEW finding b8).
+                epoch = time.monotonic()
+                epoch_wall = time.time()
                 for camera_id in cfg.source.cameras or []:
-                    opened.append(create_source(self._per_camera_cfg(camera_id)))
+                    opened.append(
+                        create_source(
+                            self._per_camera_cfg(camera_id),
+                            epoch=epoch,
+                            epoch_wall=epoch_wall,
+                        )
+                    )
             ids = [s.source_id for s in opened]
             if len(set(ids)) != len(ids):
                 raise ValueError(f"duplicate source ids in station: {ids}")
@@ -129,6 +148,26 @@ class StationRunner:
             self.deduper = CrossCameraDeduper(
                 self.business_bus.publish, cfg.dedup.window_s, cameras=ids
             )
+            # Restart-spanning dedup (REVIEW finding 10): only when every
+            # source carries a wall anchor (cameras; synth/replay must stay
+            # deterministic) and the local store is configured.
+            walls = [getattr(s, "epoch_wall", None) for s in opened]
+            if (
+                cfg.sinks.sqlite.enabled
+                and walls
+                and all(w is not None for w in walls)
+                and walls[0] is not None
+            ):
+                seeds = load_restart_seeds(
+                    cfg.sinks.sqlite.path, cfg.dedup.window_s, float(walls[0])
+                )
+                if seeds:
+                    self.deduper.seed(seeds)
+                    log.info(
+                        "seeded cross-camera dedup with %d payload(s) from "
+                        "the previous run (restart-spanning suppression)",
+                        len(seeds),
+                    )
             self.runners: dict[str, PipelineRunner] = {}
             for source in opened:
                 self.runners[source.source_id] = PipelineRunner(
@@ -208,6 +247,7 @@ class StationRunner:
             )
             for source_id, runner in self.runners.items()
         ]
+        business_drained = False
         try:
             for t in threads:
                 t.start()
@@ -215,8 +255,20 @@ class StationRunner:
                 t.join()
         finally:
             # Per-camera buses have fully drained into the deduper by the
-            # time runner.run() returns; now drain the business bus.
-            self.business_bus.shutdown()
+            # time runner.run() returns (an undrained one fails its runner,
+            # which lands in _errors below); now drain the business bus.
+            business_drained = self.business_bus.shutdown()
+        if not business_drained and not self._errors:
+            self._errors.append(
+                (
+                    "business-bus",
+                    RuntimeError(
+                        "business event bus failed to drain: "
+                        f"~{self.business_bus.events_lost} event(s) "
+                        "undelivered (wedged sink?)"
+                    ),
+                )
+            )
         if self._errors:
             source_id, exc = self._errors[0]
             # Chain from the runner error's cause so a WatchdogEscalation

@@ -38,6 +38,22 @@ class RawDecode:
     roi: Roi
 
 
+def decode_payload(data: bytes) -> str:
+    """Symbol bytes -> payload string, losslessly.
+
+    Strict UTF-8 first; on failure, Latin-1 — ISO/IEC 16022's *default*
+    byte interpretation for Data Matrix, and a total 1:1 mapping, so no
+    byte sequence ever becomes U+FFFD. A replacement character here would
+    poison the tracker/dedup/manifest keys downstream: the manifest input
+    path is strict UTF-8 and a U+FFFD payload can never match it
+    (REVIEW_SYSTEM_0c30c77 finding 14).
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
 class PyzbarDecoder:
     """QR decoding via zbar (the fast path)."""
 
@@ -57,7 +73,7 @@ class PyzbarDecoder:
             rect = r.rect
             out.append(
                 RawDecode(
-                    payload=r.data.decode("utf-8", errors="replace"),
+                    payload=decode_payload(r.data),
                     symbology=Symbology.QR,
                     roi=Roi(rect.left, rect.top, rect.width, rect.height),
                 )
@@ -88,7 +104,7 @@ class PylibdmtxDecoder:
             # libdmtx uses a bottom-left origin; flip to image coordinates.
             out.append(
                 RawDecode(
-                    payload=r.data.decode("utf-8", errors="replace"),
+                    payload=decode_payload(r.data),
                     symbology=Symbology.DATAMATRIX,
                     roi=Roi(rect.left, h - rect.top - rect.height, rect.width, rect.height),
                 )

@@ -8,6 +8,8 @@ the moving region.
 
 from __future__ import annotations
 
+import time
+
 import cv2
 import numpy as np
 
@@ -16,17 +18,27 @@ from palletscan.types import Frame, MotionResult, Roi, SegmentEvent, SegmentKind
 
 
 class MotionGate:
-    """Per-source motion gate. Call :meth:`update` once per frame in order."""
+    """Per-source motion gate. Call :meth:`update` once per frame in order.
 
-    def __init__(self, cfg: MotionConfig, source_id: str) -> None:
+    ``run_token`` (default: UTC HHMMSS at construction) makes candidate ids
+    unique across process restarts: the per-process segment counter starts
+    at 0 every run, and two same-day runs would otherwise mint the same
+    ``<source>-000001`` id — whose evidence directories then silently merge
+    and byte-overwrite each other (REVIEW finding 5).
+    """
+
+    def __init__(
+        self, cfg: MotionConfig, source_id: str, run_token: str | None = None
+    ) -> None:
         self._cfg = cfg
         self._source_id = source_id
-        self._prev_small: np.ndarray | None = None
-        self._mog2 = (
-            cv2.createBackgroundSubtractorMOG2(detectShadows=False)
-            if cfg.algorithm is MotionAlgorithm.MOG2
-            else None
+        self._run_token = (
+            run_token
+            if run_token is not None
+            else time.strftime("%H%M%S", time.gmtime())
         )
+        self._prev_small: np.ndarray | None = None
+        self._mog2 = self._make_mog2()
         self._mog2_primed = False
         self._kernel = np.ones((3, 3), np.uint8)
         # Segment state
@@ -36,6 +48,13 @@ class MotionGate:
         self._open_id: str | None = None
         self._open_backdate: tuple[int, float] | None = None  # first active frame
         self._last_active: tuple[int, float] | None = None
+
+    def _make_mog2(self) -> cv2.BackgroundSubtractorMOG2 | None:
+        return (
+            cv2.createBackgroundSubtractorMOG2(detectShadows=False)
+            if self._cfg.algorithm is MotionAlgorithm.MOG2
+            else None
+        )
 
     def _mask(self, small: np.ndarray) -> np.ndarray | None:
         """Binary motion mask on the downscaled frame, or None on warm-up."""
@@ -89,7 +108,10 @@ class MotionGate:
             self._last_active = (frame.frame_index, frame.ts)
             if self._open_id is None and self._active_streak >= cfg.open_frames:
                 self._segment_count += 1
-                self._open_id = f"{self._source_id}-{self._segment_count:06d}"
+                self._open_id = (
+                    f"{self._source_id}-{self._run_token}"
+                    f"-{self._segment_count:06d}"
+                )
                 backdate = self._open_backdate or (frame.frame_index, frame.ts)
                 event = SegmentEvent(
                     kind=SegmentKind.OPEN,
@@ -132,3 +154,25 @@ class MotionGate:
         if self._open_id is not None:
             return self._close_segment()
         return None
+
+    def break_segment(self) -> SegmentEvent | None:
+        """Source discontinuity (watchdog reconnect): hard segment boundary.
+
+        Closes any open segment at its last *observed* active frame — the
+        pre-gap pallet — so motion present at reconnect can never glue onto
+        it (a decoded pallet on the far side would swallow the undecoded
+        one's MissEvent; REVIEW finding 2, critical). Also resets the
+        debounce streaks AND the motion model: post-gap frames re-warm like
+        stream start, because diffing against a pre-gap reference (or an
+        MOG2 background learned before the gap, with exposure possibly
+        re-negotiated) manufactures phantom whole-frame motion.
+        """
+        event = self._close_segment() if self._open_id is not None else None
+        self._active_streak = 0
+        self._quiet_streak = 0
+        self._open_backdate = None
+        self._last_active = None
+        self._prev_small = None
+        self._mog2 = self._make_mog2()
+        self._mog2_primed = False
+        return event

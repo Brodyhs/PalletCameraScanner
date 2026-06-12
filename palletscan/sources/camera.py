@@ -38,12 +38,13 @@ from palletscan.sources.controls import (
     all_verified,
     apply_mode,
     apply_settings,
+    fourcc_str,
     log_reports,
     measure_achieved_fps,
     quirks_for,
 )
 from palletscan.sources.devices import DeviceInfo, backend_flag, find_device, list_devices
-from palletscan.sources.video import to_gray
+from palletscan.sources.video import packed_luma_channel_for, to_gray
 from palletscan.types import Frame
 
 log = logging.getLogger(__name__)
@@ -97,6 +98,9 @@ class CameraSource(FrameSource):
         capture_factory: CaptureFactory | None = None,
         device_lister: DeviceLister | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        epoch: float | None = None,
+        epoch_wall: float | None = None,
     ) -> None:
         self._cfg = cfg
         # Resolved at call time (not def time) so tests can patch the
@@ -104,14 +108,36 @@ class CameraSource(FrameSource):
         self._capture_factory = capture_factory or default_capture_factory
         self._device_lister = device_lister or list_devices
         self._clock = clock
-        self._t0 = clock()  # anchored once; never re-anchored on reopen
+        # ``epoch`` lets StationRunner anchor every camera's ts=0 at ONE
+        # shared instant (sampled before any device is opened), so the
+        # cross-camera skew the dedup window compares against is zero by
+        # construction (REVIEW finding b8); standalone construction keeps
+        # the anchor-at-construction default. Never re-anchored on reopen.
+        self._t0 = epoch if epoch is not None else clock()
+        #: Wall-clock instant of ts == 0 — the bridge that lets stored
+        #: wall_time_iso stamps be compared with this process's source
+        #: clock (restart-spanning dedup, finding 10; close-time event
+        #: stamping, finding b12). Paired sampling: when the caller passes
+        #: ``epoch`` it passes the adjacent wall sample too.
+        self.epoch_wall: float = (
+            epoch_wall
+            if epoch_wall is not None
+            else wall_clock() - (clock() - self._t0)
+        )
         self._frame_index = 0
         self._closed = False
         self._lock = threading.Lock()
         self._cap: Capture | None = None
-        # Packed-YUV luma plane for raw (CONVERT_RGB=0) HxWx2 frames:
-        # UYVY interleaves U Y V Y, so its luma is channel 1; YUY2 is 0.
-        self._luma_channel = 1 if (cfg.fourcc or "").upper() == "UYVY" else 0
+        # Packed-YUV luma plane for raw (CONVERT_RGB=0) HxWx2 frames; None
+        # means "no packed interpretation known". Seeded from the config,
+        # re-derived from the NEGOTIATED format on every (re)connect
+        # (REVIEW finding 3).
+        self._luma_channel: int | None = packed_luma_channel_for(cfg.fourcc)
+        #: Warn-level divergences at (re)connect (unverified controls,
+        #: negotiated-vs-configured fourcc): surfaced as the
+        #: source.connect_mismatches health metric.
+        self.connect_mismatches = 0
+        self._shape_checked = False  # first delivered frame per connection
         self._connect()  # fail fast: refuse to run blind
 
     @property
@@ -129,8 +155,17 @@ class CameraSource(FrameSource):
     # -- (re)connect -------------------------------------------------------
 
     def _resolve(self) -> tuple[int, int]:
-        """(index, backend flag) by stable name; fallback_index only when
-        the platform yields no names at all."""
+        """(index, backend flag) by stable name under the enumeration
+        backend; explicit non-enumeration backends (e.g. msmf under
+        DSHOW-only enumeration) require a pinned ``fallback_index``.
+
+        A name-resolved index is only valid under the backend it was
+        enumerated with (devices.py contract): opening it under another
+        backend captures whatever device sits at that DSHOW-ordered slot
+        after a replug shifts the order — silently swapping the A/B arms
+        (REVIEW finding 8). The fallback_index escape hatch forfeits name
+        stability and says so loudly on every connect.
+        """
         cfg = self._cfg
         devices = self._device_lister()
         flag = backend_flag(cfg.backend)
@@ -139,12 +174,25 @@ class CameraSource(FrameSource):
             if cfg.backend is Backend.AUTO:
                 return dev.index, dev.backend
             if flag != dev.backend:
-                log.warning(
-                    "camera %s: explicit backend %s differs from the "
-                    "enumeration backend; device order may not match "
-                    "(ARRIVAL_CHECKLIST step 2)",
-                    cfg.id,
-                    cfg.backend,
+                if cfg.fallback_index is not None:
+                    log.warning(
+                        "camera %s: explicit backend %s is not the "
+                        "enumeration backend; using pinned fallback_index "
+                        "%d — name resolution is forfeited and index order "
+                        "is NOT stable across replugs (ARRIVAL_CHECKLIST "
+                        "step 2)",
+                        cfg.id,
+                        cfg.backend,
+                        cfg.fallback_index,
+                    )
+                    return cfg.fallback_index, flag
+                raise CameraConnectError(
+                    f"camera {cfg.id}: name-resolved indexes are only valid "
+                    f"under the enumeration backend; opening {cfg.name!r} "
+                    f"under explicit backend {cfg.backend} can silently "
+                    "capture the wrong physical camera after a replug. Use "
+                    "backend: auto/dshow, or pin cameras[].fallback_index "
+                    f"to use {cfg.backend} (forfeits name stability)."
                 )
             return dev.index, flag
         if cfg.fallback_index is not None:
@@ -186,12 +234,20 @@ class CameraSource(FrameSource):
             cap, cfg.settings, quirks_for(cfg.backend)
         )
         log_reports(f"camera {cfg.id} connect", reports)
+        # (Re)connect policy: control VALUES may differ silently (warned and
+        # counted below — frames at slightly-wrong exposure beat no frames);
+        # the frame INTERPRETATION may not. The luma plane follows the
+        # format the device actually negotiated, and the first delivered
+        # frame is shape-verified in frames() (REVIEW findings 3/8 policy).
+        self._apply_negotiated_format(fourcc_str(cap.get(cv2.CAP_PROP_FOURCC)))
+        self._shape_checked = False
         if not all_verified(reports):
             # Warn-and-continue on the run path: frames at slightly-wrong
             # exposure beat no frames. Calibrate/selftest are the strict path.
             unverified = [
                 r.prop for r in reports if not (r.verified or r.informational)
             ]
+            self.connect_mismatches += 1
             log.warning(
                 "camera %s: %d control(s) unverified after connect: %s",
                 cfg.id,
@@ -222,6 +278,88 @@ class CameraSource(FrameSource):
             # close() raced the connect: the published capture is already
             # released; report the connect as failed rather than succeeded.
             raise CameraConnectError(f"camera {cfg.id}: closed during connect")
+
+    def _apply_negotiated_format(self, negotiated: str) -> None:
+        """Derive the packed-YUV luma channel from the NEGOTIATED fourcc.
+
+        UVC devices lie: a requested mode may be silently snapped to the
+        sibling packed format (UYVY <-> YUY2), and the run path's mode
+        readback is warn-only — fixing the channel from the *configured*
+        value made such a camera read the chroma plane as "grayscale" and
+        go blind without a single failed check (REVIEW finding 3).
+
+        Unverifiable readback (0.0 or garbage renders as '?') falls back to
+        the configured value, warned and counted. A format with no packed
+        interpretation leaves the channel None; whether that matters is
+        decided by the first delivered frame's actual shape (frames()), not
+        by string knowledge — a mono camera delivering 2-D frames needs no
+        channel at all.
+        """
+        cfg = self._cfg
+        norm = negotiated.strip().upper()
+        configured = (cfg.fourcc or "").strip().upper() or None
+        if not norm or "?" in norm:
+            if configured is not None:
+                self.connect_mismatches += 1
+                log.warning(
+                    "camera %s: fourcc readback unverifiable (%r); deriving "
+                    "the luma layout from the configured %s",
+                    cfg.id,
+                    negotiated,
+                    configured,
+                )
+            self._luma_channel = packed_luma_channel_for(configured)
+            return
+        if configured is not None and norm != configured:
+            self.connect_mismatches += 1
+            log.warning(
+                "camera %s: device negotiated %s instead of the configured "
+                "%s; the luma layout follows the NEGOTIATED format",
+                cfg.id,
+                norm,
+                configured,
+            )
+        channel = packed_luma_channel_for(norm)
+        if channel is None:
+            channel = packed_luma_channel_for(configured)
+        self._luma_channel = channel
+
+    def _verify_frame_shape(self, img: np.ndarray) -> None:
+        """First-delivered-frame gate, once per connection.
+
+        The delivered frame is the only honest format oracle (readback
+        lies, see probe.py). Interpretation-bearing mismatches fail loudly
+        into the watchdog's retry path instead of silently scanning the
+        wrong pixels or the wrong optics envelope (REVIEW findings 3/8
+        policy: what may differ silently vs what must fail).
+        """
+        cfg = self._cfg
+        if img.ndim not in (2, 3):
+            raise CameraReadError(
+                f"camera {cfg.id}: undecodable frame layout {img.shape}; "
+                "the negotiated format does not deliver image frames — "
+                "check cameras[].fourcc/convert_rgb"
+            )
+        if img.ndim == 3 and img.shape[2] == 2 and self._luma_channel is None:
+            raise CameraReadError(
+                f"camera {cfg.id}: device delivers packed 2-channel frames "
+                "but no luma layout is known for the negotiated/configured "
+                "format; refusing to scan a chroma plane as luma. Set "
+                "cameras[].fourcc to the actual format (UYVY/YUY2) or "
+                "enable convert_rgb."
+            )
+        h, w = int(img.shape[0]), int(img.shape[1])
+        if (cfg.width is not None and w != cfg.width) or (
+            cfg.height is not None and h != cfg.height
+        ):
+            raise CameraReadError(
+                f"camera {cfg.id}: device delivers {w}x{h} frames but the "
+                f"locked mode is {cfg.width}x{cfg.height}; a silently "
+                "different geometry corrupts the optics envelope and the "
+                "A/B attribution. Recalibrate (palletscan calibrate --save) "
+                "or clear cameras[].width/height to accept the device "
+                "default."
+            )
 
     def reopen(self) -> None:
         """Watchdog recovery hook: tear down, re-enumerate by name,
@@ -263,13 +401,21 @@ class CameraSource(FrameSource):
                 time.sleep(_READ_RETRY_SLEEP_S)
                 continue
             consecutive_fails = 0
+            if not self._shape_checked:
+                self._verify_frame_shape(img)
+                self._shape_checked = True
             ts = self._clock() - self._t0  # sampled right after read()
             # Allocate the index before yielding: a generator abandoned
             # mid-yield (watchdog reopen) must never reissue an index.
             idx = self._frame_index
             self._frame_index += 1
             yield Frame(
-                image=to_gray(img, packed_luma_channel=self._luma_channel),
+                image=to_gray(
+                    img,
+                    packed_luma_channel=(
+                        0 if self._luma_channel is None else self._luma_channel
+                    ),
+                ),
                 ts=ts,
                 frame_index=idx,
                 source_id=cfg.id,
@@ -291,10 +437,14 @@ def build_camera_source(
     capture_factory: CaptureFactory | None = None,
     device_lister: DeviceLister | None = None,
     clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
+    epoch: float | None = None,
+    epoch_wall: float | None = None,
 ) -> FrameSource:
     """Resolve ``source.camera``, build the CameraSource, wrap it in the
     reliability watchdog. ``create_source`` calls this with defaults;
-    tests inject fakes through the same seams."""
+    tests inject fakes through the same seams. ``epoch``/``epoch_wall``
+    are StationRunner's shared clock anchor (REVIEW finding b8)."""
     from palletscan.reliability.watchdog import WatchdogSource
 
     cam_cfg = resolve_camera(cfg)
@@ -303,5 +453,8 @@ def build_camera_source(
         capture_factory=capture_factory,
         device_lister=device_lister,
         clock=clock,
+        wall_clock=wall_clock,
+        epoch=epoch,
+        epoch_wall=epoch_wall,
     )
     return WatchdogSource(inner, cfg.watchdog)

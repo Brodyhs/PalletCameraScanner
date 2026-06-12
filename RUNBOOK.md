@@ -88,10 +88,19 @@ the running pipeline owns them).
 
 ```powershell
 palletscan calibrate --list                       # device names
+# First-ever calibration of each camera: --name creates the entry
+# (--camera alone only selects an EXISTING cameras[] entry).
+palletscan calibrate --camera cam-color --name "<device-name substring>" --save --config config\station.yaml
+palletscan calibrate --camera cam-mono  --name "<device-name substring>" --save --config config\station.yaml
+# Re-calibration later (the entries exist now):
 palletscan calibrate --camera cam-color --save --config config\station.yaml
-palletscan calibrate --camera cam-mono  --save --config config\station.yaml
-palletscan selftest --config config\station.yaml  # must be fully green
+palletscan selftest --config config\station.yaml --data-dir C:\palletscan\data  # must be fully green
 ```
+
+Pass the same `--data-dir` the service uses: the disk-space gate probes
+the volumes the station actually writes to, and the decode check's
+scratch outputs land in an isolated `<data-dir>\selftest\` subtree (never
+the production evidence).
 
 Work through **ARRIVAL_CHECKLIST.md** the day the cameras arrive — it is
 the authoritative list of hardware claims to verify, in dependency order.
@@ -134,22 +143,39 @@ After install: reboot once and confirm the station comes up scanning
 ## 6. Start / stop / restart
 
 ```powershell
-deploy\start_palletscan.ps1                          # start now
-deploy\stop_palletscan.ps1 -DataDir C:\palletscan\data   # graceful stop
-deploy\stop_palletscan.ps1 -DataDir C:\palletscan\data; deploy\start_palletscan.ps1   # restart
+deploy\start_palletscan.ps1                          # start now (re-arms a stopped station)
+deploy\stop_palletscan.ps1                           # verified stop
+deploy\stop_palletscan.ps1; deploy\start_palletscan.ps1   # restart
 ```
 
-How the graceful stop works: the script writes
-`<data-dir>\supervisor.stop`; the supervisor notices within 0.5 s, sends
-CTRL_BREAK to the child, gives it 15 s to drain its queues (events are
-flushed, open motion segments become misses — nothing is silently
-dropped), removes the file, and exits 0. The script waits for the file to
-disappear as confirmation.
+Both scripts derive the data dir from the registered task's `--data-dir`
+argument, so the bare invocations above always act on the right
+directory (pass `-DataDir` only to override).
 
-Hard stop fallback (`-Hard`, or `Stop-ScheduledTask PalletScan`):
-terminates the tree immediately. Durable state survives (SQLite and the
-outbox are crash-safe; evidence pruning tolerates races), but in-flight
-queue contents are dropped. Use it only when the graceful path times out.
+How the stop works: the script writes `<data-dir>\supervisor.stop`; the
+supervisor notices within 0.5 s, sends CTRL_BREAK to the child, gives it
+15 s to drain its queues (events are flushed, open motion segments
+become misses — nothing is silently dropped), and exits 0. The script
+then **verifies** the station is dead by probing both instance locks
+(the OS releases them when their holders die, however they die) and
+prints "stopped" only when both are free — it never infers success from
+the stop-file alone.
+
+The stop-file is a **sticky latch**: the supervisor never deletes it,
+and any supervisor starting while it exists honors it (exits without
+scanning). The station therefore STAYS stopped through Task Scheduler
+restarts and reboots until `start_palletscan.ps1` removes the latch —
+safe for maintenance windows. Don't delete the file by hand mid-stop;
+start the station with the start script.
+
+Hard stop fallback (`-Hard`, or automatic after the graceful timeout):
+stops the scheduled task (the supervisor's kill-on-close job object
+takes the pipeline child with it — best-effort) AND explicitly kills the
+writer-lock holder, covering orphans; then re-verifies via the lock
+probes. Durable state survives (SQLite and the outbox are crash-safe;
+evidence pruning tolerates races), but in-flight queue contents are
+dropped. If the script reports the station is STILL RUNNING, believe it:
+do not archive or edit the data dir until the named holder pid is dead.
 
 A manual foreground run (e.g. for debugging) is
 `palletscan run --config config\station.yaml` — but note the instance
@@ -168,8 +194,11 @@ use a different `--data-dir`.
 | 4 | another instance holds the lock | restart with backoff until the other instance stops |
 
 Every child exit appends one JSON line to `logs\restarts.jsonl`:
-`{"ts", "exit_code", "runtime_s", "delay_s", "reason"}`. Count watchdog
-escalations (how often the USB stack wedged) without log diving:
+`{"ts", "exit_code", "runtime_s", "delay_s", "reason"}`. A line with
+`exit_code: null` and reason `stop-honored-at-startup` records a
+supervisor that started while the stop latch was present and honored it
+(no child ran). Count watchdog escalations (how often the USB stack
+wedged) without log diving:
 
 ```powershell
 Get-Content C:\palletscan\data\logs\restarts.jsonl |
@@ -196,7 +225,7 @@ Default data dir `C:\palletscan\data` (everything below is per
 | `evidence\<camera>\<day>\...` | JPEG bursts for missed passes | capped: 500 MB / 14 days, auto-pruned |
 | `outbox.db` | store-and-forward queue for the HTTP sink | capped: 200 MB / 14 days |
 | `palletscan.lock`, `palletscan.supervisor.lock` | instance locks; content = holder diagnostics JSON (pid/start/argv) | persist after exit (harmless last-holder info; never delete while running) |
-| `supervisor.stop` | stop request marker | transient; consumed by the supervisor |
+| `supervisor.stop` | stop latch ("this station should be stopped") | sticky: never deleted by the supervisor; removed by `start_palletscan.ps1` |
 | `data\demo\` | demo runs (`tools/demo.py`) | disposable |
 
 **Log-tailing caveat:** don't hold rotating logs open —
@@ -228,20 +257,31 @@ service are fighting over one data dir. The message names the holder
 (pid, start time, argv). Stop one of them; the supervised child keeps
 retrying with backoff and wins the lock as soon as it's free.
 
-**Stale `supervisor.stop`** — left behind by a hard stop at exactly the
-wrong moment. Harmless: the supervisor removes and ignores it at startup.
+**`supervisor.stop` present, station won't start** — that is the stop
+latch doing its job: a stop request stays honored through Task Scheduler
+restarts and reboots (each honor leaves a `stop-honored-at-startup` line
+in `restarts.jsonl`). Start the station with
+`deploy\start_palletscan.ps1`, which removes the latch.
 
 **Disk full / filling** — evidence and logs are capped and self-pruning;
 the growers are `events.jsonl` and `palletscan.db` (§10). Archive them.
-`selftest` refuses to start a station with < 1 GB free.
+`selftest --data-dir <the service's data dir>` gates on the volumes the
+station actually writes to. If the disk does fill anyway, the station
+degrades loudly, not silently: misses are still emitted (flagged
+`evidence_error`, counted in the dashboard's `misses.evidence_failures`)
+even when their JPEG bursts cannot be stored, and the supervisor keeps
+restarting the child even when its own `restarts.jsonl` is unwritable.
 
 **Config typo after an edit** — the child exits 2, the supervisor logs
 `fix the config` and retries forever; fix `station.yaml` and the next
 retry (≤ 300 s) picks it up. Nothing to restart by hand.
 
 **Box replaced / restored from backup** — repeat §2–§5; copy the old
-data dir if the trial history matters. Locks and stop-files are
-per-data-dir state and carry over harmlessly.
+data dir if the trial history matters. Lock files carry over harmlessly
+(last-holder diagnostics only). A restored `supervisor.stop` is a live
+stop latch: the station will not scan until `start_palletscan.ps1`
+removes it — which is the right default for a box whose cameras may not
+be plugged in yet.
 
 ## 10. Event sinks: growth and archival
 
@@ -263,6 +303,12 @@ deploy\start_palletscan.ps1
 Both files are recreated empty on the next start. To review an archived
 trial later: `palletscan dashboard --data-dir C:\archive\...` (point a
 copy of the layout at it).
+
+Do not run `replay` (or `synth`) against the live station's data dir:
+besides the instance lock making the loser exit 4, replayed pass rows
+carry real wall stamps that a live `run` started within the dedup window
+(~1 minute) could pick up as restart-dedup seeds and suppress a genuine
+first sighting. Tools get their own `--data-dir`.
 
 ## 11. Demo
 

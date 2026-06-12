@@ -19,6 +19,7 @@ If port 8000 is taken, the child exits 2 with a clean message — edit
 from __future__ import annotations
 
 import argparse
+import socket
 import subprocess
 import sys
 import time
@@ -63,17 +64,41 @@ def _stats_ok(url: str) -> bool:
         return False
 
 
-def _stop(child: subprocess.Popen) -> int:
+def port_in_use(host: str, port: int) -> bool:
+    """True when something is already bound on (host, port).
+
+    The readiness poll accepts any HTTP 200, so a pre-existing server on
+    the demo port (the LIVE station dashboard, if the demo config ever
+    points at its port) would make the demo declare "ready" against real
+    trial data while the demo child dies of a port-bind exit 2 underneath
+    (REVIEW finding b5). Refuse up front instead.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return True
+    return False
+
+
+def _stop(child: subprocess.Popen, *, already_signaled: bool = False) -> int:
     """Smoke-mode stop. POSIX drains via SIGTERM; Windows smoke runs get a
     hard terminate (CTRL events can't target a same-group child) — the
-    interactive Windows path is Ctrl-C, which the child handles itself."""
+    interactive Windows path is Ctrl-C, which the child handles itself.
+
+    ``already_signaled``: a POSIX Ctrl-C already hit the whole foreground
+    group, the child is draining, and its first-signal handler restored
+    SIG_DFL — a second signal here would hard-kill it mid-drain (REVIEW
+    finding b6). Just wait it out (then kill only a truly wedged child).
+    """
     import signal
 
     if child.poll() is None:
-        if sys.platform == "win32":
-            child.terminate()
-        else:
-            child.send_signal(signal.SIGTERM)
+        if not already_signaled:
+            if sys.platform == "win32":
+                child.terminate()
+            else:
+                child.send_signal(signal.SIGTERM)
         try:
             child.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -109,6 +134,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     url = f"http://{cfg.web.host}:{cfg.web.port}"
+    if port_in_use(cfg.web.host, cfg.web.port):
+        print(
+            f"demo: something is already serving on "
+            f"{cfg.web.host}:{cfg.web.port} (the live station dashboard?); "
+            "refusing to demo against it — edit web.port in the demo config",
+            file=sys.stderr,
+        )
+        return 2
 
     cmd = [
         sys.executable,
@@ -123,36 +156,49 @@ def main(argv: list[str] | None = None) -> int:
         str(args.data_dir),
     ]
     child = subprocess.Popen(cmd)
+    interrupted = False
     try:
-        ready = wait_until_ready(
-            lambda: _stats_ok(url + "/stats.json"),
-            timeout_s=60.0,
-            child_alive=lambda: child.poll() is None,
-        )
-        if not ready:
-            if child.poll() is not None:
-                # The child already printed why (port in use, bad config).
-                return child.wait()
-            print("demo: dashboard never became ready", file=sys.stderr)
-            return _stop(child) or 1
-        print(f"dashboard ready at {url}")
-        if not args.no_browser:
-            webbrowser.open(url)
-        if args.max_seconds is not None:
-            try:
-                return child.wait(timeout=args.max_seconds)
-            except subprocess.TimeoutExpired:
-                return _stop(child)
-        while True:
-            try:
-                return child.wait()
-            except KeyboardInterrupt:
-                # Ctrl-C hit the whole foreground group: the child is
-                # draining and will print its summary; keep waiting.
-                continue
+        try:
+            ready = wait_until_ready(
+                lambda: _stats_ok(url + "/stats.json"),
+                timeout_s=60.0,
+                child_alive=lambda: child.poll() is None,
+            )
+            if not ready:
+                if child.poll() is not None:
+                    # The child already printed why (port in use, bad config).
+                    return child.wait()
+                print("demo: dashboard never became ready", file=sys.stderr)
+                return _stop(child) or 1
+            print(f"dashboard ready at {url}")
+            if not args.no_browser:
+                webbrowser.open(url)
+            if args.max_seconds is not None:
+                try:
+                    return child.wait(timeout=args.max_seconds)
+                except subprocess.TimeoutExpired:
+                    return _stop(child)
+            while True:
+                try:
+                    return child.wait()
+                except KeyboardInterrupt:
+                    # Ctrl-C hit the whole foreground group: the child is
+                    # draining and will print its summary; keep waiting.
+                    continue
+        except KeyboardInterrupt:
+            # Ctrl-C outside the wait loop (readiness poll, browser open):
+            # the console event still reached the child, whose first-signal
+            # handler already restored SIG_DFL — sending a second signal
+            # would hard-kill it mid-drain (REVIEW finding b6). Wait it out.
+            interrupted = True
+            while True:
+                try:
+                    return child.wait()
+                except KeyboardInterrupt:
+                    continue
     finally:
         if child.poll() is None:
-            _stop(child)
+            _stop(child, already_signaled=interrupted)
 
 
 if __name__ == "__main__":

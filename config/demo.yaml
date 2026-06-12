@@ -16,4 +16,9 @@ sinks:
 
 web:
   enabled: true
-  port: 8000            # http://127.0.0.1:8000
+  # Deliberately NOT 8000 (the production dashboard default): on a factory
+  # box with the live station running, a demo probing 8000 would get the
+  # station's own dashboard answering and declare itself "ready" against
+  # real trial data (REVIEW finding b5). The demo also refuses to start if
+  # this port is already bound.
+  port: 8765            # http://127.0.0.1:8765

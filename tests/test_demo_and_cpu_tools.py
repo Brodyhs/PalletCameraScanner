@@ -139,3 +139,88 @@ def test_demo_smoke_end_to_end(tmp_path: Path) -> None:
     assert "dashboard ready at" in out.stdout
     assert "station summary" in out.stdout, "the drain must print the summary"
     assert "UNACCOUNTED    : 0" in out.stdout
+
+
+# -- REVIEW_SYSTEM_0c30c77 findings b5 and b6 ----------------------------------
+
+
+def test_port_in_use_detects_bound_socket() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b5: the readiness probe accepts any
+    HTTP 200, so a pre-existing server on the demo port (the LIVE station
+    dashboard) made the demo declare itself ready against real trial data.
+    The preflight bind-check is what closes that path."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+        holder.listen(1)
+        assert demo.port_in_use("127.0.0.1", port) is True
+    assert demo.port_in_use("127.0.0.1", port) is False
+
+
+def test_demo_port_avoids_production_dashboard_default() -> None:
+    """Finding b5, second arm: config/demo.yaml pinned 8000 — the
+    production dashboard default — making the live-station collision the
+    factory-box default."""
+    cfg = load_config(Path(__file__).resolve().parents[1] / "config" / "demo.yaml")
+    assert cfg.web.port != 8000
+
+
+def test_demo_refuses_when_port_already_bound(tmp_path: Path, capsys) -> None:
+    """Finding b5: the demo must refuse up front, before spawning a child
+    whose port-bind exit 2 gets buried under a false 'ready'."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+        holder.listen(1)
+        cfg = tmp_path / "demo.yaml"
+        cfg.write_text(
+            f"web: {{enabled: true, port: {port}}}\n", encoding="utf-8"
+        )
+        rc = demo.main(
+            ["--config", str(cfg), "--no-browser", "--data-dir", str(tmp_path / "d")]
+        )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "already serving" in err
+
+
+class _StubChild:
+    """Popen-shaped recorder for _stop's signalling decisions."""
+
+    def __init__(self) -> None:
+        self.signals: list = []
+        self.terminates = 0
+        self.waits = 0
+        self._alive = True
+
+    def poll(self):
+        return None if self._alive else 0
+
+    def wait(self, timeout=None):
+        self._alive = False
+        self.waits += 1
+        return 0
+
+    def send_signal(self, sig) -> None:
+        self.signals.append(sig)
+
+    def terminate(self) -> None:
+        self.terminates += 1
+
+    def kill(self) -> None:  # pragma: no cover - wedged-child path
+        self._alive = False
+
+
+def test_stop_skips_second_signal_for_already_interrupted_child() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b6 (repro: Ctrl-C outside the wait
+    loop reached the finally, which sent a SECOND stop signal to a child
+    whose first-signal handler had already restored SIG_DFL — hard kill
+    mid-drain). An already-signalled child is waited out, not re-signalled."""
+    child = _StubChild()
+    assert demo._stop(child, already_signaled=True) == 0
+    assert child.signals == [] and child.terminates == 0
+    assert child.waits >= 1
+
+    fresh = _StubChild()
+    demo._stop(fresh)  # the smoke-mode stop still signals once
+    assert (len(fresh.signals) + fresh.terminates) == 1

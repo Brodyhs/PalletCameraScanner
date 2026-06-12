@@ -53,12 +53,14 @@ def test_static_stream_produces_no_candidates() -> None:
 
 def test_single_pass_yields_one_segment_with_sane_bounds() -> None:
     cfg = MotionConfig()
-    gate = MotionGate(cfg, "cam0")
+    # run_token injected: candidate ids carry a per-run token so a restart
+    # can never mint the same id again (REVIEW finding 5).
+    gate = MotionGate(cfg, "cam0", run_token="t0")
     images = _moving_square_stream(60, start=10, stop=28)
     _, events = _run(gate, images)
     assert [e.kind for e in events] == [SegmentKind.OPEN, SegmentKind.CLOSE]
     opened, closed = events
-    assert opened.candidate_id == closed.candidate_id == "cam0-000001"
+    assert opened.candidate_id == closed.candidate_id == "cam0-t0-000001"
     # open is backdated to the first active frame (within a frame or two of
     # actual motion start; frame differencing sees motion at start+1)
     assert 10 <= opened.frame_index <= 12
@@ -134,3 +136,100 @@ def test_mog2_mode_smoke() -> None:
     images = _moving_square_stream(60, start=20, stop=40)
     _, events = _run(gate, images)
     assert any(e.kind is SegmentKind.OPEN for e in events)
+
+
+def test_break_segment_closes_at_last_active_pre_gap_frame() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 2 (critical), gate half: a segment
+    open when the source stalled stayed open across the outage and glued
+    onto whatever motion was present at reconnect. break_segment() must
+    close it at the last OBSERVED active frame — the pre-gap pallet."""
+    gate = MotionGate(MotionConfig(), "cam0", run_token="t0")
+    images = _moving_square_stream(20, start=5)  # motion never goes quiet
+    opens = []
+    for i, img in enumerate(images):
+        _, ev = gate.update(_frame(img, i))
+        if ev:
+            opens.append(ev)
+    assert [e.kind for e in opens] == [SegmentKind.OPEN]
+    broke = gate.break_segment()
+    assert broke is not None and broke.kind is SegmentKind.CLOSE
+    assert broke.candidate_id == opens[0].candidate_id
+    # Last active frame of the stream, not anything from after the gap.
+    assert broke.frame_index <= 19
+    assert broke.frame_index >= 17
+
+
+def test_break_segment_resets_debounce_and_motion_model() -> None:
+    """Finding 2, gate half: post-gap frames must re-warm like stream
+    start. Without the model reset, diffing the first post-gap frame
+    against the pre-gap reference manufactures phantom whole-frame motion
+    that re-opens a segment instantly."""
+    gate = MotionGate(MotionConfig(), "cam0", run_token="t0")
+    for i, img in enumerate(_moving_square_stream(20, start=5)):
+        gate.update(_frame(img, i))
+    gate.break_segment()
+    # Post-gap scene differs wholesale from the pre-gap reference (the
+    # square is gone, background level shifted): quiet frames must yield
+    # no candidate.
+    bg = np.full((360, 640), 140, np.uint8)
+    results = []
+    for j in range(10):
+        res, ev = gate.update(_frame(bg.copy(), 100 + j))
+        results.append(res)
+        assert ev is None or ev.kind is not SegmentKind.OPEN
+    # Including the FIRST post-gap frame: with the model reset it is a
+    # warm-up frame; without the reset it diffs against the pre-gap
+    # reference and reads as whole-frame motion.
+    assert all(not r.active for r in results), (
+        "post-gap frames diffed against the pre-gap reference"
+    )
+    # Genuine post-gap motion opens a NEW candidate id.
+    new_events = []
+    for j, img in enumerate(_moving_square_stream(30, start=2, stop=20)):
+        _, ev = gate.update(_frame(img, 200 + j))
+        if ev:
+            new_events.append(ev)
+    assert new_events and new_events[0].kind is SegmentKind.OPEN
+    assert new_events[0].candidate_id.endswith("-000002")
+
+
+def test_break_segment_recreates_mog2_background_model() -> None:
+    """Finding 2 + design-review fix: 'MOG2 re-prime' must RECREATE the
+    subtractor — merely skipping one frame keeps the pre-gap background
+    model, and a legitimate post-reconnect brightness change (exposure
+    re-negotiation is warn-and-continue) reads as whole-frame foreground
+    for the model's entire history length."""
+    cfg = MotionConfig(algorithm=MotionAlgorithm.MOG2)
+    gate = MotionGate(cfg, "cam0", run_token="t0")
+    dark = np.full((360, 640), 90, np.uint8)
+    for i in range(30):
+        gate.update(_frame(dark.copy(), i))
+    gate.break_segment()
+    # Post-gap stream is globally brighter, no moving object.
+    bright = np.full((360, 640), 140, np.uint8)
+    for j in range(30):
+        _, ev = gate.update(_frame(bright.copy(), 100 + j))
+        assert ev is None, (
+            "a global brightness step across the break opened a phantom "
+            f"segment at post-gap frame {j}"
+        )
+
+
+def test_run_token_makes_candidate_ids_restart_unique() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 5: the per-process segment counter
+    restarts at 0, so two same-day runs minted the same <source>-000001 id
+    and their evidence directories silently merged. The run token keys
+    them apart; the default token is time-derived."""
+    import re
+
+    images = _moving_square_stream(40, start=5, stop=18)
+    ids = []
+    for token in ("run1", "run2"):
+        gate = MotionGate(MotionConfig(), "cam0", run_token=token)
+        _, events = _run(gate, images)
+        ids.append(events[0].candidate_id)
+    assert ids == ["cam0-run1-000001", "cam0-run2-000001"]
+    assert len(set(ids)) == 2
+    default_gate = MotionGate(MotionConfig(), "cam0")
+    _, events = _run(default_gate, images)
+    assert re.fullmatch(r"cam0-\d{6}-000001", events[0].candidate_id)

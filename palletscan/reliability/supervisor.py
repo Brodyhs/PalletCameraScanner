@@ -8,9 +8,22 @@ exit to ``<data-dir>/logs/restarts.jsonl`` (``ts``, ``exit_code``,
 ``runtime_s``, ``delay_s``, ``reason``) so escalations (exit 3) vs crashes
 (exit 1) are a one-liner to count, and stops cleanly via a stop-file
 (``<data-dir>/supervisor.stop``) — console-ctrl events cannot cross
-Windows sessions, so an operator's PowerShell writes a file instead.
-Task Scheduler's only jobs: start the supervisor at logon and restart the
-*supervisor* if it ever dies.
+Windows sessions, so an operator's PowerShell writes a file instead. The
+stop-file is a sticky latch: the supervisor never deletes it, and one
+present at startup is honored (exit 0, no spawn, audit line) — a stop
+request survives Task Scheduler revivals and reboots until an explicit
+start removes the file (REVIEW findings 13/15). Task Scheduler's only
+jobs: start the supervisor at logon and restart the *supervisor* if it
+ever dies.
+
+Child lifetime is tied to supervisor lifetime (REVIEW finding 6): on
+Windows the child joins a kill-on-close job object whose only handle the
+supervisor holds; everywhere, the child gets the supervisor's pid in
+``SUPERVISOR_PID_ENV`` and self-stops (graceful drain) when that process
+dies; and an unexpected supervisor exception stops the child before
+propagating. "Stopped" is verified, never assumed: the stop tooling
+probes the instance locks (whose OS-level release is death-proof) instead
+of trusting stop-file consumption.
 
 Policy (owner rulings):
 
@@ -33,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -47,9 +61,23 @@ from palletscan.logging_setup import RESTARTS_LOG_NAME
 
 log = logging.getLogger(__name__)
 
-#: Operator stop channel: write this file next to the data dir and the
-#: supervisor stops the child gracefully, removes it, and exits 0.
+#: Operator stop channel: write this file in the data dir. The supervisor
+#: stops the child gracefully and exits 0 — and the file is a STICKY LATCH:
+#: the supervisor never removes it, and a supervisor starting while it
+#: exists honors it (exits 0 without spawning). A stop request can
+#: therefore never be discarded by a Task Scheduler revival or a reboot
+#: (REVIEW findings 13/15); only an explicit start (start_palletscan.ps1,
+#: or deleting the file) re-arms the station.
 STOP_FILE_NAME = "supervisor.stop"
+
+#: Env var carrying the supervisor's pid to its writer child. The child
+#: watches that process and self-stops (graceful drain) when it dies, so a
+#: dead supervisor can never strand an unstoppable orphan that holds the
+#: instance lock and keeps scanning under a stale config (REVIEW finding
+#: 6). Injected per spawn via the Popen env argument — never by mutating
+#: os.environ, which would leak into in-process pytest main() calls and
+#: into writer children spawned by other tools.
+SUPERVISOR_PID_ENV = "PALLETSCAN_SUPERVISOR_PID"
 
 _EXIT_REASONS = {
     0: "clean-exit",
@@ -78,14 +106,184 @@ class ChildProcess(Protocol):
     def kill(self) -> None: ...
 
 
+if sys.platform == "win32":
+
+    def _assign_kill_on_close_job(proc: subprocess.Popen) -> object | None:
+        """Tie the child's lifetime to this process via a Job Object.
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE with the only job handle held
+        here (attached to the Popen object): ANY supervisor death — crash,
+        taskkill, Stop-ScheduledTask — closes the handle and the OS
+        terminates the child, so the orphaned-writer state of REVIEW
+        finding 6 cannot arise. Best-effort: on assignment failure the
+        child-side parent watch (SUPERVISOR_PID_ENV) is the backstop.
+        Windows-only by nature; executed verification is an
+        ARRIVAL_CHECKLIST §9 item.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        class _BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),  # ULONG_PTR
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in (
+                "ReadOperationCount", "WriteOperationCount",
+                "OtherOperationCount", "ReadTransferCount",
+                "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class _ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimits),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        _JobObjectExtendedLimitInformation = 9
+        k32 = ctypes.windll.kernel32
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            log.warning("CreateJobObject failed (%d); relying on the "
+                        "child-side parent watch", k32.GetLastError())
+            return None
+        info = _ExtendedLimits()
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        ok = k32.SetInformationJobObject(
+            job,
+            _JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ) and k32.AssignProcessToJobObject(job, wintypes.HANDLE(proc._handle))
+        if not ok:
+            log.warning(
+                "job-object assignment failed (%d); relying on the "
+                "child-side parent watch", k32.GetLastError(),
+            )
+            k32.CloseHandle(job)
+            return None
+        return job
+
+    def _make_parent_alive_check(pid: int) -> Callable[[], bool]:
+        """Liveness check that survives pid reuse: open a SYNCHRONIZE
+        handle ONCE while the parent is known alive and poll it — the
+        retained handle pins the process object, so a recycled pid can
+        never fake liveness (a false-alive here means an orphan that never
+        stops)."""
+        import ctypes
+
+        _SYNCHRONIZE = 0x00100000
+        _WAIT_TIMEOUT = 0x102
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(_SYNCHRONIZE, False, pid)
+        if not handle:
+            return lambda: False  # already gone (or unopenable: fail safe)
+
+        def alive() -> bool:
+            return bool(k32.WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT)
+
+        return alive
+
+else:
+
+    def _assign_kill_on_close_job(proc: subprocess.Popen) -> object | None:
+        return None  # POSIX: the parent watch + crash-path stop cover it
+
+    def _make_parent_alive_check(pid: int) -> Callable[[], bool]:
+        """The writer is a direct child of the supervisor: orphaning
+        reparents it (POSIX), so a changed ppid is a pid-reuse-proof death
+        signal."""
+        return lambda: os.getppid() == pid
+
+
+class ParentWatch:
+    """Daemon thread that fires ``on_dead`` once when the watched process
+    dies (the writer child's half of the finding-6 orphan protection).
+
+    ``stop()`` must run when the writer command finishes: main() runs
+    in-process under pytest and process-global acquisitions must not leak
+    across calls (the ``_WriterLease`` convention) — a poll-forever thread
+    holding a finished runner would. ``alive`` is injectable for tests.
+    """
+
+    def __init__(
+        self,
+        pid: int,
+        on_dead: Callable[[], None],
+        *,
+        poll_s: float = 2.0,
+        alive: Callable[[], bool] | None = None,
+    ) -> None:
+        self._pid = pid
+        self._on_dead = on_dead
+        self._poll_s = poll_s
+        self._alive = alive if alive is not None else _make_parent_alive_check(pid)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="parent-watch", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._poll_s):
+            try:
+                ok = self._alive()
+            except Exception:  # pragma: no cover - defensive
+                ok = False
+            if not ok:
+                log.error(
+                    "supervisor (pid %d) is gone; stopping this writer so a "
+                    "replacement supervisor can own the station (orphan "
+                    "protection, REVIEW finding 6)",
+                    self._pid,
+                )
+                try:
+                    self._on_dead()
+                finally:
+                    return
+
+
 def _default_spawn(command: list[str]) -> ChildProcess:
     """Spawn the child with inherited stdio (no pipes — a full pipe would
     deadlock a chatty child) and, on Windows, its own process group so
-    CTRL_BREAK can target it without hitting the supervisor."""
-    kwargs: dict = {}
+    CTRL_BREAK can target it without hitting the supervisor. The child gets
+    this process's pid in SUPERVISOR_PID_ENV (parent watch) and, on
+    Windows, joins a kill-on-close job object — both halves of tying the
+    child's lifetime to the supervisor's (REVIEW finding 6)."""
+    kwargs: dict = {
+        "env": {**os.environ, SUPERVISOR_PID_ENV: str(os.getpid())},
+    }
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    return subprocess.Popen(command, **kwargs)
+    proc = subprocess.Popen(command, **kwargs)
+    job = _assign_kill_on_close_job(proc)
+    if job is not None:
+        # The job handle must live exactly as long as the supervisor holds
+        # the child; parking it on the Popen object does that.
+        proc._palletscan_job = job  # type: ignore[attr-defined]
+    return proc
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,8 +344,16 @@ class Supervisor:
         return self._stop_event.is_set() or self.stop_file.exists()
 
     def _append_restart(
-        self, exit_code: int, runtime_s: float, delay_s: float, reason: str
+        self,
+        exit_code: int | None,
+        runtime_s: float,
+        delay_s: float,
+        reason: str,
     ) -> None:
+        """Best-effort audit line. NEVER raises: an unwritable audit log
+        (full disk — the same condition that crashes the child) must not
+        kill the supervisor that exists to restart it, and on the stop path
+        it must not derail the stop handling (REVIEW finding 13)."""
         line = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
             "exit_code": exit_code,
@@ -156,9 +362,17 @@ class Supervisor:
             "reason": reason,
         }
         path = self.restarts_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(line) + "\n")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(line) + "\n")
+        except OSError as exc:
+            log.error(
+                "could not append to %s (%r); continuing — supervision "
+                "outranks its own bookkeeping",
+                path,
+                exc,
+            )
 
     def stop_child_gracefully(self, child: ChildProcess) -> int:
         """Signal (unless the child already got one), drain, then kill."""
@@ -204,50 +418,83 @@ class Supervisor:
 
     def run(self) -> int:
         if self.stop_file.exists():
-            # Leftover from a hard stop: refusing to start over a stale
-            # marker would strand the station; remove and carry on.
-            self.stop_file.unlink(missing_ok=True)
-            log.info("removed stale stop-file %s", self.stop_file)
-        delay = self.opts.backoff_base_s
-        while True:
-            started = self._clock()
-            try:
-                child = self._spawn(self.opts.command)
-            except OSError as exc:
-                log.error("could not spawn %s: %s", self.opts.command, exc)
-                return 1
-            log.info("child pid %d spawned: %s", child.pid, self.opts.command)
-            code, stopped = self._wait_for_exit_or_stop(child)
-            runtime = self._clock() - started
-            if stopped:
-                self._append_restart(code, runtime, 0.0, "stop-requested")
-                self.stop_file.unlink(missing_ok=True)
-                log.info(
-                    "stop requested; child exited %d after %.1fs", code, runtime
-                )
-                return 0
-            if code == 0:
-                self._append_restart(0, runtime, 0.0, "clean-exit")
-                log.info("child exited 0 after %.1fs; supervision ends", runtime)
-                return 0
-            if runtime >= self.opts.stable_after_s:
-                delay = self.opts.backoff_base_s  # stable run resets backoff
-            self._append_restart(code, runtime, delay, _reason_for(code))
-            if code == 2:
-                log.error(
-                    "child exited 2 (usage/config error): fix the config; "
-                    "the supervisor will pick it up on the next retry"
-                )
+            # The stop-file is a sticky latch, never discarded (REVIEW
+            # findings 13/15): a stop written while no supervisor was
+            # looking — during a Task Scheduler restart window, before a
+            # reboot — must keep the station stopped, not be deleted as
+            # "stale" while the operator's stop script reports success.
+            # Only an explicit start (start_palletscan.ps1 removes the
+            # file) re-arms the station.
+            self._append_restart(None, 0.0, 0.0, "stop-honored-at-startup")
             log.warning(
-                "child exited %d (%s) after %.1fs; restarting in %.0fs",
-                code,
-                _reason_for(code),
-                runtime,
-                delay,
+                "stop-file %s present at startup: honoring the stop "
+                "request and not starting the child (remove the file or "
+                "use start_palletscan.ps1 to start the station)",
+                self.stop_file,
             )
-            if self._backoff_sleep(delay):
-                self.stop_file.unlink(missing_ok=True)
-                log.info("stop requested during backoff; supervision ends")
-                return 0
-            if runtime < self.opts.stable_after_s:
-                delay = min(delay * 2, self.opts.backoff_cap_s)
+            return 0
+        delay = self.opts.backoff_base_s
+        child: ChildProcess | None = None
+        try:
+            while True:
+                started = self._clock()
+                try:
+                    child = self._spawn(self.opts.command)
+                except OSError as exc:
+                    log.error("could not spawn %s: %s", self.opts.command, exc)
+                    return 1
+                log.info(
+                    "child pid %d spawned: %s", child.pid, self.opts.command
+                )
+                code, stopped = self._wait_for_exit_or_stop(child)
+                runtime = self._clock() - started
+                if stopped:
+                    # The child is verified dead here: _wait_for_exit_or_stop
+                    # returns only after wait() (grace, then kill+wait). The
+                    # stop-file, if any, stays — see the latch note above.
+                    self._append_restart(code, runtime, 0.0, "stop-requested")
+                    log.info(
+                        "stop requested; child exited %d after %.1fs",
+                        code,
+                        runtime,
+                    )
+                    return 0
+                if code == 0:
+                    self._append_restart(0, runtime, 0.0, "clean-exit")
+                    log.info(
+                        "child exited 0 after %.1fs; supervision ends", runtime
+                    )
+                    return 0
+                if runtime >= self.opts.stable_after_s:
+                    delay = self.opts.backoff_base_s  # stable run resets backoff
+                self._append_restart(code, runtime, delay, _reason_for(code))
+                if code == 2:
+                    log.error(
+                        "child exited 2 (usage/config error): fix the config; "
+                        "the supervisor will pick it up on the next retry"
+                    )
+                log.warning(
+                    "child exited %d (%s) after %.1fs; restarting in %.0fs",
+                    code,
+                    _reason_for(code),
+                    runtime,
+                    delay,
+                )
+                if self._backoff_sleep(delay):
+                    log.info("stop requested during backoff; supervision ends")
+                    return 0
+                if runtime < self.opts.stable_after_s:
+                    delay = min(delay * 2, self.opts.backoff_cap_s)
+        except BaseException:
+            # A supervisor bug must not strand an unstoppable orphan that
+            # holds the instance lock and keeps scanning under a stale
+            # config (REVIEW finding 6): take the child down (gracefully —
+            # signal, grace, kill) before propagating.
+            if child is not None and child.poll() is None:
+                log.error(
+                    "supervisor failed with child pid %d alive; stopping "
+                    "the child before exiting",
+                    child.pid,
+                )
+                self.stop_child_gracefully(child)
+            raise

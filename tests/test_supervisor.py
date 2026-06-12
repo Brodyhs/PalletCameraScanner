@@ -192,7 +192,9 @@ def test_stop_file_stops_gracefully(tmp_path: Path) -> None:
     sup, _ = _supervisor(tmp_path, [child], clock)
     assert sup.run() == 0
     assert child.signals, "the child must be signalled to drain"
-    assert not stop_file.exists(), "the stop-file is consumed"
+    # Sticky latch (REVIEW findings 13/15): the supervisor never deletes
+    # the stop-file — a Task Scheduler revival must keep honoring it.
+    assert stop_file.exists(), "the stop-file is a latch, never consumed"
     lines = _restart_lines(tmp_path)
     assert len(lines) == 1
     assert lines[0]["reason"] == "stop-requested"
@@ -210,12 +212,18 @@ def test_stop_during_backoff_exits_promptly(tmp_path: Path) -> None:
     )
     assert sup.run() == 0
     assert len(spawned) == 1, "no respawn after a stop during backoff"
-    assert not stop_file.exists()
+    assert stop_file.exists(), "the stop-file is a latch, never consumed"
 
 
-def test_stale_stop_file_at_startup_is_removed_and_ignored(
+def test_stop_file_at_startup_is_honored_not_discarded(
     tmp_path: Path,
 ) -> None:
+    """REVIEW finding 15 (repro-derived): a stop request written while the
+    supervisor was down (Task Scheduler restart window, reboot) used to be
+    unlinked as 'stale' and the child spawned — the operator's stop script
+    saw the file vanish and printed success while the station started up.
+    A starting supervisor must HONOR the request: no spawn, exit 0, audit
+    line, and the latch stays for the next revival."""
     stop_file = tmp_path / "supervisor.stop"
     stop_file.touch()
     clock = FakeClock()
@@ -223,8 +231,12 @@ def test_stale_stop_file_at_startup_is_removed_and_ignored(
         tmp_path, [FakeChild(clock, runtime=1.0, code=0)], clock
     )
     assert sup.run() == 0
-    assert len(spawned) == 1, "a stale stop-file must not refuse startup"
-    assert not stop_file.exists()
+    assert spawned == [], "a live stop request must never start the child"
+    assert stop_file.exists(), "the latch survives for the next revival"
+    lines = _restart_lines(tmp_path)
+    assert len(lines) == 1
+    assert lines[0]["reason"] == "stop-honored-at-startup"
+    assert lines[0]["exit_code"] is None
 
 
 def test_unresponsive_child_is_killed_after_grace(tmp_path: Path) -> None:
@@ -311,3 +323,147 @@ def test_supervise_rejects_non_writer_child(tmp_path: Path, capsys) -> None:
     assert "run, synth or replay" in capsys.readouterr().err
     rc = main(["supervise", "--data-dir", str(tmp_path)])
     assert rc == 2
+
+
+# -- REVIEW_SYSTEM_0c30c77 findings 13 and 6 -----------------------------------
+
+
+def test_unwritable_audit_log_does_not_kill_the_restart(tmp_path: Path) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 13 (repro: child crashes at 02:00,
+    the supervisor's restarts.jsonl append raises ENOSPC, the supervisor
+    dies instead of restarting in 5 s — the station goes fully dark while
+    the disk stays full). The append is bookkeeping; supervision outranks
+    it."""
+    (tmp_path / "logs").write_text("not a directory")  # mkdir will raise
+    clock = FakeClock()
+    children = [
+        FakeChild(clock, runtime=10.0, code=1),
+        FakeChild(clock, runtime=10.0, code=0),
+    ]
+    sup, spawned = _supervisor(tmp_path, children, clock)
+    assert sup.run() == 0
+    assert len(spawned) == 2, "the crash must still be restarted"
+
+
+def test_unwritable_audit_log_does_not_derail_the_stop(tmp_path: Path) -> None:
+    """Finding 13, stop variant: the same ENOSPC fired on the stop path
+    before the stop handling completed."""
+    (tmp_path / "logs").write_text("not a directory")
+    clock = FakeClock()
+    child = FakeChild(clock, runtime=math.inf, code=1)
+    stop_file = tmp_path / "supervisor.stop"
+    clock.on_sleep.append(
+        lambda c: stop_file.touch() if c.now >= 2.0 else None
+    )
+    sup, _ = _supervisor(tmp_path, [child], clock)
+    assert sup.run() == 0
+    assert child.signals, "the child must still be stopped gracefully"
+
+
+def test_parent_watch_fires_once_when_parent_dies() -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 6: the writer child's half of the
+    orphan protection — a dead supervisor must make the child self-stop so
+    a replacement supervisor can win the lock instead of churning exit-4
+    against an unstoppable orphan."""
+    from palletscan.reliability.supervisor import ParentWatch
+
+    alive = {"value": True}
+    fired: list[int] = []
+    watch = ParentWatch(
+        4242, lambda: fired.append(1), poll_s=0.01, alive=lambda: alive["value"]
+    )
+    watch.start()
+    time.sleep(0.05)
+    assert fired == [], "must not fire while the parent lives"
+    alive["value"] = False
+    deadline = time.monotonic() + 2.0
+    while not fired and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fired == [1], "on_dead fires exactly once"
+    watch.stop()
+
+
+def test_parent_watch_stop_ends_the_thread_without_firing() -> None:
+    """Finding 6 + the in-process-main no-leak convention: the watch must
+    terminate when the writer command finishes."""
+    from palletscan.reliability.supervisor import ParentWatch
+
+    fired: list[int] = []
+    watch = ParentWatch(
+        4242, lambda: fired.append(1), poll_s=0.01, alive=lambda: True
+    )
+    watch.start()
+    watch.stop()
+    assert fired == []
+    assert not watch._thread.is_alive()
+
+
+def test_parent_watch_treats_alive_check_error_as_dead() -> None:
+    from palletscan.reliability.supervisor import ParentWatch
+
+    def broken() -> bool:
+        raise OSError("cannot probe")
+
+    fired: list[int] = []
+    watch = ParentWatch(4242, lambda: fired.append(1), poll_s=0.01, alive=broken)
+    watch.start()
+    deadline = time.monotonic() + 2.0
+    while not fired and time.monotonic() < deadline:
+        time.sleep(0.01)
+    watch.stop()
+    assert fired == [1]
+
+
+def test_default_spawn_injects_pid_env_without_mutating_environ(
+    monkeypatch,
+) -> None:
+    """Finding 6 + design-review fix: the env var must ride the Popen env
+    argument only — a mutated os.environ leaks into in-process pytest
+    main() calls and into writer children spawned by other tools, handing
+    them a bogus supervisor pid that makes them self-stop seconds in."""
+    import os
+
+    from palletscan.reliability.supervisor import (
+        SUPERVISOR_PID_ENV,
+        _default_spawn,
+    )
+
+    recorded: dict = {}
+
+    class _FakeProc:
+        pid = 1
+
+    def fake_popen(command, **kwargs):
+        recorded["command"] = command
+        recorded.update(kwargs)
+        return _FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    _default_spawn(["x"])
+    assert recorded["env"][SUPERVISOR_PID_ENV] == str(os.getpid())
+    assert SUPERVISOR_PID_ENV not in os.environ
+
+
+def test_supervisor_crash_stops_live_child_before_propagating(
+    tmp_path: Path,
+) -> None:
+    """Finding 6, supervisor half: an unexpected supervisor exception must
+    not strand an unstoppable orphan that holds the instance lock and
+    keeps scanning under a stale config."""
+    clock = FakeClock()
+    child = FakeChild(clock, runtime=math.inf, code=1)
+    sup, _ = _supervisor(tmp_path, [child], clock)
+    calls = {"n": 0}
+    original_sleep = clock.sleep
+
+    def exploding_sleep(seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise RuntimeError("supervisor bug")
+        original_sleep(seconds)
+
+    sup._sleep = exploding_sleep
+    with pytest.raises(RuntimeError, match="supervisor bug"):
+        sup.run()
+    assert child.signals, "the child must be stopped before the crash escapes"
+    assert child.poll() is not None, "the child must be dead"

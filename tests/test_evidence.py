@@ -98,6 +98,77 @@ def test_day_vanishing_mid_cleanup_scan_is_tolerated(
     assert ref.frame_count == 3
 
 
+def test_uncreatable_burst_dir_degrades_to_flagged_ref(tmp_path: Path) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 1 (mkdir raiser, evidence.py): an
+    ENOSPC/PermissionError out of write_burst propagated into
+    _finalize_miss AFTER the pending miss was destructively popped — the
+    MissEvent reached no sink, ever. write_burst must degrade to a flagged
+    EvidenceRef instead of raising."""
+    from datetime import datetime, timezone
+
+    cfg = EvidenceConfig(dir=tmp_path / "ev", frame_stride=1)
+    writer = EvidenceWriter(cfg)
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # The day path is a FILE: creating the candidate dir under it raises
+    # (NotADirectoryError is an OSError — same family as ENOSPC).
+    (tmp_path / "ev" / day).write_text("not a directory")
+    ref = writer.write_burst("cam0-r1-000001", _frames(3), {})  # must not raise
+    assert ref.directory is None
+    assert ref.frame_count == 0
+    assert ref.error is not None
+
+
+def test_meta_json_failure_keeps_frames_and_flags_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 1 (meta.json raiser, evidence.py):
+    the second unguarded raiser — cv2.imwrite fails soft by design, but
+    the meta.json write_text raised through the miss path."""
+    cfg = EvidenceConfig(dir=tmp_path / "ev", frame_stride=1)
+    writer = EvidenceWriter(cfg)
+    original_write_text = Path.write_text
+
+    def enospc_for_meta(self: Path, *args, **kwargs):
+        if self.name == "meta.json":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", enospc_for_meta)
+    ref = writer.write_burst("cam0-r1-000002", _frames(3), {})  # must not raise
+    assert ref.directory is not None
+    assert ref.frame_count == 3  # the JPEGs landed
+    assert len(list(ref.directory.glob("*.jpg"))) == 3
+    assert ref.error is not None
+
+
+def test_same_candidate_id_never_overwrites_existing_burst(
+    tmp_path: Path,
+) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding 5 (reproduced there): candidate ids
+    restart per process, and a same-day restart's first miss byte-overwrote
+    the morning burst's JPEGs and replaced its meta.json — the dashboard
+    then presented the afternoon pallet's frames as the morning pallet's
+    evidence. A collision must land in a suffixed directory, losslessly."""
+    cfg = EvidenceConfig(dir=tmp_path / "ev", frame_stride=1)
+    writer = EvidenceWriter(cfg)
+    first = writer.write_burst("cam0-000001", _frames(3), {"run": "morning"})
+    assert first.directory is not None
+    meta_before = (first.directory / "meta.json").read_bytes()
+    jpg = sorted(first.directory.glob("*.jpg"))[0]
+    jpg_before = jpg.read_bytes()
+
+    second = writer.write_burst("cam0-000001", _frames(5), {"run": "afternoon"})
+    assert second.directory is not None
+    assert second.directory != first.directory
+    assert second.directory.name == "cam0-000001-r1"
+    assert (first.directory / "meta.json").read_bytes() == meta_before
+    assert jpg.read_bytes() == jpg_before
+    # a third collision keeps stepping the suffix
+    third = writer.write_burst("cam0-000001", _frames(2), {})
+    assert third.directory is not None
+    assert third.directory.name == "cam0-000001-r2"
+
+
 def test_prune_by_size_drops_oldest_first(tmp_path: Path) -> None:
     cfg = EvidenceConfig(
         dir=tmp_path / "ev", frame_stride=1, max_total_mb=0.02  # ~20 KB cap

@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from palletscan.config import BufferConfig, DedupConfig
-from palletscan.events.evidence import EvidenceWriter
+from palletscan.events.evidence import EvidenceRef, EvidenceWriter
 from palletscan.pipeline.decode_engine import PassDecodeContext
 from palletscan.pipeline.rolling_buffer import RollingFrameBuffer
 from palletscan.types import (
@@ -100,6 +100,7 @@ class PassTracker:
         emit: Callable[[Event], None],
         source_id: str,
         confirmations: int = 1,
+        ts_to_wall: Callable[[float], str] | None = None,
     ) -> None:
         self._dedup = dedup_cfg
         self._buffer_cfg = buffer_cfg
@@ -108,12 +109,19 @@ class PassTracker:
         self._emit = emit
         self._source_id = source_id
         self._confirmations = max(1, int(confirmations))
+        # Maps a source-clock ts to the wall-clock ISO stamp of that
+        # moment (sources with a known epoch provide it). Events are then
+        # attributed to when the pallet PASSED, not when the deferred
+        # finalize ran — an outage-deferred miss must not land in the
+        # reconnect's report window (REVIEW finding b12).
+        self._ts_to_wall = ts_to_wall
         self._open: _SegmentState | None = None
         self._recent: dict[str, float] = {}  # payload -> last_seen_ts
         self._pending: list[_PendingMiss] = []
         self.passes_emitted = 0
         self.misses_emitted = 0
         self.passes_merged = 0
+        self.evidence_failures = 0
 
     # -- pipeline-thread API ------------------------------------------------
 
@@ -173,6 +181,28 @@ class PassTracker:
         while self._pending and self._pending[0].deadline_ts <= ts:
             self._finalize_miss(self._pending.pop(0))
 
+    def flush_pending(self) -> None:
+        """Finalize every pending miss now, post-roll deadlines or not.
+
+        Used at end-of-stream and at a source discontinuity (watchdog
+        reconnect): frames after the break are not pallet-exit evidence,
+        so waiting out the deadline cannot add anything — it can only let
+        the break's ts jump pull wrong frames into the burst.
+        """
+        while self._pending:
+            self._finalize_miss(self._pending.pop(0))
+
+    def seed_recent(self, entries: dict[str, float]) -> None:
+        """Seed the payload dedup window from a previous process's stored
+        passes, with timestamps already mapped into THIS process's source
+        clock (they are typically negative — before process start). A
+        pallet pass spanning a supervisor restart merges instead of
+        double-counting as a second business pass (REVIEW finding 10).
+        """
+        for payload, ts in entries.items():
+            if ts > self._recent.get(payload, float("-inf")):
+                self._recent[payload] = ts
+
     def flush(self) -> None:
         """End-of-stream: finalize everything with whatever frames exist."""
         if self._open is not None:
@@ -181,8 +211,7 @@ class PassTracker:
             last_ts = self._open.decodes[-1].ts if self._open.decodes else self._open.open_ts
             self._finalize_segment(self._open, last, last_ts)
             self._open = None
-        while self._pending:
-            self._finalize_miss(self._pending.pop(0))
+        self.flush_pending()
 
     # -- internals ------------------------------------------------------------
 
@@ -236,7 +265,7 @@ class PassTracker:
                     best_frame=(first.source_id, first.frame_index),
                     candidate_ids=[seg.candidate_id],
                     event_id=str(uuid.uuid4()),
-                    wall_time_iso=now_iso(),
+                    wall_time_iso=self._wall_at(close_ts),
                     first_decode_ts=first.ts,
                     camera_detail={
                         self._source_id: {
@@ -253,27 +282,49 @@ class PassTracker:
         cutoff = close_ts - self._dedup.window_s
         self._recent = {p: t for p, t in self._recent.items() if t >= cutoff}
 
+    def _wall_at(self, ts: float) -> str:
+        """Wall-clock stamp for a source-clock instant (now when unmapped)."""
+        return self._ts_to_wall(ts) if self._ts_to_wall is not None else now_iso()
+
     def _finalize_miss(self, miss: _PendingMiss) -> None:
         # Pre-roll + segment frames were captured while the segment was
         # open; only the post-roll still lives in the rolling buffer.
+        # Quiet-gap frames (ts > close_ts) were already sampled into the
+        # reservoir while the segment wound down, so the post-roll must
+        # exclude them or the burst double-writes frames and overstates
+        # evidence_frame_count (REVIEW finding b11).
+        have = {f.frame_index for f in miss.frames}
         post = [
             f
             for f in self._buffer.extract(
                 miss.close_ts, miss.close_ts + self._buffer_cfg.post_s
             )
-            if f.ts > miss.close_ts
+            if f.ts > miss.close_ts and f.frame_index not in have
         ]
         frames = miss.frames + post
-        ref = self._evidence.write_burst(
-            miss.candidate_id,
-            frames,
-            meta={
-                "source_id": miss.source_id,
-                "segment_frames": [miss.open_frame, miss.close_frame],
-                "segment_ts": [miss.open_ts, miss.close_ts],
-                "reason": "motion segment ended with no decode",
-            },
-        )
+        try:
+            ref = self._evidence.write_burst(
+                miss.candidate_id,
+                frames,
+                meta={
+                    "source_id": miss.source_id,
+                    "segment_frames": [miss.open_frame, miss.close_frame],
+                    "segment_ts": [miss.open_ts, miss.close_ts],
+                    "reason": "motion segment ended with no decode",
+                },
+            )
+        except Exception as exc:
+            # write_burst degrades on OSError itself; this layer catches
+            # anything else. The pending entry was destructively popped, so
+            # raising here would eat the MissEvent forever (REVIEW finding
+            # 1) — emit evidence-less and flagged instead.
+            log.exception(
+                "evidence burst for %s failed; emitting evidence-less miss",
+                miss.candidate_id,
+            )
+            ref = EvidenceRef(directory=None, frame_count=0, error=repr(exc))
+        if ref.error is not None:
+            self.evidence_failures += 1
         self._emit(
             MissEvent(
                 candidate_id=miss.candidate_id,
@@ -282,18 +333,20 @@ class PassTracker:
                 end_ts=miss.close_ts,
                 first_frame=miss.open_frame,
                 last_frame=miss.close_frame,
-                evidence_dir=str(ref.directory),
+                evidence_dir="" if ref.directory is None else str(ref.directory),
                 evidence_frame_count=ref.frame_count,
                 event_id=str(uuid.uuid4()),
-                wall_time_iso=now_iso(),
+                wall_time_iso=self._wall_at(miss.close_ts),
+                evidence_error=ref.error,
             )
         )
         self.misses_emitted += 1
         log.warning(
-            "MISS %s [%s] frames %d-%d evidence=%s",
+            "MISS %s [%s] frames %d-%d evidence=%s%s",
             miss.candidate_id,
             miss.source_id,
             miss.open_frame,
             miss.close_frame,
             ref.directory,
+            "" if ref.error is None else f" (EVIDENCE FAILED: {ref.error})",
         )

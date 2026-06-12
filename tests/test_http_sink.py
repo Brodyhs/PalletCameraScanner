@@ -288,3 +288,63 @@ def test_pipeline_end_to_end_delivered_equals_emitted(
 
     emitted_ids = sorted(e.event_id for e in runner.collected_events)
     assert sorted(b["event_id"] for b in server.received) == emitted_ids
+
+
+# -- REVIEW_SYSTEM_0c30c77 finding b7 ------------------------------------------
+
+
+def test_dropped_ledger_is_order_independent(tmp_path: Path) -> None:
+    """REVIEW_SYSTEM_0c30c77 finding b7 (repro: the delivered-after-prune
+    reconciliation could run before the pruner's increment; the max(0,...)
+    clamp absorbed the decrement and a DELIVERED event stayed permanently
+    counted as dropped). The two adjustments must net identically in
+    either order."""
+    sink = HttpSink(
+        HttpSinkConfig(
+            enabled=True,
+            url="http://127.0.0.1:1/events",  # never reached
+            outbox_path=tmp_path / "outbox.db",
+        )
+    )
+    try:
+        # reconcile-before-prune: the old clamp turned (-1, +3) into 3.
+        sink._adjust_dropped(-1)
+        sink._adjust_dropped(3)
+        assert sink.dropped == 2
+        # prune-before-reconcile nets the same.
+        sink._adjust_dropped(3)
+        sink._adjust_dropped(-1)
+        assert sink.dropped == 4
+    finally:
+        sink.close()
+
+
+def test_dropped_counter_survives_two_thread_hammer(tmp_path: Path) -> None:
+    """Finding b7, second arm: unsynchronized read-modify-writes from the
+    bus and uploader threads lost updates in both directions."""
+    sink = HttpSink(
+        HttpSinkConfig(
+            enabled=True,
+            url="http://127.0.0.1:1/events",
+            outbox_path=tmp_path / "outbox.db",
+        )
+    )
+    try:
+        n = 5000
+
+        def add() -> None:
+            for _ in range(n):
+                sink._adjust_dropped(1)
+
+        def sub() -> None:
+            for _ in range(n):
+                sink._adjust_dropped(-1)
+
+        threads = [threading.Thread(target=add), threading.Thread(target=sub)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sink.dropped == 0, "lost updates on the dropped ledger"
+    finally:
+        sink.close()

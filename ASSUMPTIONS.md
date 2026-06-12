@@ -88,9 +88,18 @@ arrives.
     `passes_merged`, logged) and does not emit a second business event. The
     window refreshes **only on emit**: merged sightings do not extend the
     suppression, so a pallet parked in view cannot be deduped forever.
+    *Amendment (0c30c77 fix session):* camera-backed runs seed this window
+    from the previous run's stored passes (#59), so the rule holds across a
+    supervisor restart too.
 17. **Miss finalization waits for the post-roll** (`buffer.post_s`, 2 s of
     source time) so evidence bursts include frames after the segment closed;
     end-of-stream `flush()` finalizes with whatever exists.
+    *Amendment (0c30c77 finding 2):* a source discontinuity (watchdog
+    reconnect) is a third finalization trigger — pending misses finalize
+    immediately with whatever post-roll exists, because frames from after
+    the gap are never pallet-exit evidence. The post-roll also dedupes
+    against frames already sampled into the segment reservoir (finding
+    b11), so `evidence_frame_count` equals the files actually stored.
 18. **Evidence caps**: 500 MB total / 14 days, pruned oldest-first on every
     write; JPEG quality 85, every 3rd frame.
 19. **Per-camera A/B readiness**: `PassEvent.cameras` is a per-source decode
@@ -206,6 +215,19 @@ arrives.
     reissue an index). `CAP_PROP_POS_MSEC` is not used: it is unreliable
     for live devices. `frames()` is single-use **per connection**; only
     the reliability watchdog calls it again, after `reopen()`.
+    *Amendments (0c30c77 fix session):* (a) the reconnect boundary is now
+    an explicit signal, not just a ts gap — the watchdog marks the first
+    frame of every recovered connection `Frame.discontinuity=True`, the
+    motion gate hard-closes any open segment at its pre-gap last-active
+    frame (finding 2: a segment spanning the gap let a decoded pallet
+    swallow the pre-gap pallet's MissEvent), and the drop-oldest frame
+    queue carries the mark across drops (the one non-redundant frame).
+    Time itself is still never re-anchored. (b) In station mode every
+    camera anchors to ONE shared `(monotonic, wall)` epoch pair sampled
+    before any device opens (finding b8), so cross-camera ts comparisons
+    carry no construction skew; `epoch_wall` (the wall instant of ts=0)
+    also lets events be stamped with the wall time of their close ts
+    (finding b12) and bridges the dedup window across restarts (#59).
 30. **Exposure/gain are stored as raw backend values, beside their
     backend.** The number handed to `CAP_PROP_EXPOSURE` is what the
     config persists — no millisecond abstraction. DSHOW's log2 stops vs
@@ -249,6 +271,15 @@ arrives.
     enumeration returns `[]` loudly and `cameras[].fallback_index` is the
     escape hatch. Production targets Windows, where pygrabber's
     DirectShow filter order is the supported path.
+    *Amendment (0c30c77 finding 8):* `fallback_index` has a second role —
+    it is the **only** way to open a camera under an explicit backend
+    that is not the enumeration backend (e.g. `backend: msmf` on Windows,
+    where only DSHOW enumerates names). A name-resolved index under
+    another backend silently captures whatever device sits at that slot
+    after a replug shifts the order, so that combination is now a hard
+    connect error without a pinned index; with one, every connect warns
+    that name stability is forfeited. The run path, selftest and
+    calibrate all enforce the same rule.
 34. **DSHOW list-order == CAP_DSHOW-index-order is an assumption.**
     pygrabber returns DirectShow filter names in graph-enumeration order
     and OpenCV's CAP_DSHOW indexes devices the same way — believed but
@@ -376,6 +407,16 @@ arrives.
     again (harmless). The business bus deliberately has no MetricsRegistry
     (it would double-count merged passes); `/stats.json`'s business
     section serves the deduper's own counters.
+    *Amendment (0c30c77 finding 9):* the deduper's per-payload state is a
+    LIST of window entries, not one. A re-sighting beyond every entry's
+    window becomes a new business pass *appended beside* the old entry —
+    never replacing it (replacement destroyed state a lagging camera could
+    still merge with, misattributing its backdated sighting to the wrong
+    physical pass). Matching is two-sided (an event staler than every
+    anchor by more than the window is its own, earlier pass) and picks the
+    NEAREST anchor (ties to the older) — anchors of one payload are
+    pairwise > window apart, but two can both be within the window of one
+    event when their spacing is in (window, 2·window].
 
 41. **PassEvent gained trailing defaulted fields `first_decode_ts`,
     `camera_detail`, `revision` (D2); SQLite schema v2 adds the
@@ -419,6 +460,20 @@ arrives.
     the `rmdir` and the emptiness check. External-process churn against
     the evidence tree remains possible even with per-camera roots, so
     the tolerance is load-bearing, not belt-and-braces.
+    *Second amendment (0c30c77 finding 1) — the claim above was still
+    wrong.* Two unguarded raisers remained on the very same path: the
+    burst directory `mkdir` and the `meta.json` write — an ENOSPC there
+    (the 24/7 disk-full regime, not a race) ate one MissEvent per
+    finalize and aborted the shutdown drain. The invariant is no longer
+    "the writer never raises" but **the miss emits regardless**:
+    `write_burst` degrades every OSError to a flagged
+    `EvidenceRef(error=...)`, and `_finalize_miss` catches anything else
+    and still emits the MissEvent evidence-less with
+    `evidence_error` set and the `evidence_failures` gauge incremented —
+    disk exhaustion degrades loudly, never by silent event loss. The
+    burst directory is also collision-guarded (`-rN` suffix): candidate
+    ids carry a per-run token (finding 5), and even a colliding id can
+    no longer byte-overwrite a stored miss's evidence.
 
 44. **SqliteSink sets `PRAGMA busy_timeout=5000` (D6); reviews/manifest
     live in web-owned tables in the same DB file (D7).** The dashboard's
@@ -436,6 +491,11 @@ arrives.
     measurement-grade. Time-to-first-decode is skew-free by construction
     (#41). No shared-epoch plumbing this phase; revisit only if the trial
     needs cross-camera latency comparisons.
+    *Superseded (0c30c77 finding b8):* StationRunner now anchors every
+    camera to one shared epoch sampled before any device opens, so the
+    construction skew is gone and cross-camera ts comparisons (the dedup
+    window above all) are aligned by construction. The ttfd computation
+    keeps its same-camera form regardless.
 
 46. **The live MJPEG stream is tested against a real uvicorn server on an
     ephemeral port, not the Starlette TestClient** (deviation from the
@@ -518,6 +578,10 @@ arrives.
     why every forced eviction is counted (`forced_evictions`, new
     `stats()` key, additive per #41/#42) and logged per the
     counted-logged-drops convention.
+    *Amendment (0c30c77 finding 9):* the prune rule is now per-ENTRY
+    (state is a list per payload, #40 amendment); a payload's key is
+    removed when its last entry is pruned, and the `_MAX_TRACKED` cap
+    counts total entries.
 
 ## Phase 5: hardening + ops
 
@@ -578,14 +642,41 @@ arrives.
     CREATE_NEW_PROCESS_GROUP on Windows. Stop channel: stop-file
     (`supervisor.stop`, polled at 0.5 s) primary — console-ctrl events
     cannot cross Windows sessions — then CTRL_BREAK/SIGTERM, 15 s grace,
-    kill; a stale stop-file at startup is removed and ignored. Signals
-    are the secondary channel; on POSIX the SIGINT handler does *not*
-    forward to the child (terminal Ctrl-C already hit the foreground
-    group; forwarding would trip the child's second-signal-forces path
-    mid-drain), while directed SIGTERM and all Windows ctrl events do
-    forward. Convenience ruling: `supervise --data-dir D` auto-appends
-    `--data-dir D` to the child args unless they already carry one, so
-    the supervisor's and child's state land under one directory.
+    kill. Signals are the secondary channel; on POSIX the SIGINT handler
+    does *not* forward to the child (terminal Ctrl-C already hit the
+    foreground group; forwarding would trip the child's
+    second-signal-forces path mid-drain), while directed SIGTERM and all
+    Windows ctrl events do forward. Convenience ruling: `supervise
+    --data-dir D` auto-appends `--data-dir D` to the child args unless
+    they already carry one (either argparse spelling; abbreviations are
+    disabled CLI-wide — 0c30c77 finding b1).
+    *Amendments (0c30c77 findings 6/7/13/15 — the stop/lifetime protocol
+    redesign; replaces the original "stale stop-file at startup is
+    removed and ignored" rule).* (a) The stop-file is a STICKY LATCH:
+    the supervisor never deletes it, and one found at startup is honored
+    (no spawn, exit 0, a `restarts.jsonl` line with reason
+    `stop-honored-at-startup` and null exit_code) — a stop request
+    survives Task Scheduler revivals and reboots; only
+    `start_palletscan.ps1` (or deleting the file) re-arms the station.
+    (b) Child lifetime ⊆ supervisor lifetime: a Windows kill-on-close
+    job object (best-effort ctypes, arrival-verified) plus a portable
+    child-side parent watch (`SUPERVISOR_PID_ENV`; pid-reuse-safe
+    retained handle on Windows, ppid on POSIX; injected per spawn via
+    the Popen env argument, never by mutating os.environ) plus a
+    stop-the-child-first guard on unexpected supervisor exceptions.
+    Consequence: on Windows a supervisor death hard-kills the child
+    mid-queue via the job object — within crash-only tolerance; the
+    graceful self-drain applies on POSIX and when job assignment failed.
+    (c) "Stopped" is VERIFIED, never assumed: `stop_palletscan.ps1`
+    probes both instance locks with non-blocking lock attempts on the
+    lock byte (death-proof, detects orphans it has never heard of),
+    kills the writer-lock holder's pid (from the lock's diagnostics
+    JSON) on the hard path, polls ~10 s through the indeterminate
+    post-kill release window, and refuses to act on a directory with no
+    station state; both scripts derive the data dir from the registered
+    task's arguments. (d) The supervisor's own bookkeeping
+    (`restarts.jsonl` append) never raises: a full disk must not kill
+    the process that exists to restart the crashed child (finding 13).
 
 55. **Service identity: interactive station user + netplwiz auto-logon,
     not SYSTEM (D8).** UVC capture via OpenCV under session 0 is a known
@@ -629,3 +720,66 @@ arrives.
     features). RUNBOOK §10 documents expected growth (~5–10 MB/day per
     file at the spec's 10k passes/day) and the stop → move → start
     archival procedure; ops owns the cadence.
+
+## 0c30c77 fix session (whole-system review at the final software gate)
+
+58. **(Re)connect policy: what a camera may silently differ on vs what
+    must fail loudly (findings 3/8 + b9).** After any (re)connect,
+    control VALUES (exposure/gain/brightness readback, achieved fps,
+    buffersize) may differ — warned and counted in the new
+    `source.connect_mismatches` gauge; frames at slightly-wrong exposure
+    beat no frames. Identity- and interpretation-bearing state may NOT:
+    the packed-YUV luma channel is derived from the fourcc the device
+    actually NEGOTIATED (readback; falls back to the configured value
+    when readback is 0.0/garbage, warned + counted), and the FIRST
+    DELIVERED FRAME of every connection is the format oracle — a
+    2-channel frame with no derivable luma layout, or a geometry that
+    differs from the locked width/height, raises into the watchdog's
+    retry path (`reopen_failures` climbing, fps 0: visibly broken, never
+    silently scanning chroma or the wrong optics envelope). Calibrate's
+    live metrics read the same negotiated-format luma plane (b9). The
+    cost accepted: a config with locked width/height fails loudly on a
+    device that cannot deliver it (including dev Macs — omit
+    width/height in dev configs or recalibrate; the error says so).
+    Explicit-backend/name-resolution mixing is a hard error without a
+    pinned `fallback_index` (#33 amendment); a mismatch error at
+    construction exits 1 and churns under the supervisor — loud, and
+    deliberately not a config-load check because production configs
+    (msmf/dshow) must stay loadable on dev machines for the read-only
+    commands.
+
+59. **Restart-spanning dedup: suppress-and-count via a wall-clock bridge
+    (finding 10).** Camera-backed runs (the only mode with both restarts
+    and a wall anchor) seed the deduper — and each per-camera tracker,
+    filtered to payloads that camera saw — from the local store's recent
+    pass rows: anchor = stored `wall_time_iso` − `epoch_wall`, clamped
+    ≤ 0, discarded (counted + logged) when a backward wall-clock step
+    would place it after process start, newest row per payload. A
+    re-sighting within the window of a seed is SUPPRESSED
+    (`restart_repeats_suppressed`, new stats key), not merged: there is
+    no in-memory event to merge into, and reconstructing one from
+    detail_json buys little for its complexity. **Documented cost, not
+    independence:** the suppressed sighting writes no `camera_detail`
+    into the stored business row, so the A/B report loses the
+    post-restart camera's datapoint for restart-spanning passes — and
+    since the downstream camera is always the post-restart one for a
+    pallet in transit, that loss is direction-biased by camera order.
+    At the trial's restart rates (escalations are counted in
+    restarts.jsonl) this is noise; if restarts churn, the bias is
+    visible in the same file. Seeds obey the slowest-camera prune rule
+    and the cap. The loader never raises and never creates the DB
+    (first boot must not be blockable by its own bookkeeping).
+    Replay/synth runs neither seed nor anchor — determinism. Caveat: a
+    `replay` into the live data dir writes wall-stamped pass rows a
+    `run` started within ~window+slack could seed from; RUNBOOK says
+    don't do that.
+
+60. **Shutdown drains are verified, not assumed (finding 11).**
+    `EventBus.shutdown()` returns whether the bus actually drained; a
+    timeout counts the abandoned queue depth (`events_lost`), and the
+    runner fails the run (nonzero exit → supervisor restart) instead of
+    printing a clean summary over a silent tail loss. Publishing after
+    shutdown began (the station SENTINEL-overtake) is counted
+    (`published_after_shutdown`) and logged. The supervised-stop path is
+    unchanged: the 15 s grace kill preempts the join and is already a
+    documented, logged loss boundary.

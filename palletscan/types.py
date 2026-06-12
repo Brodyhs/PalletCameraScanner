@@ -28,6 +28,16 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def iso_at(wall: float) -> str:
+    """UNIX wall time -> the same ISO 8601 UTC format as :func:`now_iso`.
+
+    Used to stamp events with the wall time of their source-clock instant
+    (segment close), not of the deferred finalize that emitted them — an
+    outage-deferred miss must land in the report window where the pallet
+    passed (REVIEW finding b12)."""
+    return datetime.fromtimestamp(wall, timezone.utc).isoformat()
+
+
 class Symbology(enum.StrEnum):
     """Supported barcode symbologies."""
 
@@ -65,12 +75,20 @@ class Roi:
 
 @dataclass(frozen=True, slots=True)
 class Frame:
-    """A single grayscale frame from any FrameSource."""
+    """A single grayscale frame from any FrameSource.
+
+    ``discontinuity`` marks the first frame after a source recovery
+    (watchdog reconnect): motion continuity across the gap is unknowable,
+    so the gate must close any open segment before processing it. The
+    timestamp itself stays monotonic across the gap (ASSUMPTIONS #29) —
+    the flag is the boundary signal, not a time re-anchor.
+    """
 
     image: np.ndarray  # 2-D uint8 grayscale
     ts: float  # source clock, seconds
     frame_index: int
     source_id: str
+    discontinuity: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +166,12 @@ class PassEvent:
 
 @dataclass(frozen=True, slots=True)
 class MissEvent:
-    """Exception event: a motion segment ended with zero decodes."""
+    """Exception event: a motion segment ended with zero decodes.
+
+    ``evidence_error`` is set (and ``evidence_dir`` may be ``""``) when the
+    evidence burst could not be stored — full disk, lost permission. The
+    miss is emitted anyway: losing the burst must never lose the event.
+    """
 
     candidate_id: str
     source_id: str
@@ -160,6 +183,7 @@ class MissEvent:
     evidence_frame_count: int
     event_id: str
     wall_time_iso: str
+    evidence_error: str | None = None
 
     @property
     def kind(self) -> str:

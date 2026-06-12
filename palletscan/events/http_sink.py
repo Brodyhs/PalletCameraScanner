@@ -107,7 +107,15 @@ class HttpSink(Sink):
         self._wake = threading.Event()
         self.delivered = 0
         self.upload_failures = 0
+        # ``dropped`` is mutated by two threads (the pruner on the bus
+        # thread, the delivered-after-prune reconciliation on the uploader
+        # thread); unsynchronized read-modify-writes lose updates in both
+        # directions (REVIEW finding b7). All mutations go through
+        # _adjust_dropped under this lock. The value may be transiently
+        # negative when a reconciliation lands before its prune's
+        # increment — the net is correct once both have run.
         self.dropped = 0
+        self._dropped_lock = threading.Lock()
         # Seq the uploader is currently POSTing; the pruner skips it so a
         # cap-prune cannot drop (and double-count) an in-flight event.
         self._in_flight_seq: int | None = None
@@ -146,7 +154,7 @@ class HttpSink(Sink):
                 (cutoff, in_flight),
             ).rowcount
         if aged > 0:
-            self.dropped += aged
+            self._adjust_dropped(aged)
             log.warning(
                 "outbox dropped %d events older than %.1f days (total dropped %d)",
                 aged,
@@ -176,13 +184,20 @@ class HttpSink(Sink):
             size -= length
             pruned += deleted
         if pruned > 0:
-            self.dropped += pruned
+            self._adjust_dropped(pruned)
             log.warning(
                 "outbox over %.1f MB; dropped %d oldest events (total dropped %d)",
                 self._cfg.max_mb,
                 pruned,
                 self.dropped,
             )
+
+    def _adjust_dropped(self, delta: int) -> None:
+        """Thread-safe dropped-counter arithmetic (no clamping: a delivered
+        row's -1 may land before its prune's +1; clamping would absorb the
+        decrement and permanently overcount — REVIEW finding b7)."""
+        with self._dropped_lock:
+            self.dropped += delta
 
     # -- uploader thread ---------------------------------------------------------
 
@@ -270,9 +285,11 @@ class HttpSink(Sink):
                 self.delivered += 1
                 failures = 0
                 if acked == 0:  # pragma: no cover - microsecond race
-                    # The pruner won the race and counted this row dropped —
-                    # but it WAS delivered; reconcile the ledger.
-                    self.dropped = max(0, self.dropped - 1)
+                    # The pruner won the race and counted (or will count)
+                    # this row dropped — but it WAS delivered; reconcile
+                    # the ledger. Unclamped on purpose: the pruner's +1 may
+                    # not have landed yet (REVIEW finding b7).
+                    self._adjust_dropped(-1)
                     log.info(
                         "event seq=%d pruned mid-flight but delivered; "
                         "drop count corrected",

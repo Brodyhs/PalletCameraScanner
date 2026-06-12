@@ -26,10 +26,17 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class EvidenceRef:
-    """Where a burst landed and how many frames it holds."""
+    """Where a burst landed and how many frames it holds.
 
-    directory: Path
+    ``directory=None`` + ``error`` set means the burst could not be stored
+    at all (e.g. full disk): the caller must still emit its MissEvent —
+    evidence-less and flagged — never swallow it (REVIEW_SYSTEM_0c30c77
+    finding 1: disk exhaustion degrades loudly, not silently).
+    """
+
+    directory: Path | None
     frame_count: int
+    error: str | None = None
 
 
 class EvidenceWriter:
@@ -44,11 +51,40 @@ class EvidenceWriter:
         frames: list[Frame],
         meta: dict[str, Any],
     ) -> EvidenceRef:
-        """Write every ``frame_stride``-th frame as JPEG plus ``meta.json``."""
+        """Write every ``frame_stride``-th frame as JPEG plus ``meta.json``.
+
+        Never raises on storage failure: an OSError anywhere on this path
+        degrades to a flagged EvidenceRef so the MissEvent it documents is
+        still emitted (the miss IS the product; the burst is supporting
+        evidence).
+        """
         cfg = self._cfg
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         target = self._root / day / candidate_id
-        target.mkdir(parents=True, exist_ok=True)
+        # Candidate ids restart per process; a same-day restart must never
+        # merge into (and byte-overwrite) an existing burst's directory
+        # (finding 5). The run-token in the id makes collisions unexpected;
+        # this guard keeps a collision loud and lossless anyway.
+        suffix = 0
+        try:
+            while target.exists():
+                suffix += 1
+                target = self._root / day / f"{candidate_id}-r{suffix}"
+        except OSError:
+            pass  # probing failed; fall through to mkdir, which decides
+        if suffix:
+            log.warning(
+                "evidence dir for %s already exists; writing to %s instead "
+                "of overwriting", candidate_id, target,
+            )
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.error(
+                "evidence dir %s could not be created (%r); emitting "
+                "evidence-less miss", target, exc,
+            )
+            return EvidenceRef(directory=None, frame_count=0, error=repr(exc))
         kept = frames[:: max(1, cfg.frame_stride)]
         written: list[Frame] = []
         for f in kept:
@@ -76,11 +112,21 @@ class EvidenceWriter:
             "written_utc": now_iso(),
             **meta,
         }
-        (target / "meta.json").write_text(
-            json.dumps(payload, indent=2), encoding="utf-8"
-        )
+        error: str | None = None
+        try:
+            (target / "meta.json").write_text(
+                json.dumps(payload, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            error = repr(exc)
+            log.error(
+                "evidence meta.json for %s failed (%r); burst kept %d "
+                "frame(s) without metadata", candidate_id, exc, len(written),
+            )
         self.prune(keep=target)
-        return EvidenceRef(directory=target, frame_count=len(written))
+        return EvidenceRef(
+            directory=target, frame_count=len(written), error=error
+        )
 
     def _candidate_dirs(self) -> list[tuple[Path, float]]:
         """All candidate directories with their mtime, oldest first.
