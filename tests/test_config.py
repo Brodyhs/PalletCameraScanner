@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from palletscan.config import (
     AppConfig,
     ExecutorKind,
+    LogFileConfig,
     MotionAlgorithm,
     apply_overrides,
     load_config,
@@ -89,3 +90,19 @@ def test_apply_overrides() -> None:
 def test_apply_overrides_noop_returns_equal_config() -> None:
     cfg = AppConfig()
     assert apply_overrides(cfg) == cfg
+
+
+def test_apply_overrides_rebases_log_dir_and_lock_path() -> None:
+    out = apply_overrides(AppConfig(), data_dir="run1")
+    assert out.logging.file.dir == Path("run1/logs")
+    assert out.lock.path == Path("run1/palletscan.lock")
+
+
+def test_log_file_config_validators() -> None:
+    with pytest.raises(ValidationError):
+        LogFileConfig(max_mb=0)
+    with pytest.raises(ValidationError):
+        LogFileConfig(backups=0)
+    with pytest.raises(ValidationError):
+        LogFileConfig(max_age_days=0)
+    assert LogFileConfig().enabled is True

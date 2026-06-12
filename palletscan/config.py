@@ -336,8 +336,62 @@ class ReportConfig(_StrictModel):
     manifest_path: Path | None = None
 
 
+class LogFileConfig(_StrictModel):
+    """Rotating JSONL diagnostics file (writer commands only).
+
+    ``run``/``synth``/``replay`` install the file handler **after** the
+    instance lock is held: ``doRollover``'s rename fails on Windows when
+    another process holds the file open, so lock scope == file-logging
+    scope makes single-writer rotation an invariant. Total size cap is
+    ``max_mb * (backups + 1)``; files older than ``max_age_days`` are
+    pruned at handler install (``restarts.jsonl`` is always spared).
+    """
+
+    enabled: bool = True
+    dir: Path = Path("data/logs")
+    max_mb: float = 20.0
+    backups: int = 5
+    max_age_days: float = 14.0
+
+    @field_validator("max_mb")
+    @classmethod
+    def _max_mb_positive(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"logging.file.max_mb must be finite and > 0, got {v}")
+        return v
+
+    @field_validator("backups")
+    @classmethod
+    def _backups_min(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"logging.file.backups must be >= 1, got {v}")
+        return v
+
+    @field_validator("max_age_days")
+    @classmethod
+    def _age_positive(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(
+                f"logging.file.max_age_days must be finite and > 0, got {v}"
+            )
+        return v
+
+
 class LoggingConfig(_StrictModel):
     level: str = "INFO"
+    file: LogFileConfig = Field(default_factory=LogFileConfig)
+
+
+class LockConfig(_StrictModel):
+    """Single-instance lock (see ``reliability/instance_lock.py``).
+
+    Held by the writer commands (``run``/``synth``/``replay``) for the
+    process lifetime; scoped per data-dir so a multi-station box or a
+    parallel dev run with its own ``--data-dir`` coexists by design.
+    Contention exits with code 4.
+    """
+
+    path: Path = Path("data/palletscan.lock")
 
 
 class Backend(enum.StrEnum):
@@ -493,6 +547,7 @@ class AppConfig(_StrictModel):
     web: WebConfig = Field(default_factory=WebConfig)
     report: ReportConfig = Field(default_factory=ReportConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    lock: LockConfig = Field(default_factory=LockConfig)
 
     @model_validator(mode="after")
     def _unique_camera_ids(self) -> "AppConfig":
@@ -643,5 +698,13 @@ def apply_overrides(
                     update={"outbox_path": base / "outbox.db"}
                 ),
             }
+        )
+        update["logging"] = cfg.logging.model_copy(
+            update={
+                "file": cfg.logging.file.model_copy(update={"dir": base / "logs"})
+            }
+        )
+        update["lock"] = cfg.lock.model_copy(
+            update={"path": base / "palletscan.lock"}
         )
     return cfg.model_copy(update=update) if update else cfg

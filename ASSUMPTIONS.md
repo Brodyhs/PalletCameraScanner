@@ -331,6 +331,15 @@ arrives.
     only the window (6 min, 90 s warmup); the 8 MB/min slope gate and
     1.3× final/baseline ratio are unchanged, and the 2 h `tools/soak.py`
     run remains the authoritative memory gate.
+    *Amendment (Phase 5, D11):* the fixed 90 s warmup is gone — warmup is
+    now detected adaptively (`detect_warmup`: the earliest 60 s window
+    whose least-squares RSS slope drops under 2 MB/min, clamped to
+    [45 s, half the run]), making soak_short portable to the Windows box
+    whose reclaim/allocator ramp is unknown. The verdict records
+    `warmup_used_s` so runs stay comparable; an explicit `--warmup-s`
+    still pins it; the gates are unchanged. A genuine leak never plateaus,
+    so adaptive warmup rides its max bound and the slope gate fails on the
+    remaining half of the run, as it should.
 
 ## Phase 4: dashboard + A/B trial reporting
 
@@ -509,3 +518,114 @@ arrives.
     why every forced eviction is counted (`forced_evictions`, new
     `stats()` key, additive per #41/#42) and logged per the
     counted-logged-drops convention.
+
+## Phase 5: hardening + ops
+
+52. **Single-instance lock: OS-level locking, not a PID file (D1/D2).**
+    `fcntl.flock(LOCK_EX|LOCK_NB)` on POSIX, `msvcrt.locking(LK_NBLCK)` on
+    Windows, on `<data-dir>/palletscan.lock`, held open for the process
+    lifetime. **Stale locks are structurally impossible** — the OS
+    releases the lock when the holder dies, cleanly or not (proven by the
+    hard-killed-subprocess test); no liveness probing, no PID-reuse
+    races. Holder diagnostics (pid/start/argv) are JSON at file offset 0;
+    because Windows byte-range locks are *mandatory* (a locked byte is
+    unreadable by other handles), the actual lock byte sits at offset
+    0x100000 — past EOF, which is legal — so the JSON stays readable for
+    ops. `release()` unlocks before close (MSDN: release timing after an
+    abnormal close is indeterminate; the supervisor's ≥5 s restart delay
+    covers that window); the file is never unlinked (delete-while-open
+    races a fresh acquirer; the leftover is last-holder diagnostics).
+    Scope: per data-dir, writer commands only (`run`/`synth`/`replay` —
+    they own sinks/evidence/logs); `dashboard`/`calibrate`/`selftest`
+    take no lock (read-only/pre-flight; RUNBOOK: stop the service before
+    calibrating). Contention → exit code **4** naming the holder. Two
+    instances with different `--data-dir` coexist by design.
+
+53. **Log rotation: stdlib RotatingFileHandler; lock scope ==
+    file-logging scope (D3).** `logging.file` config: JSONL to
+    `<data-dir>/logs/palletscan.jsonl`, 20 MB × (5+1) files = 120 MB cap,
+    14-day age prune at handler install (`prune_old_logs`,
+    OSError-tolerant, always sparing `restarts.jsonl` — the ops audit
+    trail). The handler installs **only in the writer commands, after the
+    lock is held**: `doRollover()` renames, which fails on Windows if
+    another process holds the file open — single-writer rotation is an
+    invariant, not a hope. The stderr JSON handler stays in every command
+    (dashboard/calibrate/selftest are stderr-only). A startup INFO line
+    ("<cmd> started: lock ... held by pid ...") marks each run boundary
+    and materializes the `delay=True` file even on quiet runs. The CLI
+    releases lock + file handler together (`_WriterLease`) because main()
+    runs in-process under pytest and must not leak handlers across calls.
+    Event sinks are exempt from rotation by design — see #57.
+
+54. **Supervisor: `palletscan supervise` (in-package, ~200 lines), Task
+    Scheduler only boots it (D4–D7).** Task Scheduler alone cannot meet
+    the requirements (-RestartInterval has a 1-minute floor,
+    -RestartCount is bounded, only the last run result is recorded);
+    NSSM is a third-party exe (InfoSec: Python + pip only). The
+    supervisor restarts the child on **any** nonzero exit — including 2
+    (usage/config error), per owner ruling: a station must come back by
+    itself once ops fixes the file (loud "fix the config" log; a
+    permanently bad config burns one spawn per 300 s). Backoff: 5 s base,
+    doubling while runs last < 60 s, capped at 300 s, reset after a
+    stable run; clean exit 0 ends supervision. Every child exit appends
+    `{ts, exit_code, runtime_s, delay_s, reason}` to
+    `<data-dir>/logs/restarts.jsonl` (escalation counting is a
+    PowerShell one-liner, RUNBOOK §7). Two locks: the supervisor holds
+    `palletscan.supervisor.lock`, the child holds `palletscan.lock`
+    (lock handles don't leak into children — PEP 446). Children are
+    spawned as `python -m palletscan …` (hence `__main__.py`, D12) with
+    no pipes (a full pipe would deadlock a chatty child) and
+    CREATE_NEW_PROCESS_GROUP on Windows. Stop channel: stop-file
+    (`supervisor.stop`, polled at 0.5 s) primary — console-ctrl events
+    cannot cross Windows sessions — then CTRL_BREAK/SIGTERM, 15 s grace,
+    kill; a stale stop-file at startup is removed and ignored. Signals
+    are the secondary channel; on POSIX the SIGINT handler does *not*
+    forward to the child (terminal Ctrl-C already hit the foreground
+    group; forwarding would trip the child's second-signal-forces path
+    mid-drain), while directed SIGTERM and all Windows ctrl events do
+    forward. Convenience ruling: `supervise --data-dir D` auto-appends
+    `--data-dir D` to the child args unless they already carry one, so
+    the supervisor's and child's state land under one directory.
+
+55. **Service identity: interactive station user + netplwiz auto-logon,
+    not SYSTEM (D8).** UVC capture via OpenCV under session 0 is a known
+    failure mode (Windows camera frame server + per-user privacy consent
+    gate desktop camera access) and cannot be verified before hardware;
+    running blind on day one is the worse risk. Cost: kiosk posture (the
+    box stays logged in) — RUNBOOK notes physical security; the
+    ARRIVAL_CHECKLIST §9 verifies capture inside the task's session.
+
+56. **Spec §11 CPU measurement: method + dev-Mac results (D10;
+    supersedes the deferral in #28).** Method: a recorded **burst clip**
+    (idle gaps tightened to 0.2–0.8 s → ~50 passes/min ≈ 7× the 7/min
+    spec average; decodability envelope untouched — burst means cadence,
+    not blur) replayed at `--speed 1.0 --loop 0`, children sampled via
+    `psutil.Process.cpu_percent()` at 1 Hz for 300 s per scenario
+    (`tools/measure_cpu.py`). Replay, not realtime synthetic:
+    VideoFileSource paces on an absolute schedule and its
+    MJPG-decode-per-frame cost is the closest proxy for live MJPEG UVC
+    ingest, while synthetic rendering cost doesn't exist in production.
+    Results (2026-06-12, Apple Silicon dev Mac, 10 logical cores; raw %
+    = sum over cores, normalized = raw/4 for the spec's 4-core budget):
+    *baseline* (1 replay child, no dashboard) avg 33.4% raw / 8.4%
+    normalized, p95 44.8% / 11.2%; *station* (2 replay children +
+    dashboard + 1 live MJPEG viewer) total avg 63.7% raw / **15.9%
+    normalized**, p95 85.5% / 21.4%, max 110.8% / 27.7% — comfortably
+    under the ≤ ~50% bar, with headroom noted for the slower factory
+    box. Production note: real A/B runs one StationRunner process,
+    marginally cheaper than the two processes measured here. Dev-Mac
+    numbers are indicative; the binding factory-box run is
+    ARRIVAL_CHECKLIST §7/§9 (same tool, report filed at
+    `data/cpu/cpu_report.md`).
+
+57. **Event sinks stay unbounded by design (D13).** `events.jsonl` and
+    `palletscan.db` are the data of record (audit trail, dashboard,
+    A/B report, reconciliation), unlike diagnostic logs. Spec §4's
+    "auto-prune evidence and logs" is satisfied by the evidence caps
+    (Phase 1, #18) plus log rotation/age-pruning (D3, #53); the HTTP
+    outbox already has size/age caps. Rotating the audit record would
+    defeat its purpose, and SQLite cannot be "rotated" without a
+    retention feature nobody asked for (spec §12: no speculative
+    features). RUNBOOK §10 documents expected growth (~5–10 MB/day per
+    file at the spec's 10k passes/day) and the stop → move → start
+    archival procedure; ops owns the cadence.

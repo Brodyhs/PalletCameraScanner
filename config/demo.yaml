@@ -1,0 +1,19 @@
+# PalletScan end-to-end demo (run: python tools/demo.py).
+#
+# Realtime-paced A/B synthetic passes (two same-seed "cameras") with the
+# live dashboard — MJPEG views with decode/motion overlays, stats tiles,
+# events table, A/B report. ~10-15 minutes of passes; Ctrl-C stops it
+# gracefully (the run summary still prints).
+
+synthetic:
+  realtime: true        # sleep-paced frames + live drop-oldest semantics
+  num_passes: 250       # ~2-4 s cadence -> roughly 10-15 min of demo
+  idle_s_range: [1.0, 3.0]
+  seed: 4242
+
+sinks:
+  console: {enabled: false}   # the dashboard is the demo, not stdout
+
+web:
+  enabled: true
+  port: 8000            # http://127.0.0.1:8000

@@ -2,16 +2,21 @@
 
 Production-grade, 24/7 fixed-camera scanning that reads QR / Data Matrix
 codes on pallets as forklifts carry them past stationary USB cameras.
-**Phases 1–4** (this state of the repo): the complete core pipeline on
+**Phases 1–5** (this state of the repo): the complete core pipeline on
 synthetic input; video replay, metrics, a store-and-forward HTTP sink and
 the soak harness; the live-camera stack — device enumeration by name,
 empirical mode probing, a verified control layer, the reconnect watchdog,
 and the `run`/`calibrate`/`selftest` CLIs — code-complete and tested
 against fakes (cameras are in transit; see `ARRIVAL_CHECKLIST.md` for
-exactly what to verify when they land); and the dashboard + A/B trial
+exactly what to verify when they land); the dashboard + A/B trial
 stack — live MJPEG views with decode/motion overlays, stats tiles, a miss
 gallery with mark-reviewed, cross-camera business dedup, the A/B
-comparison report (markdown/CSV export) and manifest reconciliation.
+comparison report (markdown/CSV export) and manifest reconciliation; and
+the hardening/ops layer — rotating JSONL file logs, per-data-dir
+single-instance locks, graceful SIGTERM/CTRL_BREAK shutdown, the
+`supervise` restart-on-any-nonzero-exit supervisor with countable exit
+codes, Windows Task Scheduler install scripts (`deploy/`), the CPU
+measurement and demo tools, and `RUNBOOK.md` for operators.
 
 ```
 FrameSource → MotionGate → DecodeEngine → Dedup/PassTracker → EventBus → Sinks
@@ -38,6 +43,7 @@ palletscan calibrate --list                # enumerate cameras by name
 palletscan run                             # run the configured source (cameras when present)
 palletscan synth --ab --dashboard          # A/B demo: two synthetic cameras + live dashboard
 palletscan dashboard                       # review a finished trial read-only
+python tools/demo.py                       # the full demo: realtime A/B + dashboard in a browser
 ```
 
 On Windows, skip the `brew` line — the `pyzbar`/`pylibdmtx` wheels bundle
@@ -56,6 +62,7 @@ ground truth).
 | `palletscan run [--config Y] [--camera ID] [--data-dir D] [--stats-interval S] [--dashboard]` | run the configured source — live cameras in production; `source.cameras: [a, b]` routes through the A/B station (one pipeline per camera, cross-camera business dedup) |
 | `palletscan synth [--passes N] [--seed S] [--ab] [--config Y] [--data-dir D] [--stats-interval S] [--dashboard]` | run the full pipeline on generated pallet passes; `--ab` runs two same-seed synthetic cameras through the station |
 | `palletscan replay <file> [--speed N] [--loop N] [--truth T.jsonl] [--fps-override F] [--dashboard]` | replay a recorded clip as if live (`--speed 0` = unpaced, `--truth` reconciles decoded payloads) |
+| `palletscan supervise [--data-dir D] [--grace-s N] [--backoff-base-s N] [--backoff-cap-s N] [--stable-after-s N] -- run [args]` | restart the child on **any** nonzero exit (~5 s, crash-loop backoff to 300 s), append one JSONL line per child exit to `logs/restarts.jsonl`, stop gracefully via the `supervisor.stop` file — what the Windows scheduled task runs (see `RUNBOOK.md`) |
 | `palletscan dashboard [--config Y] [--data-dir D]` | serve the dashboard read-only against an existing events DB (no runners) — how a finished trial gets reviewed |
 | `palletscan calibrate [--list] [--camera ID] [--name SUBSTR] [--fourcc/--width/--height/--fps pins] [--exposure E] [--gain G] [--no-auto-exposure] [--seconds N] [--save] [--preview]` | probe modes empirically, verify controls (readback + exposure effect), stream fps/focus/decode lines, lock-and-save to the config |
 | `palletscan selftest [--skip-camera] [--data-dir D]` | startup checks: enumerate + achieved-fps gate, bundled symbols through the full pipeline, disk space |
@@ -69,12 +76,30 @@ Exit codes (the supervisor must restart on any nonzero exit):
 | 1 | software failure — check logs |
 | 2 | usage error |
 | 3 | watchdog escalation — USB stack wedged; check cable/hub, then logs |
+| 4 | another instance holds the lock — `run`/`synth`/`replay` are single-instance per data-dir |
 
-Tools: `tools/record_synthetic.py` (render a synthetic run to .avi/MJPG +
-truth JSONL), `tools/echo_server.py` (localhost endpoint for the HTTP sink,
-with `?fail_rate=`/`?latency_ms=` chaos knobs), `tools/soak.py` (long-run
-memory/recovery soak), `tools/bench_decoders.py`,
-`tools/make_selftest_assets.py` (regenerates the committed selftest PNGs).
+Tools: `tools/demo.py` (the end-to-end demo: realtime A/B synthetic +
+dashboard opened in a browser), `tools/measure_cpu.py` (the spec §11 CPU
+measurement under burst replay load), `tools/record_synthetic.py` (render
+a synthetic run to .avi/MJPG + truth JSONL), `tools/echo_server.py`
+(localhost endpoint for the HTTP sink, with `?fail_rate=`/`?latency_ms=`
+chaos knobs), `tools/soak.py` (long-run memory/recovery soak),
+`tools/bench_decoders.py`, `tools/make_selftest_assets.py` (regenerates
+the committed selftest PNGs).
+
+## Running 24/7 (Phase 5)
+
+`RUNBOOK.md` is the operator manual: install from zero, Task Scheduler +
+`palletscan supervise` service install (`deploy/*.ps1`), graceful
+stop-file semantics, the exit-code table, file locations and caps, and
+recovery procedures. The writer commands hold a per-data-dir instance
+lock (a second writer exits 4 naming the holder; stale locks are
+structurally impossible — the OS releases the lock when the holder dies)
+and write rotating JSONL diagnostics to `<data-dir>/logs/` (20 MB × 6
+cap, 14-day age prune; `restarts.jsonl` — the supervisor's per-child-exit
+audit trail — is never pruned). Event sinks (`events.jsonl`,
+`palletscan.db`) are the data of record and are deliberately not rotated;
+the RUNBOOK documents archival.
 
 ## Live cameras (Phase 3)
 
@@ -186,7 +211,9 @@ python tools/soak.py --minutes 5 --mode synthetic --inject-every-s 30
 ```
 
 Asserts a flat memory profile (post-warmup RSS slope < 1 MB/min, final
-< 1.3× baseline), zero unhandled exceptions, and — with `--inject-every-s` —
+< 1.3× baseline; warmup is detected adaptively per machine/OS — the
+plateau knee of the RSS curve — unless `--warmup-s` pins it), zero
+unhandled exceptions, and — with `--inject-every-s` —
 crash/restart recovery with zero event loss (per-segment truth
 reconciliation plus an outbox accounting check; restart gap must stay
 under 10 s). `pytest -m soak_short` runs a ~6-minute variant of the same
@@ -223,13 +250,15 @@ Python ≥3.12 silently skips `.pth` files carrying the `UF_HIDDEN` flag
 
 ```
 palletscan/
-  cli.py            entry points (run/synth/replay/calibrate/selftest)
+  cli.py            entry points (run/synth/replay/supervise/calibrate/selftest)
+  __main__.py       python -m palletscan (how supervisor/tools spawn children)
   config.py         pydantic models + YAML loading + calibrate upsert
   types.py          Frame/Roi/events/ground-truth dataclasses
   app.py            PipelineRunner: threads, queues, shutdown drain
   metrics.py        MetricsRegistry: snapshot() is the /stats.json contract
   calibrate.py      probe/verify/lock-and-save orchestration
   selftest.py       refuse-to-run-blind startup checks
+  logging_setup.py  JSON stderr + rotating, age-pruned JSONL file logs
   assets/           committed selftest symbols (tools/make_selftest_assets.py)
   sources/          FrameSource ABC, factory, SyntheticSource,
                     VideoFileSource, CameraSource, device enumeration,
@@ -239,13 +268,16 @@ palletscan/
   station.py        StationRunner: one pipeline per camera + business bus
   events/           EventBus, sinks (console/JSONL/SQLite/HTTP outbox),
                     EvidenceWriter, cross-camera deduper
-  reliability/      bounded queues, FlakySource, reconnect WatchdogSource
+  reliability/      bounded queues, FlakySource, reconnect WatchdogSource,
+                    InstanceLock (per-data-dir), restart Supervisor
   reporting/        A/B report math, manifest reconciliation, md/csv render
   web/              FastAPI app, MJPEG LivePreview, SQLite ReadStore,
                     uvicorn DashboardServer, vendored static UI (no CDN)
-tools/              record_synthetic, echo_server, soak, bench_decoders,
-                    make_selftest_assets
+deploy/             Task Scheduler install/uninstall/start/stop (PowerShell)
+tools/              demo, measure_cpu, record_synthetic, echo_server, soak,
+                    bench_decoders, make_selftest_assets
 tests/
+RUNBOOK.md          operator manual (install, service, recovery)
 ```
 
 See `ASSUMPTIONS.md` for every decision made without a spec answer.

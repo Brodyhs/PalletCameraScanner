@@ -2,17 +2,23 @@
 
 Subcommands: ``run`` (the configured source — live cameras in
 production), ``synth`` (the synthetic source), ``replay`` (a recorded
-clip), ``calibrate`` (probe/verify/lock camera settings), ``selftest``
-(refuse-to-run-blind startup checks), ``version``.
+clip), ``supervise`` (restart-on-any-nonzero-exit wrapper around a writer
+command; what the Windows scheduled task runs), ``calibrate``
+(probe/verify/lock camera settings), ``selftest`` (refuse-to-run-blind
+startup checks), ``version``.
 
 Exit codes: 0 clean; 1 software failure (check logs); 2 usage error;
-**3 watchdog escalation** ("USB stack wedged, check cable/hub") — the
-supervisor must restart the process on any nonzero exit.
+**3 watchdog escalation** ("USB stack wedged, check cable/hub");
+**4 another instance holds the lock** (run/synth/replay are
+single-instance per data-dir) — the supervisor must restart the process
+on any nonzero exit.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +30,8 @@ from palletscan.logging_setup import setup_logging
 
 if TYPE_CHECKING:
     from palletscan.app import PipelineRunner
+    from palletscan.reliability.instance_lock import InstanceLock
+    from palletscan.reliability.supervisor import Supervisor
     from palletscan.station import StationRunner
     from palletscan.web.server import DashboardServer
 
@@ -244,6 +252,50 @@ def _add_calibrate_parser(sub: "argparse._SubParsersAction") -> None:
     )
 
 
+def _add_supervise_parser(sub: "argparse._SubParsersAction") -> None:
+    p = sub.add_parser(
+        "supervise",
+        help="restart a writer command on any nonzero exit, with crash-loop "
+        "backoff, countable exit codes (logs/restarts.jsonl) and a "
+        "stop-file stop channel (what the Windows scheduled task runs)",
+    )
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="directory for the supervisor lock, logs/restarts.jsonl and "
+        "the stop-file; appended to the child as --data-dir unless the "
+        "child args carry their own",
+    )
+    p.add_argument(
+        "--grace-s",
+        type=float,
+        default=15.0,
+        help="seconds the child gets to drain after the stop signal",
+    )
+    p.add_argument(
+        "--backoff-base-s", type=float, default=5.0, help="restart delay"
+    )
+    p.add_argument(
+        "--backoff-cap-s",
+        type=float,
+        default=300.0,
+        help="crash-loop backoff ceiling",
+    )
+    p.add_argument(
+        "--stable-after-s",
+        type=float,
+        default=60.0,
+        help="a child run at least this long resets the backoff",
+    )
+    p.add_argument(
+        "child",
+        nargs=argparse.REMAINDER,
+        metavar="-- CHILD ...",
+        help="the supervised command after --: run|synth|replay [args]",
+    )
+
+
 def _add_selftest_parser(sub: "argparse._SubParsersAction") -> None:
     p = sub.add_parser(
         "selftest", help="startup checks: cameras, full-pipeline decode, disk"
@@ -258,16 +310,82 @@ def _add_selftest_parser(sub: "argparse._SubParsersAction") -> None:
     )
 
 
-def _install_sigint(runner: "PipelineRunner | StationRunner") -> None:
+def _install_stop_signals(runner: "PipelineRunner | StationRunner") -> None:
+    """Graceful-drain handlers for SIGINT, SIGTERM and (Windows) SIGBREAK.
+
+    The first signal asks the runner to stop and drain; restoring the
+    default handlers lets a second signal force-quit a wedged shutdown.
+    SIGTERM is what the POSIX supervisor sends; SIGBREAK is CTRL_BREAK —
+    the only console event deliverable to a Windows child process group
+    (see reliability/supervisor.py).
+    """
     import signal
 
-    def _on_sigint(*_: object) -> None:
-        # First Ctrl-C drains gracefully; restoring the default handler
-        # lets a second Ctrl-C force-quit a wedged shutdown.
-        runner.stop()
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
+    stop_signals = [signal.SIGINT]
+    for name in ("SIGTERM", "SIGBREAK"):
+        extra = getattr(signal, name, None)
+        if extra is not None:
+            stop_signals.append(extra)
 
-    signal.signal(signal.SIGINT, _on_sigint)
+    def _on_stop(*_: object) -> None:
+        runner.stop()
+        for sig in stop_signals:
+            signal.signal(sig, signal.SIG_DFL)
+
+    for sig in stop_signals:
+        signal.signal(sig, _on_stop)
+
+
+class _WriterLease:
+    """The writer commands' process-global acquisitions — the instance
+    lock and the rotating file handler — undone together by ``release()``.
+    main() runs in-process under pytest, so neither may leak across calls.
+    """
+
+    def __init__(
+        self, lock: "InstanceLock", handler: logging.Handler | None
+    ) -> None:
+        self._lock = lock
+        self._handler = handler
+
+    def release(self) -> None:
+        if self._handler is not None:
+            logging.getLogger().removeHandler(self._handler)
+            self._handler.close()
+            self._handler = None
+        self._lock.release()
+
+
+def _hold_lock_and_file_logging(
+    cfg: AppConfig, command: str
+) -> "_WriterLease | None":
+    """Acquire the per-data-dir single-instance lock, then start rotating
+    file logging.
+
+    Lock scope == file-logging scope (D2/D3): rotation's rename must be
+    single-writer on Windows. The lock comes before any camera, sink or
+    evidence path is touched. Returns None on contention (the message is
+    already printed; the caller exits 4).
+    """
+    from palletscan.logging_setup import add_rotating_file_handler, prune_old_logs
+    from palletscan.reliability.instance_lock import InstanceLock, InstanceLockHeld
+
+    lock = InstanceLock(cfg.lock.path)
+    try:
+        lock.acquire()
+    except InstanceLockHeld as exc:
+        print(f"{command}: {exc}", file=sys.stderr)
+        return None
+    handler = None
+    if cfg.logging.file.enabled:
+        prune_old_logs(cfg.logging.file.dir, cfg.logging.file.max_age_days)
+        handler = add_rotating_file_handler(cfg.logging.file)
+    # One startup line per run: marks the run boundary in the rotating log
+    # (and materializes the delay=True file even on quiet runs).
+    logging.getLogger(__name__).info(
+        "%s started: lock %s held by pid %d", command, cfg.lock.path, os.getpid()
+    )
+    return _WriterLease(lock, handler)
 
 
 def _exit_code_for(exc: BaseException) -> int:
@@ -294,40 +412,46 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 )
             }
         )
-    setup_logging(cfg.logging.level)
+    setup_logging(cfg.logging.level)  # stderr first: lock failures must log
+    lease = _hold_lock_and_file_logging(cfg, "run")
+    if lease is None:
+        return 4
     try:
-        runner: PipelineRunner | StationRunner = (
-            StationRunner(cfg)
-            if cfg.source.cameras is not None
-            else PipelineRunner.from_config(cfg)
-        )
-    except Exception as exc:
-        # Fail-fast construction (refuse to run blind): bad selector,
-        # missing device, capture that will not open.
-        print(f"run: {exc}", file=sys.stderr)
-        return 1
-    _install_sigint(runner)
-    dashboard = None
-    if args.dashboard or cfg.web.enabled:
-        if isinstance(runner, StationRunner):
-            runners, business = runner.runners, runner.deduper.stats
-        else:
-            runners, business = {runner.source.source_id: runner}, None
         try:
-            dashboard = _start_dashboard(cfg, runners, business)
-        except _DashboardUnavailable as exc:
+            runner: PipelineRunner | StationRunner = (
+                StationRunner(cfg)
+                if cfg.source.cameras is not None
+                else PipelineRunner.from_config(cfg)
+            )
+        except Exception as exc:
+            # Fail-fast construction (refuse to run blind): bad selector,
+            # missing device, capture that will not open.
             print(f"run: {exc}", file=sys.stderr)
-            return 2
-    try:
-        summary = runner.run(stats_interval_s=args.stats_interval)
-    except RuntimeError as exc:
-        print(f"run: {exc.__cause__ or exc}", file=sys.stderr)
-        return _exit_code_for(exc)
+            return 1
+        _install_stop_signals(runner)
+        dashboard = None
+        if args.dashboard or cfg.web.enabled:
+            if isinstance(runner, StationRunner):
+                runners, business = runner.runners, runner.deduper.stats
+            else:
+                runners, business = {runner.source.source_id: runner}, None
+            try:
+                dashboard = _start_dashboard(cfg, runners, business)
+            except _DashboardUnavailable as exc:
+                print(f"run: {exc}", file=sys.stderr)
+                return 2
+        try:
+            summary = runner.run(stats_interval_s=args.stats_interval)
+        except RuntimeError as exc:
+            print(f"run: {exc.__cause__ or exc}", file=sys.stderr)
+            return _exit_code_for(exc)
+        finally:
+            if dashboard is not None:
+                dashboard.stop()
+        print(summary.format())
+        return 0
     finally:
-        if dashboard is not None:
-            dashboard.stop()
-    print(summary.format())
-    return 0
+        lease.release()
 
 
 def _cmd_calibrate(args: argparse.Namespace) -> int:
@@ -374,69 +498,153 @@ def _cmd_synth(args: argparse.Namespace) -> int:
     cfg = apply_overrides(
         cfg, num_passes=args.passes, seed=args.seed, data_dir=args.data_dir
     )
-    setup_logging(cfg.logging.level)
+    setup_logging(cfg.logging.level)  # stderr first: lock failures must log
     truth_dir = args.data_dir if args.data_dir is not None else Path("data")
     truth_path = truth_dir / "truth.jsonl"
-    if args.ab:
-        from palletscan.sources.factory import synthetic_tail_s
-        from palletscan.station import StationRunner
+    lease = _hold_lock_and_file_logging(cfg, "synth")
+    if lease is None:
+        return 4
+    try:
+        if args.ab:
+            from palletscan.sources.factory import synthetic_tail_s
+            from palletscan.station import StationRunner
 
-        # Same-seed sources produce bit-identical pass schedules: two
-        # "cameras" on one zone, exercising the full cross-camera merge
-        # path without hardware.
-        tail = synthetic_tail_s(cfg)
-        sources = [
-            SyntheticSource(cfg.synthetic, source_id=source_id, tail_s=tail)
-            for source_id in ("synthA", "synthB")
-        ]
-        station = StationRunner(cfg, sources=sources)
-        _install_sigint(station)
+            # Same-seed sources produce bit-identical pass schedules: two
+            # "cameras" on one zone, exercising the full cross-camera merge
+            # path without hardware.
+            tail = synthetic_tail_s(cfg)
+            sources = [
+                SyntheticSource(cfg.synthetic, source_id=source_id, tail_s=tail)
+                for source_id in ("synthA", "synthB")
+            ]
+            station = StationRunner(cfg, sources=sources)
+            _install_stop_signals(station)
+            dashboard = None
+            if args.dashboard or cfg.web.enabled:
+                try:
+                    dashboard = _start_dashboard(
+                        cfg, station.runners, station.deduper.stats
+                    )
+                except _DashboardUnavailable as exc:
+                    print(f"synth: {exc}", file=sys.stderr)
+                    return 2
+            try:
+                station_summary = station.run(
+                    stats_interval_s=args.stats_interval
+                )
+            except RuntimeError as exc:
+                # Same contract as _cmd_run: station.py chains the runner
+                # failure's cause precisely so it survives to this mapping —
+                # a clean message + exit code (3 = watchdog escalation), not
+                # a raw traceback.
+                print(f"synth: {exc.__cause__ or exc}", file=sys.stderr)
+                return _exit_code_for(exc)
+            finally:
+                if dashboard is not None:
+                    dashboard.stop()
+            sources[0].write_truth_jsonl(truth_path)
+            print(f"truth written to {truth_path}")
+            print(station_summary.format())
+            return 0 if station_summary.unaccounted == 0 else 1
+        runner = PipelineRunner.from_config(cfg)
+        _install_stop_signals(runner)
         dashboard = None
         if args.dashboard or cfg.web.enabled:
             try:
                 dashboard = _start_dashboard(
-                    cfg, station.runners, station.deduper.stats
+                    cfg, {runner.source.source_id: runner}, None
                 )
             except _DashboardUnavailable as exc:
                 print(f"synth: {exc}", file=sys.stderr)
                 return 2
         try:
-            station_summary = station.run(stats_interval_s=args.stats_interval)
-        except RuntimeError as exc:
-            # Same contract as _cmd_run: station.py chains the runner
-            # failure's cause precisely so it survives to this mapping —
-            # a clean message + exit code (3 = watchdog escalation), not
-            # a raw traceback.
-            print(f"synth: {exc.__cause__ or exc}", file=sys.stderr)
-            return _exit_code_for(exc)
+            summary = runner.run(stats_interval_s=args.stats_interval)
         finally:
             if dashboard is not None:
                 dashboard.stop()
-        sources[0].write_truth_jsonl(truth_path)
-        print(f"truth written to {truth_path}")
-        print(station_summary.format())
-        return 0 if station_summary.unaccounted == 0 else 1
-    runner = PipelineRunner.from_config(cfg)
-    _install_sigint(runner)
-    dashboard = None
-    if args.dashboard or cfg.web.enabled:
-        try:
-            dashboard = _start_dashboard(
-                cfg, {runner.source.source_id: runner}, None
-            )
-        except _DashboardUnavailable as exc:
-            print(f"synth: {exc}", file=sys.stderr)
-            return 2
-    try:
-        summary = runner.run(stats_interval_s=args.stats_interval)
+        if isinstance(runner.source, SyntheticSource):
+            runner.source.write_truth_jsonl(truth_path)
+            print(f"truth written to {truth_path}")
+        print(summary.format())
+        return 0 if summary.unaccounted == 0 else 1
     finally:
-        if dashboard is not None:
-            dashboard.stop()
-    if isinstance(runner.source, SyntheticSource):
-        runner.source.write_truth_jsonl(truth_path)
-        print(f"truth written to {truth_path}")
-    print(summary.format())
-    return 0 if summary.unaccounted == 0 else 1
+        lease.release()
+
+
+def _install_supervise_signals(sup: "Supervisor") -> None:
+    """Stop the supervisor (and its child) gracefully on console signals.
+
+    ``forward`` decides whether the supervisor signals the child: a POSIX
+    terminal Ctrl-C already hit the whole foreground group (the child is
+    draining; signalling again would trip its second-signal-forces path),
+    while a directed SIGTERM — or any Windows ctrl event, since the child
+    lives in its own process group — reached the supervisor alone.
+    """
+    import signal
+
+    def _on_sigint(*_: object) -> None:
+        sup.request_stop(forward=sys.platform == "win32")
+
+    def _on_directed(*_: object) -> None:
+        sup.request_stop(forward=True)
+
+    signal.signal(signal.SIGINT, _on_sigint)
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, _on_directed)
+
+
+def _cmd_supervise(args: argparse.Namespace) -> int:
+    from palletscan.config import LogFileConfig
+    from palletscan.logging_setup import add_rotating_file_handler
+    from palletscan.reliability.instance_lock import InstanceLock, InstanceLockHeld
+    from palletscan.reliability.supervisor import Supervisor, SupervisorOptions
+
+    child = list(args.child)
+    if child[:1] == ["--"]:
+        child = child[1:]
+    if not child or child[0] not in ("run", "synth", "replay"):
+        print(
+            "supervise: the child command (after --) must start with run, "
+            "synth or replay",
+            file=sys.stderr,
+        )
+        return 2
+    if "--data-dir" not in child:
+        # The diagram in the RUNBOOK holds by construction: the child's
+        # lock/sinks/logs land under the supervisor's data-dir.
+        child += ["--data-dir", str(args.data_dir)]
+    setup_logging("INFO")
+    lock = InstanceLock(args.data_dir / "palletscan.supervisor.lock")
+    try:
+        lock.acquire()
+    except InstanceLockHeld as exc:
+        print(f"supervise: {exc}", file=sys.stderr)
+        return 4
+    # The supervisor's own rotating file — never the child's, so rollover
+    # renames stay single-writer on both sides.
+    handler = add_rotating_file_handler(
+        LogFileConfig(dir=args.data_dir / "logs"), filename="supervisor.jsonl"
+    )
+    try:
+        sup = Supervisor(
+            SupervisorOptions(
+                data_dir=args.data_dir,
+                command=[sys.executable, "-m", "palletscan", *child],
+                grace_s=args.grace_s,
+                backoff_base_s=args.backoff_base_s,
+                backoff_cap_s=args.backoff_cap_s,
+                stable_after_s=args.stable_after_s,
+            )
+        )
+        _install_supervise_signals(sup)
+        return sup.run()
+    finally:
+        if handler is not None:
+            logging.getLogger().removeHandler(handler)
+            handler.close()
+        lock.release()
 
 
 def _wait_for_interrupt() -> None:
@@ -542,30 +750,36 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             "video": video_cfg,
         }
     )
-    setup_logging(cfg.logging.level)
-    runner = PipelineRunner.from_config(cfg)
-    _install_sigint(runner)
-    dashboard = None
-    if args.dashboard or cfg.web.enabled:
-        try:
-            dashboard = _start_dashboard(
-                cfg, {runner.source.source_id: runner}, None
-            )
-        except _DashboardUnavailable as exc:
-            print(f"replay: {exc}", file=sys.stderr)
-            return 2
+    setup_logging(cfg.logging.level)  # stderr first: lock failures must log
+    lease = _hold_lock_and_file_logging(cfg, "replay")
+    if lease is None:
+        return 4
     try:
-        summary = runner.run(stats_interval_s=args.stats_interval)
+        runner = PipelineRunner.from_config(cfg)
+        _install_stop_signals(runner)
+        dashboard = None
+        if args.dashboard or cfg.web.enabled:
+            try:
+                dashboard = _start_dashboard(
+                    cfg, {runner.source.source_id: runner}, None
+                )
+            except _DashboardUnavailable as exc:
+                print(f"replay: {exc}", file=sys.stderr)
+                return 2
+        try:
+            summary = runner.run(stats_interval_s=args.stats_interval)
+        finally:
+            if dashboard is not None:
+                dashboard.stop()
+        if args.truth is not None:
+            fps = runner.source.nominal_fps or 30.0
+            summary.reconciliation = reconcile_truth(
+                load_truth_jsonl(args.truth), runner.collected_events, fps
+            )
+        print(summary.format())
+        return 0 if summary.unaccounted == 0 else 1
     finally:
-        if dashboard is not None:
-            dashboard.stop()
-    if args.truth is not None:
-        fps = runner.source.nominal_fps or 30.0
-        summary.reconciliation = reconcile_truth(
-            load_truth_jsonl(args.truth), runner.collected_events, fps
-        )
-    print(summary.format())
-    return 0 if summary.unaccounted == 0 else 1
+        lease.release()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -578,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_run_parser(sub)
     _add_synth_parser(sub)
     _add_replay_parser(sub)
+    _add_supervise_parser(sub)
     _add_dashboard_parser(sub)
     _add_calibrate_parser(sub)
     _add_selftest_parser(sub)
@@ -592,6 +807,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_synth(args)
     if args.command == "replay":
         return _cmd_replay(args)
+    if args.command == "supervise":
+        return _cmd_supervise(args)
     if args.command == "dashboard":
         return _cmd_dashboard(args)
     if args.command == "calibrate":

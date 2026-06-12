@@ -146,3 +146,22 @@ report:
 
 logging:
   level: INFO
+  # Rotating JSONL diagnostics, written only by the lock-holding writer
+  # commands (run/synth/replay) — single-writer rotation is an invariant,
+  # not a hope. Total size cap = max_mb x (backups + 1); files older than
+  # max_age_days are pruned at startup (restarts.jsonl always spared).
+  # Event sinks (events.jsonl, palletscan.db) are the data of record and
+  # are never rotated — archive manually (RUNBOOK.md).
+  file:
+    enabled: true
+    dir: data/logs
+    max_mb: 20.0
+    backups: 5
+    max_age_days: 14.0
+
+# Single-instance lock, scoped per data-dir (--data-dir rebases it). Held
+# by run/synth/replay for the process lifetime; a second writer on the same
+# data-dir exits with code 4 naming the holder. The OS releases the lock
+# when the holder dies — stale locks are structurally impossible.
+lock:
+  path: data/palletscan.lock

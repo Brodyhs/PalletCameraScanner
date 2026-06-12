@@ -18,9 +18,11 @@ pointed at a dead endpoint whose rows must equal every emitted event id
 across all restarts.
 
 Memory: RSS sampled via psutil (a [dev] extra; the runtime package never
-imports it). After --warmup-s, the least-squares slope must stay under
---max-slope-mb-per-min and the final RSS within 1.3x the post-warmup
-baseline.
+imports it). After warmup — adaptive knee detection by default
+(detect_warmup; --warmup-s pins it explicitly) — the least-squares slope
+must stay under --max-slope-mb-per-min and the final RSS within 1.3x the
+post-warmup baseline. A genuine leak never plateaus, so adaptive warmup
+rides its max bound and the slope gate fails, as it should.
 """
 
 from __future__ import annotations
@@ -86,31 +88,83 @@ class MemoryVerdict:
     baseline_mb: float
     final_mb: float
     peak_mb: float
+    warmup_used_s: float
     problems: list[str]
+
+
+def _ls_slope_mb_per_min(points: list[tuple[float, float]]) -> float:
+    """Least-squares slope of (seconds, MB) points, in MB/min."""
+    n = len(points)
+    mean_t = sum(t for t, _ in points) / n
+    mean_m = sum(m for _, m in points) / n
+    var_t = sum((t - mean_t) ** 2 for t, _ in points)
+    if var_t <= 0:
+        return 0.0
+    cov = sum((t - mean_t) * (m - mean_m) for t, m in points)
+    return (cov / var_t) * 60.0
+
+
+def detect_warmup(
+    samples: list[tuple[float, float]],
+    window_s: float = 60.0,
+    slope_thresh_mb_per_min: float = 2.0,
+    min_warmup_s: float = 45.0,
+    max_warmup_frac: float = 0.5,
+) -> float:
+    """Adaptive warmup: the earliest time the RSS curve plateaus.
+
+    Returns the smallest ``t`` where the least-squares slope over
+    ``[t, t + window_s]`` drops below the threshold, clamped to
+    ``[min_warmup_s, max_warmup_frac * duration]``. Allocator settling and
+    the macOS lazy page-reclaim ramp (ASSUMPTIONS #39) vary by machine and
+    OS — measuring the knee beats guessing per-OS constants. A genuine
+    leak never plateaus, so it rides the max bound and the slope gate
+    downstream fails on the remaining half of the run, as it should.
+    """
+    if not samples:
+        return min_warmup_s
+    t0 = samples[0][0]
+    rel = [(t - t0, mb) for t, mb in samples]
+    max_warmup = rel[-1][0] * max_warmup_frac
+    if max_warmup <= min_warmup_s:
+        return min_warmup_s
+    for t_start, _ in rel:
+        if t_start < min_warmup_s:
+            continue
+        if t_start > max_warmup:
+            break
+        window = [p for p in rel if t_start <= p[0] <= t_start + window_s]
+        if len(window) < 5:
+            break
+        if _ls_slope_mb_per_min(window) < slope_thresh_mb_per_min:
+            return t_start
+    return max_warmup
 
 
 def analyze_rss(
     samples: list[tuple[float, float]],
-    warmup_s: float,
+    warmup_s: float | None,
     max_slope_mb_per_min: float,
 ) -> MemoryVerdict:
-    """Least-squares slope + final/baseline ratio over post-warmup samples."""
+    """Least-squares slope + final/baseline ratio over post-warmup samples.
+
+    ``warmup_s=None`` detects the warmup adaptively (:func:`detect_warmup`);
+    an explicit value is honored unchanged. The verdict records what was
+    used (``warmup_used_s``) so runs stay comparable.
+    """
     if not samples:
-        return MemoryVerdict(False, 0.0, 0.0, 0.0, 0.0, ["no RSS samples"])
+        return MemoryVerdict(False, 0.0, 0.0, 0.0, 0.0, 0.0, ["no RSS samples"])
+    used_warmup = detect_warmup(samples) if warmup_s is None else warmup_s
     t0 = samples[0][0]
-    post = [(t - t0, mb) for t, mb in samples if t - t0 >= warmup_s]
+    post = [(t - t0, mb) for t, mb in samples if t - t0 >= used_warmup]
     peak = max(mb for _, mb in samples)
     if len(post) < 5:
         return MemoryVerdict(
-            False, 0.0, 0.0, 0.0, peak,
+            False, 0.0, 0.0, 0.0, peak, used_warmup,
             [f"only {len(post)} post-warmup samples (need >= 5)"],
         )
     n = len(post)
-    mean_t = sum(t for t, _ in post) / n
-    mean_m = sum(m for _, m in post) / n
-    var_t = sum((t - mean_t) ** 2 for t, _ in post)
-    cov = sum((t - mean_t) * (m - mean_m) for t, m in post)
-    slope_per_min = (cov / var_t) * 60.0 if var_t > 0 else 0.0
+    slope_per_min = _ls_slope_mb_per_min(post)
     k = min(5, n)
     baseline = sorted(m for _, m in post[:k])[k // 2]
     final = sorted(m for _, m in post[-k:])[k // 2]
@@ -125,7 +179,9 @@ def analyze_rss(
             f"final RSS {final:.1f} MB exceeds {RSS_RATIO_MAX}x post-warmup "
             f"baseline {baseline:.1f} MB"
         )
-    return MemoryVerdict(True, slope_per_min, baseline, final, peak, problems)
+    return MemoryVerdict(
+        True, slope_per_min, baseline, final, peak, used_warmup, problems
+    )
 
 
 @dataclass(slots=True)
@@ -180,7 +236,8 @@ class SoakReport:
             lines.append(
                 f"rss              : baseline {m.baseline_mb:.1f} MB -> final "
                 f"{m.final_mb:.1f} MB (peak {m.peak_mb:.1f}), slope "
-                f"{m.slope_mb_per_min:+.3f} MB/min"
+                f"{m.slope_mb_per_min:+.3f} MB/min "
+                f"(warmup {m.warmup_used_s:.0f}s)"
             )
         lines.append(
             "verdict          : " + ("OK" if self.ok else "FAIL")
@@ -387,7 +444,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument("--http-url", default=None, help="HTTP sink endpoint")
     ap.add_argument("--rss-interval-s", type=float, default=2.0)
-    ap.add_argument("--warmup-s", type=float, default=60.0)
+    ap.add_argument(
+        "--warmup-s",
+        type=float,
+        default=None,
+        help="post-start seconds excluded from the memory verdict "
+        "(default: adaptive knee detection; see detect_warmup)",
+    )
     ap.add_argument("--max-slope-mb-per-min", type=float, default=1.0)
     ap.add_argument("--stats-interval", type=float, default=60.0)
     args = ap.parse_args(argv)

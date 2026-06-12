@@ -1,0 +1,286 @@
+# PalletScan RUNBOOK
+
+Operating manual for the PalletScan station: install from zero on the
+Windows factory PC, run it as an auto-starting, self-restarting service,
+and recover it when something goes wrong. Written for an operator who did
+not build the system. (macOS works for development; this runbook targets
+the Windows 10/11 station.)
+
+The process tree in production:
+
+```
+Task Scheduler task "PalletScan"  (AtLogOn, station user; restarts the
+  │                                supervisor itself if it dies, PT1M)
+  └─ palletscan supervise --data-dir D -- run --config station.yaml
+       • holds D\palletscan.supervisor.lock      (one supervisor per data dir)
+       • writes D\logs\supervisor.jsonl           (its own rotating log)
+       • appends D\logs\restarts.jsonl            (one line per child exit)
+       • polls D\supervisor.stop                  (the graceful stop channel)
+       └─ python -m palletscan run …              (restarted in ~5 s on any
+            • holds D\palletscan.lock              nonzero exit, with
+            • writes D\logs\palletscan.jsonl       crash-loop backoff)
+```
+
+---
+
+## 1. Prerequisites
+
+- Windows 10/11 desktop, ≥ 4 cores, ≥ 8 GB RAM, ≥ 20 GB free disk.
+- Python **3.11+** from [python.org](https://www.python.org/downloads/)
+  (check *"Add python.exe to PATH"* in the installer). No other software:
+  the InfoSec posture is Python + pip packages only — no vendor SDKs, no
+  drivers, no NSSM.
+- The two USB cameras are standard UVC devices; plug them in, no driver
+  install. Prefer separate USB 3 root hubs/ports (bandwidth).
+- This repository, e.g. at `C:\palletscan`.
+
+## 2. Install from zero
+
+In PowerShell:
+
+```powershell
+cd C:\palletscan
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install .
+palletscan version        # prints 0.1.0
+```
+
+Notes:
+
+- On Windows the `pyzbar` and `pylibdmtx` wheels **bundle their native
+  DLLs** — nothing extra to install. If `pyzbar` fails to import with a
+  DLL error on an unusual box, install the
+  [Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+  and retry.
+- `pip install .` pulls `pygrabber` automatically on Windows (DirectShow
+  device names).
+- For development/test extras (`pytest`, `mypy`, `psutil`, `httpx`):
+  `pip install -e ".[dev]"`.
+
+Sanity check with zero hardware:
+
+```powershell
+palletscan synth --passes 5 --seed 7
+```
+
+You should see a run summary with 5 passes accounted for.
+
+## 3. Configuration bootstrap
+
+Copy the commented reference and edit:
+
+```powershell
+copy config\default.yaml config\station.yaml
+```
+
+The keys you will actually touch on day one: `cameras[]` (filled by
+calibrate below), `source.type: camera`, `source.cameras: [cam-color,
+cam-mono]` for the A/B trial (or `source.camera` for one), `web.enabled:
+true` for the dashboard, and `report.manifest_path` if a manifest CSV is
+used. Everything else has working defaults. Unknown keys are rejected —
+typos fail loudly at startup (exit 2).
+
+## 4. Calibrate, then selftest (before first service start)
+
+**Stop the service before calibrating** (calibrate needs the cameras;
+the running pipeline owns them).
+
+```powershell
+palletscan calibrate --list                       # device names
+palletscan calibrate --camera cam-color --save --config config\station.yaml
+palletscan calibrate --camera cam-mono  --save --config config\station.yaml
+palletscan selftest --config config\station.yaml  # must be fully green
+```
+
+Work through **ARRIVAL_CHECKLIST.md** the day the cameras arrive — it is
+the authoritative list of hardware claims to verify, in dependency order.
+`selftest` is the refuse-to-run-blind gate: it enumerates the cameras,
+verifies achieved fps, decodes bundled known-good symbols through the full
+pipeline, and checks disk space.
+
+## 5. Install as a service (Task Scheduler + supervisor)
+
+```powershell
+# elevated PowerShell
+cd C:\palletscan\deploy
+.\install_service.ps1 -RepoDir C:\palletscan `
+    -ConfigPath C:\palletscan\config\station.yaml `
+    -DataDir C:\palletscan\data
+```
+
+What this registers: an **AtLogOn** task running `palletscan supervise`
+as the **interactive station user**. The supervisor restarts the pipeline
+child on any nonzero exit in ~5 s (crash-loop backoff up to 300 s) and
+logs every child exit; Task Scheduler's only jobs are starting the
+supervisor at logon and restarting the *supervisor* if it ever dies.
+
+**Auto-logon (required for unattended reboot recovery).** The task needs
+the station user's interactive session because Windows gates desktop
+camera access per user (capture under session 0/SYSTEM is a known failure
+mode). Configure OS auto-logon with the built-in tool:
+
+1. `Win+R` → `netplwiz`
+2. Select the station user, untick *"Users must enter a user name and
+   password to use this computer"*, Apply, enter the password.
+
+> **Physical security note:** the station stays logged in (kiosk
+> posture). Keep the PC in a locked cabinet/room; the dashboard binds
+> 127.0.0.1 and has no auth by design.
+
+After install: reboot once and confirm the station comes up scanning
+(dashboard reachable, `restarts.jsonl` shows no churn).
+
+## 6. Start / stop / restart
+
+```powershell
+deploy\start_palletscan.ps1                          # start now
+deploy\stop_palletscan.ps1 -DataDir C:\palletscan\data   # graceful stop
+deploy\stop_palletscan.ps1 -DataDir C:\palletscan\data; deploy\start_palletscan.ps1   # restart
+```
+
+How the graceful stop works: the script writes
+`<data-dir>\supervisor.stop`; the supervisor notices within 0.5 s, sends
+CTRL_BREAK to the child, gives it 15 s to drain its queues (events are
+flushed, open motion segments become misses — nothing is silently
+dropped), removes the file, and exits 0. The script waits for the file to
+disappear as confirmation.
+
+Hard stop fallback (`-Hard`, or `Stop-ScheduledTask PalletScan`):
+terminates the tree immediately. Durable state survives (SQLite and the
+outbox are crash-safe; evidence pruning tolerates races), but in-flight
+queue contents are dropped. Use it only when the graceful path times out.
+
+A manual foreground run (e.g. for debugging) is
+`palletscan run --config config\station.yaml` — but note the instance
+lock: if the service is running on the same data dir, the manual run
+exits **4** and tells you who holds the lock. Stop the service first, or
+use a different `--data-dir`.
+
+## 7. Exit codes and counting failures
+
+| code | meaning | supervisor reaction |
+|---|---|---|
+| 0 | clean exit (intentional stop) | supervision ends |
+| 1 | software failure — check logs | restart |
+| 2 | usage/config error — fix the config file | restart (loud log; picks up the fixed file on retry) |
+| 3 | watchdog escalation — USB stack wedged; check cable/hub | restart (a fresh process resets the stack) |
+| 4 | another instance holds the lock | restart with backoff until the other instance stops |
+
+Every child exit appends one JSON line to `logs\restarts.jsonl`:
+`{"ts", "exit_code", "runtime_s", "delay_s", "reason"}`. Count watchdog
+escalations (how often the USB stack wedged) without log diving:
+
+```powershell
+Get-Content C:\palletscan\data\logs\restarts.jsonl |
+  ConvertFrom-Json | Where-Object exit_code -eq 3 | Measure-Object
+```
+
+A healthy station has a near-empty `restarts.jsonl`. Repeated exit-3
+lines → reseat the camera cable / move to another USB port or hub.
+Repeated exit-2 lines → the config file is broken; the loud
+`fix the config` line in `supervisor.jsonl` says so.
+
+## 8. Where everything lives
+
+Default data dir `C:\palletscan\data` (everything below is per
+`--data-dir`, so a second station on the same box just uses another dir):
+
+| path | what | growth/caps |
+|---|---|---|
+| `logs\palletscan.jsonl(.1-.5)` | pipeline diagnostics (rotating) | capped: 20 MB × 6 files; > 14-day files pruned at startup |
+| `logs\supervisor.jsonl(.N)` | supervisor diagnostics (rotating) | same caps |
+| `logs\restarts.jsonl` | one line per child exit (audit trail) | tiny; **never auto-pruned** |
+| `events.jsonl` | every pass/miss event (data of record) | unbounded by design — see §10 |
+| `palletscan.db` | events in SQLite (dashboard + reports read this) | unbounded by design — see §10 |
+| `evidence\<camera>\<day>\...` | JPEG bursts for missed passes | capped: 500 MB / 14 days, auto-pruned |
+| `outbox.db` | store-and-forward queue for the HTTP sink | capped: 200 MB / 14 days |
+| `palletscan.lock`, `palletscan.supervisor.lock` | instance locks; content = holder diagnostics JSON (pid/start/argv) | persist after exit (harmless last-holder info; never delete while running) |
+| `supervisor.stop` | stop request marker | transient; consumed by the supervisor |
+| `data\demo\` | demo runs (`tools/demo.py`) | disposable |
+
+**Log-tailing caveat:** don't hold rotating logs open —
+`Get-Content -Wait` on `palletscan.jsonl` can make the rollover rename
+fail (the handler then keeps writing to the same file past its size cap
+until the reader lets go). Copy the file and read the copy.
+
+## 9. Recovery procedures
+
+**Camera unplugged / stalled** — no action needed: the watchdog detects
+the stall (`watchdog.stall_timeout_s`, default 2 s), closes and reopens
+by device *name* with backoff forever, and re-applies the calibrated
+settings on every reconnect. Replug the cable; recovery is < 10 s and
+logged (`source.reconnects` in the stats). If the image comes back washed
+out, see ARRIVAL_CHECKLIST §6.
+
+**Repeated exit 3 (escalations)** — the USB stack wedged hard enough
+that only a process restart clears it, and it keeps happening: count via
+the §7 one-liner, then reseat the cable, try a different port/hub, check
+the hub's power. The station keeps self-healing meanwhile.
+
+**Dashboard unreachable** — is the run alive? (`restarts.jsonl` churn?)
+Port in use by something else exits 2 with a clean message in
+`supervisor.jsonl`/stderr; change `web.port`. The dashboard binds
+127.0.0.1 only — reach it from the station itself.
+
+**Exit 4 "another instance holds the lock"** — a manual run and the
+service are fighting over one data dir. The message names the holder
+(pid, start time, argv). Stop one of them; the supervised child keeps
+retrying with backoff and wins the lock as soon as it's free.
+
+**Stale `supervisor.stop`** — left behind by a hard stop at exactly the
+wrong moment. Harmless: the supervisor removes and ignores it at startup.
+
+**Disk full / filling** — evidence and logs are capped and self-pruning;
+the growers are `events.jsonl` and `palletscan.db` (§10). Archive them.
+`selftest` refuses to start a station with < 1 GB free.
+
+**Config typo after an edit** — the child exits 2, the supervisor logs
+`fix the config` and retries forever; fix `station.yaml` and the next
+retry (≤ 300 s) picks it up. Nothing to restart by hand.
+
+**Box replaced / restored from backup** — repeat §2–§5; copy the old
+data dir if the trial history matters. Locks and stop-files are
+per-data-dir state and carry over harmlessly.
+
+## 10. Event sinks: growth and archival
+
+`events.jsonl` and `palletscan.db` are the **data of record** (audit
+trail, dashboard, A/B report, reconciliation) and are deliberately never
+rotated — rotating the audit record would defeat its purpose. Expected
+growth is modest: at the spec's 10k passes/day, roughly 5–10 MB/day for
+`events.jsonl` and similar for the DB (events are ~0.5–1 KB each).
+
+Archival procedure (monthly, or whatever the trial needs):
+
+```powershell
+deploy\stop_palletscan.ps1 -DataDir C:\palletscan\data
+move C:\palletscan\data\events.jsonl C:\archive\events-2026-06.jsonl
+move C:\palletscan\data\palletscan.db C:\archive\palletscan-2026-06.db
+deploy\start_palletscan.ps1
+```
+
+Both files are recreated empty on the next start. To review an archived
+trial later: `palletscan dashboard --data-dir C:\archive\...` (point a
+copy of the layout at it).
+
+## 11. Demo
+
+Full system on synthetic input — no hardware, opens the dashboard in a
+browser, ~10–15 min of realtime-paced A/B passes:
+
+```powershell
+python tools\demo.py
+```
+
+`Ctrl-C` stops it gracefully (the run summary still prints). Smoke mode:
+`python tools\demo.py --no-browser --max-seconds 30`.
+
+## 12. Measurements (spec §11)
+
+- CPU under burst: `python tools\measure_cpu.py` (5 min per scenario;
+  report lands in `data\cpu\cpu_report.md`). Run it once on the factory
+  box and file the report — the acceptance number is the *station*
+  scenario's total normalized to 4 cores.
+- Soak: `python tools\soak.py --hours 2 --mode replay` (memory flatness),
+  or `pytest -m soak_short` for the 6-minute variant on an idle machine.

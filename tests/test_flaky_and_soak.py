@@ -113,6 +113,41 @@ def test_analyze_rss_flags_growth() -> None:
     assert not v.enough_samples
 
 
+def _ramp_then_plateau() -> list[tuple[float, float]]:
+    """+1 MB/s for 100 s, then flat; 6 min of 2 s samples."""
+    return [(float(t), 100.0 + min(t, 100)) for t in range(0, 360, 2)]
+
+
+def test_detect_warmup_lands_at_the_plateau_knee() -> None:
+    w = soak.detect_warmup(_ramp_then_plateau())
+    assert 95.0 <= w <= 130.0, f"warmup {w} should land at the ~100s knee"
+
+
+def test_detect_warmup_monotone_growth_rides_max_bound() -> None:
+    leaking = [(float(t), 100.0 + t * 0.5) for t in range(0, 360, 2)]  # 30 MB/min
+    w = soak.detect_warmup(leaking)
+    assert w == pytest.approx(358.0 * 0.5)  # max_warmup_frac of the run
+    v = soak.analyze_rss(leaking, None, max_slope_mb_per_min=1.0)
+    assert v.problems, "a real leak must still fail the slope gate"
+    assert v.warmup_used_s == pytest.approx(w)
+
+
+def test_detect_warmup_noisy_flat_hits_min_bound() -> None:
+    flat = [(float(t), 100.0 + (t % 5) * 0.2) for t in range(0, 360, 2)]
+    w = soak.detect_warmup(flat)
+    assert 45.0 <= w <= 50.0, "first candidate at/after the 45s minimum"
+
+
+def test_adaptive_default_matches_explicit_warmup_on_plateau() -> None:
+    samples = _ramp_then_plateau()
+    w = soak.detect_warmup(samples)
+    adaptive = soak.analyze_rss(samples, None, max_slope_mb_per_min=1.0)
+    explicit = soak.analyze_rss(samples, w, max_slope_mb_per_min=1.0)
+    assert adaptive == explicit
+    assert adaptive.warmup_used_s == pytest.approx(w)
+    assert adaptive.problems == []
+
+
 @pytest.mark.soak_short
 def test_short_soak_invariants(tmp_path: Path) -> None:
     """~6-minute synthetic soak with a failure injected every 30 source-
@@ -135,14 +170,14 @@ def test_short_soak_invariants(tmp_path: Path) -> None:
     )
     args = soak.parse_args(
         [
-            # 6 min / 90 s warmup (owner ruling at Phase 3 close-out; was
-            # 2.5 min / 45 s): the short run fit almost entirely inside
-            # macOS's lazy page-reclaim ramp — freed segment memory stays
-            # resident until the kernel reclaims it, so a fresh process
-            # measured +260..+800 MB/min "growth" on leak-free code
-            # (pristine Phase 2 HEAD included), while a 6-min window
-            # measured -6 MB/min with the final RSS *below* baseline. The
-            # longer window spans the plateau; thresholds are unchanged.
+            # 6 min (owner ruling at Phase 3 close-out; was 2.5 min): the
+            # short run must span macOS's lazy page-reclaim ramp — freed
+            # segment memory stays resident until the kernel reclaims it,
+            # so a too-short window measured +260..+800 MB/min "growth" on
+            # leak-free code. Warmup is adaptive since Phase 5 (D11):
+            # detect_warmup finds the plateau knee per machine/OS instead
+            # of the old hard-coded 90 s, making this test portable to the
+            # Windows box (ASSUMPTIONS #39 amended).
             "--minutes", "6",
             "--mode", "synthetic",
             "--inject-every-s", "30",
@@ -150,7 +185,6 @@ def test_short_soak_invariants(tmp_path: Path) -> None:
             "--data-dir", str(tmp_path / "data"),
             "--seed", "7",
             "--rss-interval-s", "1",
-            "--warmup-s", "90",
             # A short fit window over-extrapolates settling noise (a few
             # MB of gc/allocator drift reads as MB/min, and varies run to
             # run with machine load); the strict 1.0 default is for the 2h

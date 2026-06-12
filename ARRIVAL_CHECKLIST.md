@@ -81,7 +81,12 @@ palletscan calibrate --camera cam-mono  --seconds 3
 ## 7. 30-minute stability run
 
 - [ ] fps stable at the locked mode (watch the stats line), zero stalls,
-  zero drops beyond the expected burst behavior; note CPU%.
+  zero drops beyond the expected burst behavior.
+- [ ] CPU: run `python tools\measure_cpu.py` (the spec §11 method — burst
+  replay + dashboard + MJPEG viewer, 5 min per scenario) and file
+  `data\cpu\cpu_report.md`. **This factory-box run is the authoritative
+  §11 number** (the dev-Mac figures in ASSUMPTIONS #56 are indicative);
+  the *station total* row normalized to 4 cores must be ≤ ~50%.
 
 ## 8. Quirk watch-list (record anything observed)
 
@@ -97,3 +102,34 @@ palletscan calibrate --camera cam-mono  --seconds 3
   look like flat static, the plane choice is wrong for this device.
 - [ ] Mode changes resetting controls: after `apply_mode`, do the
   settings still read back? (`apply_settings` runs after it on purpose.)
+
+## 9. Phase 5 ops (Windows-only behaviors designed blind)
+
+These were designed conservatively on macOS and need one Windows pass
+(RUNBOOK.md is the operator-facing manual for all of them):
+
+- [ ] **Camera capture inside the scheduled task's session.** Install the
+  service (`deploy\install_service.ps1`, RUNBOOK §5 incl. netplwiz
+  auto-logon), reboot, and confirm frames flow (dashboard live view, fps
+  in `/stats.json`). This validates the run-as-interactive-user decision
+  (D8) — capture under session 0/SYSTEM is the failure mode it avoids.
+- [ ] **CTRL_BREAK stop end-to-end.** `deploy\stop_palletscan.ps1` while
+  scanning: the child must *drain* (run summary in
+  `logs\palletscan.jsonl`, `reason: "stop-requested"` in
+  `logs\restarts.jsonl`), the stop-file must vanish, and the supervisor
+  exit 0 — within ~20 s. This validates CTRL_BREAK delivery to the
+  `CREATE_NEW_PROCESS_GROUP` child and the SIGBREAK handler.
+- [ ] **Exit-4 contention message after `taskkill`.** With the service
+  running, try `palletscan run` on the same data dir → exit 4 naming the
+  holder. Then `taskkill /F` the child: the supervised replacement must
+  re-acquire the lock (msvcrt releases on process death — the stale-lock
+  proof on Windows), and a few seconds of "exit 4 + backoff" churn in
+  restarts.jsonl during the race window is expected and self-healing.
+- [ ] **Log rotation under load.** Set `logging.file.max_mb: 1` briefly;
+  confirm `palletscan.jsonl.1..5` appear and total size respects the cap
+  (doRollover's rename is the Windows-fragile bit the single-writer lock
+  protects).
+- [ ] **Factory CPU run** — §7 above (`tools\measure_cpu.py`).
+- [ ] **Windows soak_short.** `pytest -m soak_short` on the idle factory
+  box: adaptive warmup (D11) should absorb whatever Windows' allocator
+  ramp looks like; record the reported `warmup` value here.
