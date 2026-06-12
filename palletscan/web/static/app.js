@@ -2,9 +2,18 @@
 "use strict";
 
 const POLL_MS = 2000;
+const LIVE_RETRY_MS = 3000;
 const $ = (sel) => document.querySelector(sel);
 
 let liveGridBuilt = false;
+
+/* In-progress review-note text, keyed by miss event_id, so the poll loop's
+   card rebuilds never destroy what the operator is typing. */
+const noteDrafts = new Map();
+
+/* Last failed-save message, keyed by miss event_id, so the poll loop's card
+   rebuilds never wipe a "save failed" notice before the operator sees it. */
+const saveErrors = new Map();
 
 function fmt(value, digits = 2) {
   if (value === null || value === undefined) return "—";
@@ -36,7 +45,11 @@ function tile(label, value, cls) {
 
 async function getJSON(url) {
   const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`${url}: ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(`${url}: ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
   return resp.json();
 }
 
@@ -56,10 +69,23 @@ function buildLiveGrid(cameraIds) {
     const img = el("img");
     img.src = `/live/${encodeURIComponent(id)}`;
     img.alt = `live view: ${id}`;
+    const note = el("p", "muted");
+    note.hidden = true;
+    let retry = 0;
     img.onerror = () => {
-      img.replaceWith(el("p", "muted", "live view unavailable"));
+      note.textContent = "live view reconnecting…";
+      note.hidden = false;
+      setTimeout(() => {
+        retry += 1;
+        img.src = `/live/${encodeURIComponent(id)}?retry=${retry}`;
+      }, LIVE_RETRY_MS);
+    };
+    img.onload = () => {
+      note.textContent = "";
+      note.hidden = true;
     };
     card.appendChild(img);
+    card.appendChild(note);
     grid.appendChild(card);
   }
 }
@@ -151,12 +177,12 @@ function renderEvents(events) {
 /* -- miss gallery ------------------------------------------------------------ */
 
 async function markReviewed(eventId, reviewed, note) {
-  await fetch(`/api/misses/${encodeURIComponent(eventId)}/review`, {
+  const resp = await fetch(`/api/misses/${encodeURIComponent(eventId)}/review`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ reviewed, note: note || null }),
   });
-  await refreshMisses();
+  if (!resp.ok) throw new Error(`review POST ${resp.status}`);
 }
 
 function missCard(miss) {
@@ -186,11 +212,35 @@ function missCard(miss) {
   const note = el("input");
   note.type = "text";
   note.placeholder = "review note";
-  note.value = miss.review_note || "";
+  note.value = noteDrafts.has(miss.event_id)
+    ? noteDrafts.get(miss.event_id)
+    : miss.review_note || "";
+  note.oninput = () => noteDrafts.set(miss.event_id, note.value);
   controls.appendChild(note);
   const btn = el("button", null, miss.reviewed ? "mark unreviewed" : "mark reviewed");
-  btn.onclick = () => markReviewed(miss.event_id, !miss.reviewed, note.value);
+  const saveStatus = el("span", "muted", saveErrors.get(miss.event_id) || "");
+  btn.onclick = () => {
+    const saved = note.value; /* exactly what this save sends */
+    return markReviewed(miss.event_id, !miss.reviewed, saved)
+      .then(() => {
+        /* Drop the draft only if the operator hasn't typed past this save;
+           otherwise the newer text must survive the next card rebuild. */
+        if (noteDrafts.get(miss.event_id) === saved) {
+          noteDrafts.delete(miss.event_id);
+        }
+        saveErrors.delete(miss.event_id);
+        saveStatus.textContent = "";
+        /* The save itself succeeded: a transient refresh failure here must
+           never be reported as a save failure (the poll retries anyway). */
+        return refreshMisses().catch(() => {});
+      })
+      .catch((err) => {
+        saveErrors.set(miss.event_id, `save failed: ${err.message}`);
+        saveStatus.textContent = saveErrors.get(miss.event_id);
+      });
+  };
   controls.appendChild(btn);
+  controls.appendChild(saveStatus);
   if (miss.reviewed && miss.reviewed_utc) {
     controls.appendChild(
       el("span", "muted", `reviewed ${miss.reviewed_utc.slice(0, 19)}`)
@@ -204,6 +254,10 @@ async function refreshMisses() {
   const unreviewedOnly = $("#unreviewed-only").checked;
   const misses = await getJSON(`/api/misses?unreviewed_only=${unreviewedOnly}`);
   const grid = $("#misses");
+  const active = document.activeElement;
+  if (active && active.tagName === "INPUT" && grid.contains(active)) {
+    return; /* operator is typing a note: never yank the cursor mid-keystroke */
+  }
   grid.replaceChildren();
   if (!misses.length) {
     grid.appendChild(el("p", "muted", "no misses"));
@@ -284,32 +338,55 @@ async function uploadManifest() {
     status.textContent = "choose a CSV first";
     return;
   }
-  const text = await input.files[0].text();
-  const resp = await fetch("/api/manifest", {
-    method: "POST",
-    headers: { "Content-Type": "text/csv" },
-    body: text,
-  });
-  if (resp.ok) {
-    const out = await resp.json();
-    status.textContent = `stored ${out.stored} payloads`;
-    await refreshReport();
-  } else {
-    status.textContent = `upload failed: ${resp.status}`;
+  try {
+    const resp = await fetch("/api/manifest", {
+      method: "POST",
+      headers: { "Content-Type": "text/csv" },
+      /* Raw bytes, never Blob.text(): client-side decode replaces bad bytes
+         with U+FFFD and can't fail, which would smuggle a mangled manifest
+         past the server's strict UTF-8 decode (the single authority). */
+      body: input.files[0],
+    });
+    if (resp.ok) {
+      const out = await resp.json();
+      status.textContent = `stored ${out.stored} payloads`;
+      await refreshReport();
+    } else {
+      let detail = "";
+      try {
+        detail = (await resp.json()).detail || "";
+      } catch (err) {
+        /* non-JSON error body: report the status code alone */
+      }
+      status.textContent = detail
+        ? `upload failed: ${resp.status} — ${detail}`
+        : `upload failed: ${resp.status}`;
+    }
+  } catch (err) {
+    status.textContent = `upload failed: ${err.message}`;
   }
 }
 
 async function refreshReport() {
+  let failure = null;
   try {
     renderReport(await getJSON("/api/report/ab"));
   } catch (err) {
-    /* report endpoints optional while no data */
+    failure = err; /* keep the stale table visible, flag staleness below */
   }
   try {
     renderReconciliation(await getJSON("/api/report/reconciliation"));
   } catch (err) {
-    $("#reconciliation").replaceChildren(el("p", "muted", "no manifest loaded"));
+    if (err.status === 404) {
+      /* the one real "no manifest" signal from the server */
+      $("#reconciliation").replaceChildren(el("p", "muted", "no manifest loaded"));
+    } else {
+      failure = err; /* transient: keep the stale panel visible */
+    }
   }
+  $("#report-status").textContent = failure
+    ? `report update failed (${failure.message})`
+    : "";
 }
 
 /* -- poll loop ------------------------------------------------------------ */

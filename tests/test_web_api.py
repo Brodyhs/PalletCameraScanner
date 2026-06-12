@@ -166,6 +166,49 @@ def test_pruned_evidence_degrades_not_500(web) -> None:
     assert misses[0]["images"] == []  # row survives, gallery degrades
 
 
+def test_relative_evidence_dir_resolves_from_any_cwd(
+    web, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """7e4c22c review, finding 3 (reproduced there): a run with the default
+    relative evidence.dir stores cwd-relative paths; reviewing the trial
+    from a different cwd rendered 'evidence pruned' for every miss even
+    though the files exist under the dashboard's evidence root."""
+    client, ctx, _ = web
+    _write_evidence(ctx.evidence_root / "camA" / "2026-06-11" / "camA-000777")
+    stored = Path("data/evidence") / "camA" / "2026-06-11" / "camA-000777"
+    sink = SqliteSink(tmp_path / "events.db")
+    sink.handle(_miss("ev-m-rel", stored))
+    sink.close()
+    monkeypatch.chdir(tmp_path)  # dashboard cwd != the run's cwd
+    misses = client.get("/api/misses").json()
+    rel = next(m for m in misses if m["event_id"] == "ev-m-rel")
+    assert len(rel["images"]) == 2, "existing evidence reported as pruned"
+    assert rel["images"][0].startswith("/evidence/camA/2026-06-11/camA-000777/")
+    image = client.get(rel["images"][0])
+    assert image.status_code == 200
+    assert image.content[:2] == b"\xff\xd8"
+
+
+def test_miss_image_urls_percent_encode_special_camera_ids(
+    web, tmp_path: Path
+) -> None:
+    """Finding 13: camera ids only have to be non-empty, so a legal id like
+    'cam#1' must not produce URLs truncated at the fragment marker."""
+    client, ctx, _ = web
+    burst = ctx.evidence_root / "cam#1" / "2026-06-11" / "cam#1-000123"
+    _write_evidence(burst)
+    sink = SqliteSink(tmp_path / "events.db")
+    sink.handle(_miss("ev-m-hash", burst))
+    sink.close()
+    misses = client.get("/api/misses").json()
+    row = next(m for m in misses if m["event_id"] == "ev-m-hash")
+    assert row["images"]
+    assert all("%23" in url and "#" not in url for url in row["images"])
+    image = client.get(row["images"][0])
+    assert image.status_code == 200
+    assert image.content[:2] == b"\xff\xd8"
+
+
 def test_evidence_dir_outside_root_yields_no_images(web, tmp_path: Path) -> None:
     client, ctx, _ = web
     outside = tmp_path / "elsewhere" / "burst"
@@ -197,6 +240,30 @@ def test_manifest_raw_csv_upload_round_trip(web) -> None:
     # Unparseable (binary-ish) upload is a 400, not a 500.
     garbage = b'"' + b"x" * 200_000
     assert client.post("/api/manifest", content=garbage).status_code == 400
+
+
+def test_manifest_upload_rejects_non_utf8_bytes(web) -> None:
+    """Finding 11 (reproduced in the review): a cp1252 Excel export must be
+    a clear 400 — errors='replace' silently stored U+FFFD-mangled payloads
+    that can never match a scan, while reporting success. A rejected
+    upload must also never replace the stored manifest."""
+    client, _, _ = web
+    ok = client.post("/api/manifest", content="payload\nPLT-OK\n")
+    assert ok.status_code == 200
+    bad = "payload\r\nPLT-MÜNCHEN-01\r\n".encode("cp1252")
+    resp = client.post(
+        "/api/manifest", content=bad, headers={"Content-Type": "text/csv"}
+    )
+    assert resp.status_code == 400
+    assert "UTF-8" in resp.json()["detail"]
+    # Never silent replacement: the previous manifest survives intact.
+    assert client.get("/api/manifest").json()["payloads"] == ["PLT-OK"]
+    # The same payload as valid UTF-8 round-trips with the umlaut intact.
+    good = client.post(
+        "/api/manifest", content="payload\nPLT-MÜNCHEN-01\n".encode()
+    )
+    assert good.status_code == 200
+    assert client.get("/api/manifest").json()["payloads"] == ["PLT-MÜNCHEN-01"]
 
 
 def test_live_503_when_no_previews(web) -> None:

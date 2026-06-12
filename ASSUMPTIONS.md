@@ -399,6 +399,17 @@ arrives.
     the scan/size helpers additionally tolerate vanishing entries
     (`except OSError` → smaller listing, never an aborted miss write).
     Consequence: evidence size/age caps apply per camera in A/B mode.
+    *Amendment (7e4c22c review, finding 2):* the original fix guarded
+    only the `_candidate_dirs`/`_dir_size` scan. `prune()`'s trailing
+    empty-day cleanup was left unguarded, so concurrent churn (`rmdir`
+    on a just-repopulated day, a day vanishing mid-scan) could still
+    raise out of `write_burst` after the pending miss was popped — the
+    same silent MissEvent loss this entry claimed was eliminated; the
+    review's verifier reproduced it. The cleanup loop now carries the
+    same `except OSError` tolerance, with regression tests racing both
+    the `rmdir` and the emptiness check. External-process churn against
+    the evidence tree remains possible even with per-camera roots, so
+    the tolerance is load-bearing, not belt-and-braces.
 
 44. **SqliteSink sets `PRAGMA busy_timeout=5000` (D6); reviews/manifest
     live in web-owned tables in the same DB file (D7).** The dashboard's
@@ -465,3 +476,36 @@ arrives.
     promised station-run end-to-end proof; the missing integration test
     (station DB → ReadStore → A/B report + truth-derived manifest
     reconciliation) was added rather than amending the matrix.
+
+50. **`DashboardServer` is single-use; restart is a Phase 5 concern
+    (7e4c22c review, finding 17 — guarded, deliberately not fixed).**
+    `stop()` consumes the underlying `uvicorn.Server`: `should_exit`
+    stays set and its `started` flag never resets, so a second `start()`
+    used to report success while the serve thread exited within a tick —
+    every subsequent request got connection refused. All five CLI call
+    sites build a fresh instance per run and stop exactly once, so
+    nothing trips this today; rather than building restart machinery now,
+    `start()` after `stop()` raises `DashboardServerError`
+    ("single-use") — a loud failure beats silently serving nothing.
+    Revisit in Phase 5: service-restart/supervision machinery is exactly
+    what that phase builds, and a restartable server (fresh
+    `uvicorn.Server` per start) belongs with it.
+
+51. **Cross-camera dedup eviction keys on the slowest camera's high
+    water, with counted/logged forced evictions (7e4c22c review,
+    findings 1+16 — one family).** The original `_prune` used a single
+    global high-water cutoff fed by all cameras, so one camera's
+    progress could evict payload state the other, lagging camera was
+    still inside the merge window for — its late sighting then
+    double-counted as a new business pass (reproduced live by the
+    review). Eviction now keys on `min(per-camera high water) −
+    window_s` (per-camera event timestamps are monotonic, so that state
+    is unreachable by every camera); `StationRunner` hands the deduper
+    its camera ids so eviction waits for the slowest camera from the
+    first event, and a camera's misses also advance its high water
+    (decode droughts must not halt eviction). Consequence: a silent
+    camera halts time-based eviction and the `_MAX_TRACKED` cap becomes
+    the memory bound — hitting it force-evicts in-window state, which is
+    why every forced eviction is counted (`forced_evictions`, new
+    `stats()` key, additive per #41/#42) and logged per the
+    counted-logged-drops convention.

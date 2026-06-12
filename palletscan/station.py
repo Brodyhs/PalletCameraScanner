@@ -36,6 +36,7 @@ from palletscan.app import (
 from palletscan.config import AppConfig
 from palletscan.events.bus import EventBus
 from palletscan.events.dedup import CrossCameraDeduper, ForwardingSink
+from palletscan.events.http_sink import HttpSink
 from palletscan.sources.base import FrameSource
 from palletscan.sources.factory import create_source
 from palletscan.sources.synthetic import SyntheticSource
@@ -111,29 +112,52 @@ class StationRunner:
         self, cfg: AppConfig, sources: Sequence[FrameSource] | None = None
     ) -> None:
         self._cfg = cfg
-        if sources is None:
-            if not cfg.source.cameras:
-                raise ValueError("StationRunner requires source.cameras or sources")
-            sources = [
-                create_source(self._per_camera_cfg(camera_id))
-                for camera_id in cfg.source.cameras
-            ]
-        ids = [s.source_id for s in sources]
-        if len(set(ids)) != len(ids):
-            raise ValueError(f"duplicate source ids in station: {ids}")
+        if sources is None and not cfg.source.cameras:
+            raise ValueError("StationRunner requires source.cameras or sources")
+        opened: list[FrameSource] = list(sources) if sources is not None else []
+        try:
+            if sources is None:
+                for camera_id in cfg.source.cameras or []:
+                    opened.append(create_source(self._per_camera_cfg(camera_id)))
+            ids = [s.source_id for s in opened]
+            if len(set(ids)) != len(ids):
+                raise ValueError(f"duplicate source ids in station: {ids}")
 
-        self._collector = _ListSink()
-        self.business_bus = EventBus(build_sinks(cfg) + [self._collector])
-        self.deduper = CrossCameraDeduper(
-            self.business_bus.publish, cfg.dedup.window_s
-        )
-        self.runners: dict[str, PipelineRunner] = {}
-        for source in sources:
-            self.runners[source.source_id] = PipelineRunner(
-                self._per_camera_cfg(source.source_id),
-                source,
-                [ForwardingSink(self.deduper)],
+            self._collector = _ListSink()
+            business_sinks = build_sinks(cfg)
+            self.business_bus = EventBus(business_sinks + [self._collector])
+            self.deduper = CrossCameraDeduper(
+                self.business_bus.publish, cfg.dedup.window_s, cameras=ids
             )
+            self.runners: dict[str, PipelineRunner] = {}
+            for source in opened:
+                self.runners[source.source_id] = PipelineRunner(
+                    self._per_camera_cfg(source.source_id),
+                    source,
+                    [ForwardingSink(self.deduper)],
+                )
+            # The store-and-forward outbox hangs off the BUSINESS bus in A/B
+            # mode, so no per-camera sink list carries the HttpSink: feed
+            # its probe to every runner's registry or the backlog metric is
+            # invisible in exactly the trial mode the dashboard serves.
+            for sink in business_sinks:
+                if isinstance(sink, HttpSink):
+                    for runner in self.runners.values():
+                        runner.metrics.set_outbox_probe(sink.outbox_stats)
+        except BaseException:
+            # CameraSource opens its device eagerly ("fail fast"): a failure
+            # partway through construction must release every capture already
+            # opened, or an embedder/retry loop holding the exception keeps
+            # the devices locked with no close path.
+            for source in opened:
+                try:
+                    source.close()
+                except Exception:
+                    log.exception(
+                        "closing source %r after failed station construction",
+                        source.source_id,
+                    )
+            raise
         self._summaries: dict[str, RunSummary] = {}
         self._errors: list[tuple[str, BaseException]] = []
         self._lock = threading.Lock()

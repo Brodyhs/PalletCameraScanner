@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from palletscan.events.sinks import SqliteSink
 from palletscan.types import MissEvent, PassEvent, Symbology
-from palletscan.web.store import ReadStore
+from palletscan.web.store import ReadStore, ReadStoreError
 
 
 def _pass(payload: str, event_id: str) -> PassEvent:
@@ -122,6 +126,45 @@ def test_pass_and_miss_rows_split(tmp_path: Path) -> None:
     assert {p["payload"] for p in passes} == {"PLT-000001", "PLT-000002"}
     assert len(misses) == 1
     assert misses[0]["evidence_dir"] == "/tmp/ev/x"
+
+
+def test_readstore_creates_missing_parent_dirs(tmp_path: Path) -> None:
+    """Finding 4: parity with SqliteSink._connection — a sinks.sqlite.path
+    whose directory does not exist yet must not crash dashboard startup
+    (the sink would have created it lazily on the first event)."""
+    store = ReadStore(tmp_path / "deep" / "nested" / "events.db")
+    assert store.recent_events() == []
+
+
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1000)() == 0,
+    reason="root ignores file permission bits",
+)
+def test_readstore_unopenable_db_raises_clean_error(tmp_path: Path) -> None:
+    """Finding 4 (reproduced in the review): startup sqlite3 errors must
+    surface as ReadStoreError so the CLI maps them to a clean exit 2, not
+    a raw 'attempt to write a readonly database' traceback."""
+    db = _seeded_db(tmp_path)
+    db.chmod(0o444)
+    try:
+        with pytest.raises(ReadStoreError, match="cannot open events DB"):
+            ReadStore(db)
+    finally:
+        db.chmod(0o644)
+
+
+def test_manifest_path_fallback_rejects_non_utf8_like_upload_does(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 11 (consistency): an undecodable config-pointed manifest
+    degrades like an unparseable one — warning + [], never a 500 from
+    every report endpoint, never silently mangled payloads."""
+    bad = tmp_path / "expected.csv"
+    bad.write_bytes("payload\nPLT-MÜNCHEN-01\n".encode("cp1252"))
+    store = ReadStore(_seeded_db(tmp_path), manifest_path=bad)
+    with caplog.at_level(logging.WARNING, logger="palletscan.web.store"):
+        assert store.manifest_payloads() == []
+    assert any("not readable UTF-8 CSV" in r.message for r in caplog.records)
 
 
 def test_concurrent_writer_busy_timeout_smoke(tmp_path: Path) -> None:

@@ -148,7 +148,18 @@ class EvidenceWriter:
             total -= sizes[d]
             shutil.rmtree(d, ignore_errors=True)
             log.info("evidence pruned by size: %s", d)
-        # Drop empty day directories left behind.
-        for day in self._root.iterdir():
-            if day.is_dir() and not any(day.iterdir()):
-                day.rmdir()
+        # Drop empty day directories left behind — with the same OSError
+        # tolerance as the scan helpers above: concurrent churn (a day
+        # vanishing mid-scan, a racing writer repopulating one before the
+        # rmdir) must degrade to a skipped sweep, never abort the miss
+        # write that triggered this prune (ASSUMPTIONS #43 amendment).
+        try:
+            days = list(self._root.iterdir())
+        except OSError:
+            return
+        for day in days:
+            try:
+                if day.is_dir() and not any(day.iterdir()):
+                    day.rmdir()
+            except OSError:
+                continue

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -112,6 +113,19 @@ def test_stop_is_bounded_with_connected_mjpeg_client(tmp_path: Path) -> None:
         sock.close()
 
 
+def test_start_after_stop_raises_single_use_guard(tmp_path: Path) -> None:
+    """7e4c22c review, finding 17 (guarded, not fixed): stop() consumes the
+    single-use uvicorn.Server, so a second start() used to report success
+    while the serve thread died within a tick — every request then got
+    connection refused. Until Phase 5 builds real restart machinery, the
+    restart attempt must fail loudly instead."""
+    server = DashboardServer(create_app(_ctx(tmp_path)), "127.0.0.1", 0)
+    server.start()
+    server.stop()
+    with pytest.raises(DashboardServerError, match="single-use"):
+        server.start()
+
+
 def test_server_start_fails_fast_on_taken_port(tmp_path: Path) -> None:
     app = create_app(_ctx(tmp_path))
     first = DashboardServer(app, "127.0.0.1", 0)
@@ -215,6 +229,61 @@ def test_cli_dashboard_port_in_use_is_clean_exit_2(tmp_path: Path, capsys) -> No
         assert "dashboard:" in capsys.readouterr().err
     finally:
         blocker.stop()
+
+
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1000)() == 0,
+    reason="root ignores file permission bits",
+)
+def test_cli_dashboard_readonly_db_is_clean_exit_2(tmp_path: Path, capsys) -> None:
+    """Finding 4, path (1): a readonly events DB passes the is_file() check
+    but cannot host the web tables — clean message + exit 2, not a raw
+    sqlite3.OperationalError out of cli.main."""
+    data = tmp_path / "data"
+    sink = SqliteSink(data / "palletscan.db")
+    sink.handle(_pass())
+    sink.close()
+    (data / "palletscan.db").chmod(0o444)
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump({"web": {"port": 0}}), encoding="utf-8")
+    try:
+        code = cli.main(
+            ["dashboard", "--config", str(cfg_path), "--data-dir", str(data)]
+        )
+    finally:
+        (data / "palletscan.db").chmod(0o644)
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "dashboard:" in err and "cannot open events DB" in err
+
+
+def test_cli_synth_dashboard_with_unborn_db_dir_succeeds(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """Finding 4, path (2): a sinks.sqlite.path whose parent directory does
+    not exist yet crashed --dashboard startup before the run began, while
+    the same config without --dashboard worked (the sink mkdirs lazily).
+    The ReadStore now creates it too."""
+    monkeypatch.chdir(tmp_path)  # relative config paths land under tmp
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "web": {"port": 0},
+                "sinks": {
+                    "console": {"enabled": False},
+                    "sqlite": {"path": "unborn/nested/palletscan.db"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    code = cli.main(
+        ["synth", "--passes", "1", "--config", str(cfg_path), "--dashboard"]
+    )
+    assert code == 0
+    assert "dashboard serving on" in capsys.readouterr().out
+    assert (tmp_path / "unborn" / "nested" / "palletscan.db").is_file()
 
 
 def test_cli_dashboard_requires_existing_db(tmp_path: Path, capsys) -> None:

@@ -22,6 +22,7 @@ from palletscan.config import (
     apply_overrides,
 )
 from palletscan.reliability.watchdog import WatchdogEscalation
+from palletscan.sources.base import FrameSource
 from palletscan.sources.factory import synthetic_tail_s
 from palletscan.sources.synthetic import SyntheticSource
 from palletscan.station import StationRunner, StationSummary
@@ -261,6 +262,107 @@ def test_plain_runner_error_maps_to_exit_1(tmp_path: Path) -> None:
     assert _exit_code_for(excinfo.value) == 1
 
 
+# -- construction: leaks, probes, deduper wiring (7e4c22c review) ---------------
+
+
+class _RecordingSource(FrameSource):
+    """Minimal source that records close() — stands in for an eagerly
+    opened CameraSource capture."""
+
+    def __init__(self, source_id: str) -> None:
+        self._id = source_id
+        self.closed = False
+
+    @property
+    def source_id(self) -> str:
+        return self._id
+
+    def frames(self):
+        return iter(())
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_duplicate_ids_close_already_opened_sources(tmp_path: Path) -> None:
+    """Finding 15: constructor failure must release every source already
+    opened — CameraSource opens its device eagerly, and there is no other
+    close path for a half-built station."""
+    cfg = _station_cfg(tmp_path)
+    sources = [_RecordingSource("camA"), _RecordingSource("camA")]
+    with pytest.raises(ValueError, match="duplicate source ids"):
+        StationRunner(cfg, sources=sources)
+    assert all(s.closed for s in sources)
+
+
+def test_failed_second_camera_closes_the_first(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Finding 15, the review's scenario: camB unplugged -> create_source
+    raises after camA's capture is already open; camA must be closed."""
+    import palletscan.station as station_mod
+
+    cfg = _station_cfg(tmp_path).model_copy(
+        update={
+            "source": SourceConfig(type="camera", cameras=["camA", "camB"]),
+            "cameras": [_cam("camA"), _cam("camB")],
+        }
+    )
+    opened: list[_RecordingSource] = []
+
+    def fake_create_source(per_cam_cfg):
+        if per_cam_cfg.source.camera == "camB":
+            raise RuntimeError("camB: no matching device (unplugged)")
+        source = _RecordingSource(per_cam_cfg.source.camera)
+        opened.append(source)
+        return source
+
+    monkeypatch.setattr(station_mod, "create_source", fake_create_source)
+    with pytest.raises(RuntimeError, match="camB"):
+        StationRunner(cfg)
+    assert len(opened) == 1
+    assert opened[0].closed
+
+
+def test_ab_outbox_metric_visible_on_every_camera(tmp_path: Path) -> None:
+    """Finding 5: with sinks.http enabled the outbox hangs off the business
+    bus, so per-camera snapshots reported outbox=null and the backlog
+    signal was invisible in exactly the A/B trial mode."""
+    from palletscan.config import HttpSinkConfig
+
+    cfg = _station_cfg(tmp_path)
+    cfg = cfg.model_copy(
+        update={
+            "sinks": cfg.sinks.model_copy(
+                update={
+                    "http": HttpSinkConfig(
+                        enabled=True,
+                        url="http://127.0.0.1:9/events",  # never dialed here
+                        outbox_path=tmp_path / "outbox.db",
+                    )
+                }
+            )
+        }
+    )
+    station, _ = _build_station(cfg)
+    try:
+        for source_id, runner in station.runners.items():
+            outbox = runner.metrics.snapshot()["outbox"]
+            assert outbox is not None, f"{source_id}: outbox probe not wired"
+            assert outbox["depth"] == 0
+    finally:
+        # Drain-and-close the never-used bus so the HttpSink uploader stops.
+        station.business_bus.start()
+        station.business_bus.shutdown()
+
+
+def test_station_deduper_knows_camera_set(tmp_path: Path) -> None:
+    """Finding 1 wiring: the station hands its source ids to the deduper so
+    eviction waits for the slowest camera from the very first event."""
+    station, _ = _build_station(_station_cfg(tmp_path))
+    assert set(station.deduper._high_waters) == {"synthA", "synthB"}
+
+
 # -- config validation (D8) ----------------------------------------------------
 
 
@@ -316,6 +418,41 @@ def test_cli_synth_ab_end_to_end(tmp_path: Path, capsys) -> None:
     ).fetchone()
     conn.close()
     assert passes == 1
+
+
+def test_cli_synth_ab_runner_failure_keeps_exit_contract(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """Finding 12: synth --ab must map a RuntimeError out of station.run()
+    to the same clean message + exit code _cmd_run guarantees (station.py
+    chains the cause precisely so the CLI can inspect it), instead of a
+    raw traceback."""
+    import palletscan.station as station_mod
+
+    def fail_plain(self, stats_interval_s=None):
+        try:
+            raise OSError(28, "No space left on device")
+        except OSError as exc:
+            raise RuntimeError("station runner 'synthA' failed") from exc
+
+    monkeypatch.setattr(station_mod.StationRunner, "run", fail_plain)
+    code = main(["synth", "--ab", "--passes", "1", "--data-dir", str(tmp_path)])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "synth:" in err and "No space left on device" in err
+
+    def fail_escalated(self, stats_interval_s=None):
+        try:
+            raise WatchdogEscalation("zombie reader limit")
+        except WatchdogEscalation as exc:
+            raise RuntimeError("station runner 'synthA' failed") from exc
+
+    monkeypatch.setattr(station_mod.StationRunner, "run", fail_escalated)
+    code = main(
+        ["synth", "--ab", "--passes", "1", "--data-dir", str(tmp_path / "b")]
+    )
+    assert code == 3  # watchdog escalation survives to the supervisor
+    assert "zombie reader limit" in capsys.readouterr().err
 
 
 def test_business_view_takes_max_revision() -> None:

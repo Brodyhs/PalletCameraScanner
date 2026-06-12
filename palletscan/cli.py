@@ -84,7 +84,7 @@ def _start_dashboard(
     from palletscan.web.app import DashboardContext, create_app
     from palletscan.web.preview import LivePreview
     from palletscan.web.server import DashboardServer
-    from palletscan.web.store import ReadStore
+    from palletscan.web.store import ReadStore, ReadStoreError
 
     from palletscan.web.server import DashboardServerError
 
@@ -100,11 +100,17 @@ def _start_dashboard(
         runner.preview = preview
         previews[source_id] = preview
         snapshots[source_id] = runner.metrics.snapshot
+    try:
+        store = ReadStore(cfg.sinks.sqlite.path, cfg.report.manifest_path)
+    except ReadStoreError as exc:
+        # An unopenable events DB is a configuration error: clean message,
+        # exit 2 — same treatment as a bad bind below.
+        raise _DashboardUnavailable(str(exc)) from exc
     ctx = DashboardContext(
         snapshots=snapshots,
         previews=previews,
         business=business,
-        store=ReadStore(cfg.sinks.sqlite.path, cfg.report.manifest_path),
+        store=store,
         evidence_root=cfg.evidence.dir,
         web=cfg.web,
     )
@@ -396,6 +402,13 @@ def _cmd_synth(args: argparse.Namespace) -> int:
                 return 2
         try:
             station_summary = station.run(stats_interval_s=args.stats_interval)
+        except RuntimeError as exc:
+            # Same contract as _cmd_run: station.py chains the runner
+            # failure's cause precisely so it survives to this mapping —
+            # a clean message + exit code (3 = watchdog escalation), not
+            # a raw traceback.
+            print(f"synth: {exc.__cause__ or exc}", file=sys.stderr)
+            return _exit_code_for(exc)
         finally:
             if dashboard is not None:
                 dashboard.stop()
@@ -440,7 +453,7 @@ def _wait_for_interrupt() -> None:
 def _cmd_dashboard(args: argparse.Namespace) -> int:
     from palletscan.web.app import DashboardContext, create_app
     from palletscan.web.server import DashboardServer, DashboardServerError
-    from palletscan.web.store import ReadStore
+    from palletscan.web.store import ReadStore, ReadStoreError
 
     cfg = load_config(args.config)
     cfg = apply_overrides(cfg, data_dir=args.data_dir)
@@ -462,11 +475,18 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        store = ReadStore(db, cfg.report.manifest_path)
+    except ReadStoreError as exc:
+        # e.g. a readonly DB file: the is_file() check passes but the web
+        # tables cannot be prepared — clean message, not a raw traceback.
+        print(f"dashboard: {exc}", file=sys.stderr)
+        return 2
     ctx = DashboardContext(
         snapshots={},
         previews={},
         business=None,
-        store=ReadStore(db, cfg.report.manifest_path),
+        store=store,
         evidence_root=cfg.evidence.dir,
         web=cfg.web,
     )

@@ -41,6 +41,7 @@ class DashboardServer:
         )
         self._server = uvicorn.Server(self._config)
         self._thread: threading.Thread | None = None
+        self._stopped = False
 
     def _run(self) -> None:
         try:
@@ -64,6 +65,16 @@ class DashboardServer:
 
     def start(self, timeout_s: float = 15.0) -> None:
         """Spawn the server thread and wait until it accepts connections."""
+        if self._stopped:
+            # stop() consumes the single-use uvicorn.Server (should_exit
+            # stays set, its started flag never resets), so a relaunch
+            # would report success and serve nothing. Fail loudly until
+            # real restart machinery exists — a Phase 5 concern, where
+            # service-restart support is being built (ASSUMPTIONS #50).
+            raise DashboardServerError(
+                "DashboardServer is single-use: construct a new instance "
+                "instead of restarting a stopped one"
+            )
         if self._thread is not None:
             raise DashboardServerError("server already started")
         self._thread = threading.Thread(
@@ -86,7 +97,9 @@ class DashboardServer:
         log.info("dashboard serving on %s", self.url)
 
     def stop(self, timeout_s: float = 10.0) -> None:
-        """Signal shutdown and join the thread. Idempotent."""
+        """Signal shutdown and join the thread. Idempotent. Consumes the
+        server: a later start() raises (single-use, see start())."""
+        self._stopped = True
         if self._thread is None:
             return
         self._server.should_exit = True

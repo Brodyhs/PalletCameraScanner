@@ -16,6 +16,15 @@ event and its revision are computed under the lock; ``publish`` happens
 outside it, because the business bus's blocking put must never couple one
 runner's bus thread to the other's. No held state needs expiry timers, so
 idle periods and accelerated replay have no failure modes here.
+
+Eviction keys on the SLOWEST camera's progress, not a global high water:
+per-camera event timestamps are monotonic, so state older than
+``min(per-camera high water) - window_s`` is unreachable by every camera,
+while a lagging camera's still-mergeable state survives until that camera
+itself moves past it. A camera that goes silent therefore halts time-based
+eviction; the ``_MAX_TRACKED`` cap bounds memory instead, and every forced
+cap eviction is counted (``forced_evictions``) and logged because the
+evicted payload's next sighting double-counts as a new business pass.
 """
 
 from __future__ import annotations
@@ -23,7 +32,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from palletscan.events.sinks import Sink
@@ -31,8 +40,11 @@ from palletscan.types import Event, PassEvent
 
 log = logging.getLogger(__name__)
 
-#: Hard cap on tracked payloads; lazy high-water pruning keeps the map far
-#: smaller in practice (~window_s worth of distinct payloads).
+#: Hard cap on tracked payloads; lazy slowest-camera pruning keeps the map
+#: far smaller in practice (~window_s worth of distinct payloads). The cap
+#: only binds when a camera goes silent (its lag becomes unknowable, so
+#: time-based eviction stops); hitting it force-evicts in-window state —
+#: counted in ``forced_evictions`` and logged.
 _MAX_TRACKED = 4096
 
 
@@ -58,27 +70,45 @@ class _PayloadState:
 
 
 class CrossCameraDeduper:
-    """Collapses per-camera PassEvents into business events by payload."""
+    """Collapses per-camera PassEvents into business events by payload.
+
+    ``cameras`` names the camera set feeding this deduper (StationRunner
+    passes its source ids). Until every named camera has reported at least
+    one event, no time-based eviction happens — a camera's lag is unknown
+    until it speaks, and evicting state another camera can still merge
+    with double-counts that pallet (finding 1 of the 7e4c22c review).
+    Without ``cameras`` the set is learned from the events themselves.
+    """
 
     def __init__(
-        self, publish: Callable[[Event], None], window_s: float
+        self,
+        publish: Callable[[Event], None],
+        window_s: float,
+        cameras: Sequence[str] | None = None,
     ) -> None:
         self._publish = publish
         self._window_s = window_s
         self._lock = threading.Lock()
         self._state: dict[str, _PayloadState] = {}
-        self._high_water = float("-inf")
+        self._high_waters: dict[str, float] = {
+            camera: float("-inf") for camera in cameras or ()
+        }
         self.passes_emitted = 0
         self.cross_camera_merges = 0
         self.repeats_suppressed = 0
         self.reemits = 0
         self.misses_forwarded = 0
+        self.forced_evictions = 0
 
     def submit(self, event: Event) -> None:
         """Route one per-camera event; called from any runner's bus thread."""
         if not isinstance(event, PassEvent):
             with self._lock:
                 self.misses_forwarded += 1
+                # A miss still proves its camera's clock reached end_ts:
+                # per-camera emission is in source-clock order, so eviction
+                # keeps progressing through decode droughts.
+                self._note_progress(event.source_id, event.end_ts)
             self._publish(event)
             return
         with self._lock:
@@ -88,16 +118,23 @@ class CrossCameraDeduper:
         if out is not None:
             self._publish(out)
 
+    def _note_progress(self, camera: str, ts: float) -> None:
+        """Advance one camera's high-water mark (under the lock)."""
+        if ts > self._high_waters.get(camera, float("-inf")):
+            self._high_waters[camera] = ts
+
     def _absorb(self, event: PassEvent) -> PassEvent | None:
         """Merge ``event`` into the payload map; returns what to publish."""
         ts = event.last_seen_ts
-        self._prune(ts)
+        camera = next(iter(event.cameras), None)
+        if camera is not None:
+            self._note_progress(camera, ts)
+        self._prune()
         state = self._state.get(event.payload)
         if state is None or ts - state.anchor_ts > self._window_s:
             self._state[event.payload] = _PayloadState(event=event, anchor_ts=ts)
             self.passes_emitted += 1
             return event
-        camera = next(iter(event.cameras), None)
         if camera in state.event.cameras:
             # Same camera re-sighting (e.g. its tracker window expired
             # first): suppress, and do NOT extend the anchor — a parked
@@ -145,19 +182,36 @@ class CrossCameraDeduper:
             revision=base.revision + 1,
         )
 
-    def _prune(self, ts: float) -> None:
-        """Drop entries that can no longer merge (lazy, under the lock)."""
-        self._high_water = max(self._high_water, ts)
-        cutoff = self._high_water - self._window_s
-        if len(self._state) > _MAX_TRACKED or any(
-            s.anchor_ts < cutoff for s in self._state.values()
-        ):
-            self._state = {
-                p: s for p, s in self._state.items() if s.anchor_ts >= cutoff
-            }
-        while len(self._state) > _MAX_TRACKED:
-            oldest = min(self._state, key=lambda p: self._state[p].anchor_ts)
-            del self._state[oldest]
+    def _prune(self) -> None:
+        """Drop entries no camera can merge with any more (lazy, under the
+        lock). Anything newer than the slowest camera's high water minus the
+        window stays: evicting it would double-count the pallet when that
+        camera's lagging sighting arrives."""
+        if self._high_waters:
+            cutoff = min(self._high_waters.values()) - self._window_s
+            if any(s.anchor_ts < cutoff for s in self._state.values()):
+                self._state = {
+                    p: s for p, s in self._state.items() if s.anchor_ts >= cutoff
+                }
+        over = len(self._state) - _MAX_TRACKED
+        if over > 0:
+            # Forced eviction: everything left is still inside the merge
+            # window for at least one camera, so each evicted payload's
+            # next sighting becomes a second business pass. Counted and
+            # logged, never silent (the project's counted-logged-drops
+            # convention).
+            for payload in sorted(
+                self._state, key=lambda p: self._state[p].anchor_ts
+            )[:over]:
+                del self._state[payload]
+            self.forced_evictions += over
+            log.warning(
+                "dedup tracking cap (%d) exceeded: force-evicted %d "
+                "in-window payload(s); the next sighting of each will "
+                "double-count as a new business pass",
+                _MAX_TRACKED,
+                over,
+            )
 
     def stats(self) -> dict[str, int]:
         """Business counters for /stats.json and the station summary."""
@@ -168,4 +222,5 @@ class CrossCameraDeduper:
                 "repeats_suppressed": self.repeats_suppressed,
                 "reemits": self.reemits,
                 "misses_forwarded": self.misses_forwarded,
+                "forced_evictions": self.forced_evictions,
             }

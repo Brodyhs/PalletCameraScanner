@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
@@ -80,20 +81,53 @@ def _mjpeg_part(data: bytes) -> bytes:
 def create_app(ctx: DashboardContext) -> FastAPI:
     app = FastAPI(title="PalletScan", docs_url=None, redoc_url=None)
 
+    def _resolve_miss_dir(evidence_dir: str) -> Path | None:
+        """The stored evidence dir located under the evidence root, or None.
+
+        A run with a relative ``evidence.dir`` stores cwd-relative paths,
+        and the dashboard may review the trial from a different cwd — so
+        when direct resolution does not land under the root, fall back to
+        matching the stored path's trailing components beneath the root
+        (``<day>/<candidate>``, or ``<source>/<day>/<candidate>`` after the
+        A/B rebase). Longest tail wins; everything served stays inside the
+        root."""
+        root = ctx.evidence_root.resolve()
+        stored = Path(evidence_dir)
+        try:
+            direct = stored.resolve()
+            direct.relative_to(root)
+            if direct.is_dir():
+                return direct
+        except (ValueError, OSError):
+            pass
+        parts = [p for p in stored.parts if p not in ("..", "/", "\\")]
+        for start in range(len(parts)):
+            candidate = root.joinpath(*parts[start:])
+            try:
+                if not candidate.is_dir():
+                    continue
+                candidate.resolve().relative_to(root)  # symlink containment
+            except (ValueError, OSError):
+                continue
+            return candidate
+        return None
+
     def _miss_images(evidence_dir: str) -> list[str]:
         """Evidence JPEGs as /evidence/... URLs; [] when pruned or outside
         the root — a stale miss row must degrade, never 500."""
-        root = ctx.evidence_root.resolve()
-        try:
-            directory = Path(evidence_dir).resolve()
-            rel = directory.relative_to(root)
-        except (ValueError, OSError):
+        directory = _resolve_miss_dir(evidence_dir)
+        if directory is None:
             return []
+        rel = directory.relative_to(ctx.evidence_root.resolve())
         try:
             names = sorted(p.name for p in directory.glob("*.jpg"))
         except OSError:
             return []
-        return [f"/evidence/{rel.as_posix()}/{name}" for name in names]
+        # Per-segment percent-encoding: camera ids are only required to be
+        # non-empty, so '#', '?' or '%' in a candidate id must not truncate
+        # or mangle the URL (the static mount decodes on the way back in).
+        prefix = "/".join(quote(part, safe="") for part in rel.parts)
+        return [f"/evidence/{prefix}/{quote(name, safe='')}" for name in names]
 
     @app.get("/")
     def index() -> FileResponse:
@@ -185,7 +219,17 @@ def create_app(ctx: DashboardContext) -> FastAPI:
         # dependency (D7).
         body = await request.body()
         try:
-            payloads = parse_manifest(body.decode("utf-8", errors="replace"))
+            text = body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            # errors="replace" would silently mangle e.g. a cp1252 Excel
+            # export into U+FFFD payloads that can never match a scan;
+            # reject strictly, like the report.manifest_path fallback.
+            raise HTTPException(
+                400,
+                f"manifest must be UTF-8 text (CSV); body is not: {exc}",
+            ) from exc
+        try:
+            payloads = parse_manifest(text)
         except ValueError as exc:
             raise HTTPException(400, f"manifest is not parseable CSV: {exc}")
         if not payloads:

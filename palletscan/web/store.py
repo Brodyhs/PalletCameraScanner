@@ -34,12 +34,28 @@ CREATE TABLE IF NOT EXISTS manifest (
 """
 
 
+class ReadStoreError(RuntimeError):
+    """The events DB cannot be opened or prepared (bad path, permissions).
+
+    Raised from construction so the CLI can map it to a clean message +
+    exit 2 instead of a raw sqlite3 traceback."""
+
+
 class ReadStore:
     def __init__(self, db_path: Path, manifest_path: Path | None = None) -> None:
         self._db_path = db_path
         self._manifest_path = manifest_path
-        with closing(self._connect()) as conn:
-            conn.executescript(_WEB_SCHEMA)
+        try:
+            # Parity with SqliteSink._connection: --dashboard on a fresh
+            # config must not depend on the sink having created the
+            # directory first.
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with closing(self._connect()) as conn:
+                conn.executescript(_WEB_SCHEMA)
+        except (OSError, sqlite3.Error) as exc:
+            raise ReadStoreError(
+                f"cannot open events DB at {db_path}: {exc}"
+            ) from exc
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
@@ -137,9 +153,13 @@ class ReadStore:
                 return parse_manifest(
                     self._manifest_path.read_text(encoding="utf-8")
                 )
-            except ValueError:
+            except (OSError, UnicodeDecodeError, ValueError):
+                # Strict decode, consistently with the upload path's 400:
+                # an undecodable or unreadable fallback file degrades with
+                # a warning instead of 500ing every report endpoint.
                 log.warning(
-                    "report.manifest_path %s is not parseable CSV; ignoring",
+                    "report.manifest_path %s is not readable UTF-8 CSV; "
+                    "ignoring",
                     self._manifest_path,
                 )
         return []
