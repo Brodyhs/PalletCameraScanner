@@ -75,7 +75,7 @@ class JsonlSink(Sink):
             self._file = None
 
 
-_SCHEMA = """
+_SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -88,11 +88,33 @@ CREATE TABLE IF NOT EXISTS events (
     decode_count INTEGER,
     evidence_dir TEXT,
     wall_time_iso TEXT NOT NULL,
-    detail_json TEXT NOT NULL
+    detail_json TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 CREATE INDEX IF NOT EXISTS idx_events_payload ON events(payload);
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
+"""
+
+# Replace only when the incoming revision is current-or-newer: re-emitted
+# cross-camera merges publish outside the deduper's lock, so a stale v1 can
+# arrive after v2 — the guard makes it a no-op instead of a regression.
+_UPSERT = """
+INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(event_id) DO UPDATE SET
+    kind=excluded.kind,
+    payload=excluded.payload,
+    symbology=excluded.symbology,
+    candidate_id=excluded.candidate_id,
+    source_id=excluded.source_id,
+    first_seen_ts=excluded.first_seen_ts,
+    last_seen_ts=excluded.last_seen_ts,
+    decode_count=excluded.decode_count,
+    evidence_dir=excluded.evidence_dir,
+    wall_time_iso=excluded.wall_time_iso,
+    detail_json=excluded.detail_json,
+    revision=excluded.revision
+WHERE excluded.revision >= events.revision
 """
 
 
@@ -104,10 +126,38 @@ class SqliteSink(Sink):
     def _connection(self) -> sqlite3.Connection:
         if self._conn is None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self._path)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.executescript(_SCHEMA)
+            conn = sqlite3.connect(self._path)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                # The dashboard opens a second writer connection on this WAL
+                # DB (reviews/manifest); without a busy timeout a contended
+                # commit raises SQLITE_BUSY immediately and drops an event row.
+                conn.execute("PRAGMA busy_timeout=5000")
+                self._migrate(conn)
+            except BaseException:
+                # Cache only a fully-migrated connection: caching first
+                # would let the next handle() skip the failed migration and
+                # write into an unmigrated (or version-refused) DB.
+                conn.close()
+                raise
+            self._conn = conn
         return self._conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        (version,) = conn.execute("PRAGMA user_version").fetchone()
+        if version == 0:  # fresh database
+            conn.executescript(_SCHEMA_V2)
+        elif version == 1:  # Phase 1-3 schema: add the revision column
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        elif version != 2:
+            raise RuntimeError(
+                f"events DB schema version {version} is newer than this build"
+            )
 
     def handle(self, event: Event) -> None:
         conn = self._connection()
@@ -127,6 +177,7 @@ class SqliteSink(Sink):
                 None,
                 event.wall_time_iso,
                 json.dumps(d),
+                event.revision,
             )
         else:
             assert isinstance(event, MissEvent)
@@ -143,10 +194,9 @@ class SqliteSink(Sink):
                 event.evidence_dir,
                 event.wall_time_iso,
                 json.dumps(d),
+                0,  # misses are never re-emitted
             )
-        conn.execute(
-            "INSERT OR REPLACE INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", row
-        )
+        conn.execute(_UPSERT, row)
         conn.commit()
 
     def close(self) -> None:

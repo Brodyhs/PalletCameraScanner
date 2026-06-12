@@ -116,7 +116,15 @@ class DecodeResult:
 
 @dataclass(frozen=True, slots=True)
 class PassEvent:
-    """Business event: one pallet pass, deduplicated by payload."""
+    """Business event: one pallet pass, deduplicated by payload.
+
+    ``revision`` orders re-emissions of the same ``event_id`` (cross-camera
+    merges, Phase 4): storage keeps the highest revision per id, so a stale
+    pre-merge version arriving late can never overwrite a merged row.
+    ``camera_detail`` carries per-camera timing for the A/B report;
+    time-to-first-decode uses same-camera timestamps, so cross-camera clock
+    skew cancels.
+    """
 
     payload: str
     symbology: Symbology
@@ -128,6 +136,10 @@ class PassEvent:
     candidate_ids: list[str]
     event_id: str
     wall_time_iso: str
+    first_decode_ts: float | None = None
+    #: source_id -> {first_seen_ts, first_decode_ts, last_seen_ts, decode_count}
+    camera_detail: dict[str, dict[str, Any]] | None = None
+    revision: int = 0
 
     @property
     def kind(self) -> str:

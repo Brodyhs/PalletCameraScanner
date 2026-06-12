@@ -83,19 +83,43 @@ class EvidenceWriter:
         return EvidenceRef(directory=target, frame_count=len(written))
 
     def _candidate_dirs(self) -> list[tuple[Path, float]]:
-        """All candidate directories with their mtime, oldest first."""
-        dirs = [
-            (c, c.stat().st_mtime)
-            for day in self._root.iterdir()
-            if day.is_dir()
-            for c in day.iterdir()
-            if c.is_dir()
-        ]
+        """All candidate directories with their mtime, oldest first.
+
+        Tolerates entries vanishing mid-scan (external cleanup, another
+        process pruning): a stat race must degrade to a smaller listing,
+        never abort the miss write that triggered the prune.
+        """
+        dirs: list[tuple[Path, float]] = []
+        try:
+            days = [d for d in self._root.iterdir() if d.is_dir()]
+        except OSError:
+            return []
+        for day in days:
+            try:
+                children = list(day.iterdir())
+            except OSError:
+                continue
+            for c in children:
+                try:
+                    if c.is_dir():
+                        dirs.append((c, c.stat().st_mtime))
+                except OSError:
+                    continue
         return sorted(dirs, key=lambda it: it[1])
 
     @staticmethod
     def _dir_size(path: Path) -> int:
-        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        total = 0
+        try:
+            for f in path.rglob("*"):
+                try:
+                    if f.is_file():
+                        total += f.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return total
 
     def prune(self, keep: Path | None = None) -> None:
         """Enforce the age cap, then the total-size cap (oldest first).

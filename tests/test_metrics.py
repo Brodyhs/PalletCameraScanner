@@ -30,6 +30,7 @@ SNAPSHOT_KEYS = {
     "misses",
     "source",  # Phase 3 watchdog counters (approved API extension)
     "read_rate_1h",
+    "read_rate_24h",  # Phase 4 tile (approved API extension, D4)
     "events",
     "outbox",
 }
@@ -181,6 +182,34 @@ def test_rates_anchor_on_frame_clock_and_decay_when_idle() -> None:
     snap = m.snapshot()
     assert snap["passes"]["per_hour"] == 0.0
     assert snap["read_rate_1h"] is None
+
+
+def test_read_rate_24h_outlives_the_1h_window() -> None:
+    m = _registry(FakeClock())
+    m.record_frame(source_ts=0.0)
+    m.record_pass(10.0)
+    m.record_pass(20.0)
+    m.record_miss(30.0)
+    m.record_frame(source_ts=40.0)
+    snap = m.snapshot()
+    # Fresh events count in both windows.
+    assert snap["read_rate_1h"] == pytest.approx(2 / 3)
+    assert snap["read_rate_24h"] == pytest.approx(2 / 3)
+    # 2 h later: >1 h but <24 h old -> 24 h rate only.
+    m.record_frame(source_ts=7200.0)
+    snap = m.snapshot()
+    assert snap["read_rate_1h"] is None
+    assert snap["read_rate_24h"] == pytest.approx(2 / 3)
+    # 25 h later: out of both windows.
+    m.record_frame(source_ts=90000.0)
+    snap = m.snapshot()
+    assert snap["read_rate_24h"] is None
+
+
+def test_read_rate_24h_none_without_events() -> None:
+    m = _registry(FakeClock())
+    m.record_frame(source_ts=0.0)
+    assert m.snapshot()["read_rate_24h"] is None
 
 
 def test_register_gauges_rejects_unknown_names() -> None:

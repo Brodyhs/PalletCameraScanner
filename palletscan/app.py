@@ -18,6 +18,7 @@ import logging
 import threading
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from palletscan.config import AppConfig, ExecutorKind
 from palletscan.events.bus import EventBus
@@ -35,6 +36,7 @@ from palletscan.sources.base import FrameSource
 from palletscan.sources.factory import create_source
 from palletscan.sources.synthetic import SyntheticSource
 from palletscan.types import (
+    DecodeResult,
     Event,
     Frame,
     GroundTruthRecord,
@@ -43,9 +45,26 @@ from palletscan.types import (
     SegmentKind,
 )
 
+if TYPE_CHECKING:
+    from palletscan.web.preview import LivePreview
+
 log = logging.getLogger(__name__)
 
 _EVENT_COLLECT_CAP = 100_000
+
+
+def build_sinks(cfg: AppConfig) -> list[Sink]:
+    """Config-driven sink set (shared by PipelineRunner and StationRunner)."""
+    sinks: list[Sink] = []
+    if cfg.sinks.console.enabled:
+        sinks.append(ConsoleSink())
+    if cfg.sinks.jsonl.enabled:
+        sinks.append(JsonlSink(cfg.sinks.jsonl.path))
+    if cfg.sinks.sqlite.enabled:
+        sinks.append(SqliteSink(cfg.sinks.sqlite.path))
+    if cfg.sinks.http.enabled:
+        sinks.append(HttpSink(cfg.sinks.http))
+    return sinks
 
 
 @dataclass(slots=True)
@@ -221,6 +240,9 @@ class PipelineRunner:
             source_id=source.source_id,
             confirmations=cfg.decode.confirmations,
         )
+        #: Optional dashboard live-view tap; assigned before run() by the
+        #: CLI when the dashboard is enabled. None costs one check per frame.
+        self.preview: "LivePreview | None" = None
         self._stop = threading.Event()
         # Set only when the pipeline (consumer) thread dies: the sentinel
         # put must keep blocking through a merely-slow consumer, and the
@@ -269,16 +291,7 @@ class PipelineRunner:
         config-selected source (e.g. a FlakySource-wrapped one in soak)."""
         if source is None:
             source = create_source(cfg)
-        sinks: list[Sink] = []
-        if cfg.sinks.console.enabled:
-            sinks.append(ConsoleSink())
-        if cfg.sinks.jsonl.enabled:
-            sinks.append(JsonlSink(cfg.sinks.jsonl.path))
-        if cfg.sinks.sqlite.enabled:
-            sinks.append(SqliteSink(cfg.sinks.sqlite.path))
-        if cfg.sinks.http.enabled:
-            sinks.append(HttpSink(cfg.sinks.http))
-        return cls(cfg, source, sinks)
+        return cls(cfg, source, build_sinks(cfg))
 
     def stop(self) -> None:
         """Request a graceful shutdown (drains queues before exiting)."""
@@ -328,11 +341,14 @@ class PipelineRunner:
         if seg_event is not None and seg_event.kind is SegmentKind.OPEN:
             self._tracker.on_segment_open(seg_event)
         ctx = self._tracker.open_ctx
+        decodes: list[DecodeResult] = []
         if result.active and result.roi is not None and ctx is not None:
             decodes = self._engine.decode_frame(frame, result.roi, ctx)
             self._tracker.on_decode(decodes)
         if seg_event is not None and seg_event.kind is SegmentKind.CLOSE:
             self._tracker.on_segment_close(seg_event)
+        if self.preview is not None:
+            self.preview.update(frame, result, decodes)
 
     def _pipeline_loop(self) -> None:
         try:

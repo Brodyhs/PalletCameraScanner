@@ -83,6 +83,15 @@ def test_many_decodes_one_pass_event(setup) -> None:
     assert ev.first_seen_ts == pytest.approx(10 / FPS)
     assert ev.last_seen_ts == pytest.approx(20 / FPS)
     assert ev.best_frame == ("cam0", 11)
+    # Phase 4 additive fields: first decode timing + per-camera detail.
+    assert ev.first_decode_ts == pytest.approx(11 / FPS)
+    assert ev.revision == 0
+    assert set(ev.camera_detail) == set(ev.cameras) == {"cam0"}
+    detail = ev.camera_detail["cam0"]
+    assert detail["first_seen_ts"] == pytest.approx(ev.first_seen_ts)
+    assert detail["first_decode_ts"] == pytest.approx(11 / FPS)
+    assert detail["last_seen_ts"] == pytest.approx(ev.last_seen_ts)
+    assert detail["decode_count"] == ev.decode_count == 3
 
 
 def test_confirmed_set_on_first_decode(setup) -> None:

@@ -237,6 +237,15 @@ class PassTracker:
                     candidate_ids=[seg.candidate_id],
                     event_id=str(uuid.uuid4()),
                     wall_time_iso=now_iso(),
+                    first_decode_ts=first.ts,
+                    camera_detail={
+                        self._source_id: {
+                            "first_seen_ts": seg.open_ts,
+                            "first_decode_ts": first.ts,
+                            "last_seen_ts": close_ts,
+                            "decode_count": len(decodes),
+                        }
+                    },
                 )
             )
             self.passes_emitted += 1

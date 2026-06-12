@@ -35,6 +35,8 @@ dev = [
     # soak harness RSS sampling only (tools/soak.py); the runtime package
     # never imports it
     "psutil>=5.9",
+    # dashboard TestClient transport only; the runtime serves with uvicorn
+    "httpx>=0.27",
 ]
 
 [project.scripts]
@@ -44,7 +46,7 @@ palletscan = "palletscan.cli:main"
 include = ["palletscan*"]
 
 [tool.setuptools.package-data]
-palletscan = ["assets/*.png"]
+palletscan = ["assets/*.png", "web/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

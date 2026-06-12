@@ -331,3 +331,137 @@ arrives.
     only the window (6 min, 90 s warmup); the 8 MB/min slope gate and
     1.3× final/baseline ratio are unchanged, and the 2 h `tools/soak.py`
     run remains the authoritative memory gate.
+
+## Phase 4: dashboard + A/B trial reporting
+
+40. **Cross-camera dedup is emit-now + merge-by-reemit with a
+    revision-guarded upsert (owner-approved D1, with owner amendment).**
+    In A/B mode the first sighting of a payload publishes the business
+    PassEvent immediately (that event's `event_id` stays the stable
+    business id); a second camera's pass within `dedup.window_s` is merged
+    and re-published with the same id — min first_seen, max last_seen,
+    summed decode_count, merged cameras/camera_detail, best_frame = earlier
+    first decode, concatenated candidate_ids. Same-camera repeats are
+    suppressed and counted; the window anchor refreshes only on first emit
+    (parked-pallet rule, mirrors #16). Misses forward unchanged — the
+    per-camera miss IS the A/B experiment's evidence. No held state, no
+    expiry timers: report completeness never depends on dedup timing. The
+    rejected hold-until-all-cameras alternative needs expiry machinery
+    whose early firing systematically undercounts the slower camera — the
+    exact experiment this phase runs.
+    **Owner amendment — re-emit ordering.** Publish happens outside the
+    deduper's lock (the business bus's blocking put must never couple the
+    two runners' bus threads), so same-id re-emits can reach storage out
+    of order. The guard lives at the storage boundary: a monotonically
+    increasing `revision` (assigned under the deduper's lock) rides on
+    every re-emitted event, and SqliteSink's upsert replaces a row only
+    when `excluded.revision >= events.revision`. A stale v0 arriving after
+    v1 is a no-op; a barrier-synchronized two-thread hammer test asserts
+    the FINAL stored row is always the fully-merged version. Accepted
+    costs: JSONL gets ≤ N_cameras lines per business pass sharing one
+    event_id (append-only audit log; readers take max-revision-wins — the
+    station summary and `tests` do exactly that); HTTP receivers keep the
+    first version per the at-least-once dedupe-on-event_id contract (#23)
+    — business fields are correct in v1, merged per-camera detail is a
+    local trial-reporting concern; ConsoleSink prints the merged event
+    again (harmless). The business bus deliberately has no MetricsRegistry
+    (it would double-count merged passes); `/stats.json`'s business
+    section serves the deduper's own counters.
+
+41. **PassEvent gained trailing defaulted fields `first_decode_ts`,
+    `camera_detail`, `revision` (D2); SQLite schema v2 adds the
+    `revision` column.** `camera_detail` maps source_id →
+    {first_seen_ts, first_decode_ts, last_seen_ts, decode_count};
+    time-to-first-decode = same-camera `first_decode_ts − first_seen_ts`,
+    so cross-camera clock skew cancels by construction. The A/B report
+    falls back to the `cameras` map for pre-Phase-4 rows (ttfd
+    unavailable) so old DBs stay browsable. On connect SqliteSink reads
+    `PRAGMA user_version`: 0/fresh → create v2; 1 → `ALTER TABLE ... ADD
+    COLUMN revision`; 2 → no-op; newer → refuse (forward-compat guard).
+    Deviation from the Phase 4 plan's "only test_metrics.py edits": the
+    existing `test_sqlite_sink_rows_queryable` pinned `user_version == 1`
+    and necessarily moved to 2 — a second, mechanical existing-test edit.
+
+42. **`/stats.json` envelope (D3, amends the #24/#36 wording):**
+    `{"generated_utc": iso, "cameras": {source_id: snapshot() verbatim},
+    "business": {deduper counters} | null}` — uniform across single-camera,
+    A/B, and standalone modes (standalone serves `cameras: {}`). The
+    pinned snapshot dict itself is unchanged except D4: a top-level
+    `read_rate_24h` (second `_SourceTimeWindow(86400)` pair fed by the
+    same hooks), computed identically to `read_rate_1h`. `SNAPSHOT_KEYS`
+    amended accordingly (precedent #36).
+
+43. **A/B evidence is rebased per camera: `<evidence.dir>/<source_id>`
+    (D5).** Two runners sharing one evidence root race each other's prune
+    (`rmtree` during another's `_candidate_dirs`/`_dir_size` scan) and the
+    loser's exception lands in `_finalize_miss` before `_emit` — silently
+    eating a MissEvent. Per-camera subdirectories eliminate the race;
+    the scan/size helpers additionally tolerate vanishing entries
+    (`except OSError` → smaller listing, never an aborted miss write).
+    Consequence: evidence size/age caps apply per camera in A/B mode.
+
+44. **SqliteSink sets `PRAGMA busy_timeout=5000` (D6); reviews/manifest
+    live in web-owned tables in the same DB file (D7).** The dashboard's
+    mark-reviewed/manifest writes open a second writer connection on the
+    same WAL DB; without the timeout the bus thread's commit can raise
+    SQLITE_BUSY immediately and drop an event row. `miss_reviews`
+    (keyed by miss event_id — reviews survive evidence pruning) and
+    `manifest` are created by the web ReadStore, never by SqliteSink.
+    Manifest upload is a raw `text/csv` request body (FileReader → fetch);
+    no python-multipart dependency. `report.manifest_path` is the
+    config-pointed fallback when the manifest table is empty.
+
+45. **Merged cross-camera first/last timestamps mix per-source clocks**
+    anchored ~1–3 s apart at construction — display-grade, not
+    measurement-grade. Time-to-first-decode is skew-free by construction
+    (#41). No shared-epoch plumbing this phase; revisit only if the trial
+    needs cross-camera latency comparisons.
+
+46. **The live MJPEG stream is tested against a real uvicorn server on an
+    ephemeral port, not the Starlette TestClient** (deviation from the
+    plan's test sketch, found during implementation): the installed
+    TestClient runs each ASGI request to completion on its portal before
+    returning — `client.stream()` blocks forever on an unbounded
+    multipart response (verified by faulthandler dump). `DashboardServer`
+    (uvicorn on a daemon thread, `port=0` supported, `started`-flag
+    startup wait, `should_exit` shutdown) was pulled forward from Step 7
+    and is itself under test. uvicorn off-main-thread skips signal
+    handlers, so the pipeline's SIGINT handling stays in charge; a failed
+    bind sys.exit()s in the thread and is absorbed into a logged error +
+    `DashboardServerError` from `start()`.
+
+47. **`web.port: 0` means ephemeral** (the CLI prints the picked port) —
+    needed so tests and parallel dev runs never collide on 8000; the
+    validator allows 0–65535. `palletscan dashboard` refuses to start if
+    the events DB file is absent (a typo'd path silently showing "no
+    events" would misreport a finished trial) — exit 2.
+
+48. **httpx joined `[dev]` extras only** (TestClient transport, D10);
+    runtime dependencies are unchanged (fastapi/uvicorn were already
+    required). The dashboard UI is vendored vanilla JS/CSS under
+    `palletscan/web/static/` (packaged via package-data) — no CDN, no
+    build step, offline-first.
+
+49. **Phase 4 close-out adversarial review: five fixes landed before
+    commit.** A multi-agent review of the phase diff (every finding
+    independently verified by two adversarial refuters with reproductions)
+    confirmed and we fixed: (a) naive `window_from`/`window_to` query
+    values (e.g. `2026-06-11T08:00`) raised TypeError against the
+    always-aware stored stamps and 500'd all three report endpoints —
+    naive bounds now normalize to UTC; (b) Excel "CSV UTF-8" manifests
+    carry a BOM that defeated the header rule, silently adding a phantom
+    expected payload and deflating true read rate — `parse_manifest` now
+    strips it, and unparseable CSV raises ValueError → HTTP 400 instead
+    of 500; (c) `DashboardServer.stop()` stalled its full join timeout and
+    leaked a still-serving thread whenever an MJPEG viewer was connected
+    (uvicorn's graceful shutdown waits forever by default) —
+    `timeout_graceful_shutdown=3` bounds it, verified by a
+    stop-with-connected-client test; (d) SqliteSink cached its connection
+    before migration succeeded, so a failed/refused migration was bypassed
+    on the next write — the connection is now cached only after a
+    successful migrate; (e) a dashboard port collision surfaced as a raw
+    traceback — now a clean message + exit 2 on all CLI paths. The review
+    also flagged that two §4 verification-matrix rows lacked their
+    promised station-run end-to-end proof; the missing integration test
+    (station DB → ReadStore → A/B report + truth-derived manifest
+    reconciliation) was added rather than amending the matrix.

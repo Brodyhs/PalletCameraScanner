@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PalletScan</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>PalletScan</h1>
+    <span id="mode-note"></span>
+    <span id="generated" class="muted"></span>
+  </header>
+  <main>
+    <section id="live-section">
+      <h2>Live</h2>
+      <div id="live-grid" class="live-grid"></div>
+    </section>
+
+    <section>
+      <h2>Cameras</h2>
+      <div id="camera-tiles" class="tile-grid"></div>
+    </section>
+
+    <section id="business-section" hidden>
+      <h2>Business (cross-camera deduped)</h2>
+      <div id="business-tiles" class="tile-grid"></div>
+    </section>
+
+    <section>
+      <h2>A/B trial report</h2>
+      <div id="report" class="report"></div>
+      <p class="downloads">
+        <a href="/report/ab.md" download>ab-report.md</a>
+        <a href="/report/ab.csv" download>ab-report.csv</a>
+        <a href="/report/reconciliation.csv" download>reconciliation.csv</a>
+      </p>
+      <h3>Manifest reconciliation</h3>
+      <p>
+        <input type="file" id="manifest-file" accept=".csv,text/csv">
+        <button id="manifest-upload">Upload manifest CSV</button>
+        <span id="manifest-status" class="muted"></span>
+      </p>
+      <div id="reconciliation" class="report"></div>
+    </section>
+
+    <section>
+      <h2>Last events</h2>
+      <table id="events">
+        <thead>
+          <tr>
+            <th>time (utc)</th><th>kind</th><th>payload / candidate</th>
+            <th>cameras</th><th>decodes</th><th>symbology</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Miss gallery</h2>
+      <label class="muted">
+        <input type="checkbox" id="unreviewed-only"> unreviewed only
+      </label>
+      <div id="misses" class="miss-grid"></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

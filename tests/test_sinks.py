@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -23,6 +24,15 @@ def _pass(payload: str = "PLT-000001") -> PassEvent:
         candidate_ids=["cam0-000001"],
         event_id=f"ev-{payload}",
         wall_time_iso="2026-06-10T00:00:00+00:00",
+        first_decode_ts=1.5,
+        camera_detail={
+            "cam0": {
+                "first_seen_ts": 1.0,
+                "first_decode_ts": 1.5,
+                "last_seen_ts": 2.0,
+                "decode_count": 3,
+            }
+        },
     )
 
 
@@ -70,13 +80,135 @@ def test_sqlite_sink_rows_queryable(tmp_path: Path) -> None:
     assert ("miss", None, "cam0-000002", "/tmp/ev/x") in rows
     assert ("pass", "PLT-000001", "cam0-000001", None) in rows
     (version,) = conn.execute("PRAGMA user_version").fetchone()
-    assert version == 1
+    assert version == 2
     detail = json.loads(
         conn.execute(
             "SELECT detail_json FROM events WHERE kind='pass'"
         ).fetchone()[0]
     )
     assert detail["cameras"] == {"cam0": 3}
+    # Phase 4 additive fields ride through detail_json untouched.
+    assert detail["first_decode_ts"] == 1.5
+    assert detail["camera_detail"]["cam0"]["decode_count"] == 3
+    assert detail["revision"] == 0
+    conn.close()
+
+
+_V1_SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    payload TEXT,
+    symbology TEXT,
+    candidate_id TEXT,
+    source_id TEXT,
+    first_seen_ts REAL,
+    last_seen_ts REAL,
+    decode_count INTEGER,
+    evidence_dir TEXT,
+    wall_time_iso TEXT NOT NULL,
+    detail_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
+CREATE INDEX IF NOT EXISTS idx_events_payload ON events(payload);
+PRAGMA user_version = 1;
+"""
+
+
+def test_sqlite_v1_to_v2_migration_preserves_rows(tmp_path: Path) -> None:
+    """An existing Phase 1-3 DB gains the revision column without data loss."""
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_V1_SCHEMA)
+    conn.execute(
+        "INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("ev-old", "pass", "PLT-OLD", "qr", "cam0-000009", "cam0",
+         1.0, 2.0, 4, None, "2026-06-01T00:00:00+00:00", "{}"),
+    )
+    conn.commit()
+    conn.close()
+
+    sink = SqliteSink(db)
+    sink.handle(_pass())  # triggers connect + migration
+    sink.close()
+
+    conn = sqlite3.connect(db)
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 2
+    old = conn.execute(
+        "SELECT payload, decode_count, revision FROM events WHERE event_id='ev-old'"
+    ).fetchone()
+    assert old == ("PLT-OLD", 4, 0)
+    new = conn.execute(
+        "SELECT payload, revision FROM events WHERE event_id='ev-PLT-000001'"
+    ).fetchone()
+    assert new == ("PLT-000001", 0)
+    conn.close()
+
+
+def test_sqlite_stale_revision_cannot_regress_row(tmp_path: Path) -> None:
+    """The revision-guarded upsert: a late v0 after v1 is a no-op (D1)."""
+    db = tmp_path / "rev.db"
+    sink = SqliteSink(db)
+    base = _pass()
+    merged = dataclasses.replace(
+        base,
+        decode_count=6,
+        cameras={"cam0": 3, "cam1": 3},
+        revision=1,
+    )
+    sink.handle(merged)
+    sink.handle(base)  # stale pre-merge version arrives late
+    sink.close()
+
+    conn = sqlite3.connect(db)
+    row = conn.execute(
+        "SELECT decode_count, revision, detail_json FROM events "
+        "WHERE event_id=?", (base.event_id,)
+    ).fetchone()
+    assert row[0] == 6
+    assert row[1] == 1
+    assert json.loads(row[2])["cameras"] == {"cam0": 3, "cam1": 3}
+    conn.close()
+
+
+def test_sqlite_future_schema_refused_on_every_write(tmp_path: Path) -> None:
+    """A failed migration must not be bypassed by connection caching: every
+    handle() against a newer-than-this-build DB refuses, and the DB stays
+    untouched (adversarial-review finding)."""
+    import pytest
+
+    db = tmp_path / "future.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_V1_SCHEMA + "PRAGMA user_version = 9;")
+    conn.commit()
+    conn.close()
+
+    sink = SqliteSink(db)
+    for _ in range(2):  # second attempt must not silently write
+        with pytest.raises(RuntimeError, match="newer than this build"):
+            sink.handle(_pass())
+    sink.close()
+    conn = sqlite3.connect(db)
+    (count,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    conn.close()
+    assert count == 0
+    assert version == 9
+
+
+def test_sqlite_equal_revision_replaces(tmp_path: Path) -> None:
+    """Same-revision re-handle (at-least-once redelivery) still lands."""
+    db = tmp_path / "eq.db"
+    sink = SqliteSink(db)
+    sink.handle(_pass())
+    sink.handle(dataclasses.replace(_pass(), decode_count=9))
+    sink.close()
+    conn = sqlite3.connect(db)
+    (count,) = conn.execute(
+        "SELECT decode_count FROM events WHERE event_id='ev-PLT-000001'"
+    ).fetchone()
+    assert count == 9
     conn.close()
 
 

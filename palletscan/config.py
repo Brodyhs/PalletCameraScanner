@@ -31,6 +31,31 @@ class SourceConfig(_StrictModel):
     type: Literal["synthetic", "video", "camera"] = "synthetic"
     #: ``cameras[].id`` to run; optional when exactly one entry exists.
     camera: str | None = None
+    #: A/B mode: run one pipeline per listed ``cameras[].id`` with
+    #: cross-camera business dedup (Phase 4). Mutually exclusive with
+    #: ``camera``; requires ``type: camera`` and >= 2 distinct entries.
+    cameras: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _ab_mode_consistent(self) -> "SourceConfig":
+        if self.cameras is None:
+            return self
+        if self.camera is not None:
+            raise ValueError(
+                "source.camera and source.cameras are mutually exclusive"
+            )
+        if len(self.cameras) < 2:
+            raise ValueError(
+                f"source.cameras needs >= 2 entries (A/B mode), got {self.cameras}"
+            )
+        dupes = sorted({c for c in self.cameras if self.cameras.count(c) > 1})
+        if dupes:
+            raise ValueError(f"duplicate ids in source.cameras: {dupes}")
+        if self.type != "camera":
+            raise ValueError(
+                f"source.cameras requires source.type=camera, got {self.type!r}"
+            )
+        return self
 
 
 class VideoConfig(_StrictModel):
@@ -262,6 +287,55 @@ class MetricsConfig(_StrictModel):
         return v
 
 
+class WebConfig(_StrictModel):
+    """Dashboard server (FastAPI/uvicorn). Localhost-bound by default; no
+    auth (spec §12 — note for future work, do not expose beyond the host)."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8000
+    preview_fps: float = 10.0  # MJPEG pacing per client
+    preview_quality: int = 80  # JPEG encode quality
+    preview_width: int = 640  # downscale target for the live view
+
+    @field_validator("port")
+    @classmethod
+    def _port_range(cls, v: int) -> int:
+        # 0 = ephemeral (the OS picks a free port; the CLI prints it).
+        if not 0 <= v <= 65535:
+            raise ValueError(f"web.port must be 0-65535, got {v}")
+        return v
+
+    @field_validator("preview_fps")
+    @classmethod
+    def _fps_positive(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"web.preview_fps must be finite and > 0, got {v}")
+        return v
+
+    @field_validator("preview_quality")
+    @classmethod
+    def _quality_range(cls, v: int) -> int:
+        if not 1 <= v <= 100:
+            raise ValueError(f"web.preview_quality must be 1-100, got {v}")
+        return v
+
+    @field_validator("preview_width")
+    @classmethod
+    def _width_positive(cls, v: int) -> int:
+        if v < 16:
+            raise ValueError(f"web.preview_width must be >= 16, got {v}")
+        return v
+
+
+class ReportConfig(_StrictModel):
+    """Trial reporting inputs."""
+
+    #: CSV of expected pallet payloads (first column); fallback used when
+    #: no manifest has been uploaded through the dashboard.
+    manifest_path: Path | None = None
+
+
 class LoggingConfig(_StrictModel):
     level: str = "INFO"
 
@@ -416,6 +490,8 @@ class AppConfig(_StrictModel):
     evidence: EvidenceConfig = Field(default_factory=EvidenceConfig)
     sinks: SinksConfig = Field(default_factory=SinksConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
+    report: ReportConfig = Field(default_factory=ReportConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     @model_validator(mode="after")
@@ -424,6 +500,13 @@ class AppConfig(_StrictModel):
         dupes = sorted({i for i in ids if ids.count(i) > 1})
         if dupes:
             raise ValueError(f"duplicate cameras[].id: {dupes}")
+        if self.source.cameras is not None:
+            missing = [i for i in self.source.cameras if i not in ids]
+            if missing:
+                raise ValueError(
+                    f"source.cameras entries not in cameras[]: {missing}; "
+                    f"configured ids: {ids}"
+                )
         return self
 
 

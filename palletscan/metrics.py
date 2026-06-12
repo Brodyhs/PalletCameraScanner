@@ -31,8 +31,9 @@ from typing import Any
 
 from palletscan.config import MetricsConfig
 
-#: Source-time horizon for pass/miss rates (spec §6: "rolling 1h").
+#: Source-time horizons for pass/miss rates (spec §6: "rolling 1h/24h").
 _HOUR_S = 3600.0
+_DAY_S = 86400.0
 
 #: Minimum source-time span used when extrapolating passes/hour, so a few
 #: seconds of data cannot extrapolate to absurd hourly rates.
@@ -145,6 +146,10 @@ class MetricsRegistry:
         self._latency_ms: deque[float] = deque(maxlen=cfg.latency_samples)
         self._passes = _SourceTimeWindow(_HOUR_S)
         self._misses = _SourceTimeWindow(_HOUR_S)
+        # 24 h pair: ~10k pallets/day of bare timestamps is trivially cheap
+        # under the 100k ring cap.
+        self._passes_24h = _SourceTimeWindow(_DAY_S)
+        self._misses_24h = _SourceTimeWindow(_DAY_S)
         self._gauges: dict[str, Callable[[], int]] = {}
         self._queues: dict[str, Callable[[], int]] = {}
         self._outbox_probe: Callable[[], dict[str, Any]] | None = None
@@ -174,9 +179,11 @@ class MetricsRegistry:
 
     def record_pass(self, source_ts: float) -> None:
         self._passes.add(source_ts)
+        self._passes_24h.add(source_ts)
 
     def record_miss(self, source_ts: float) -> None:
         self._misses.add(source_ts)
+        self._misses_24h.add(source_ts)
 
     # -- wiring ---------------------------------------------------------------
 
@@ -210,6 +217,7 @@ class MetricsRegistry:
         first, last = self._first_frame_ts, self._last_frame_ts
         per_hour = 0.0
         read_rate: float | None = None
+        read_rate_24h: float | None = None
         if first is not None and last is not None:
             span = min(_HOUR_S, max(last - first, _MIN_RATE_SPAN_S))
             p = self._passes.count_since(last)
@@ -217,6 +225,10 @@ class MetricsRegistry:
             per_hour = p * _HOUR_S / span
             if p + m:
                 read_rate = p / (p + m)
+            p24 = self._passes_24h.count_since(last)
+            m24 = self._misses_24h.count_since(last)
+            if p24 + m24:
+                read_rate_24h = p24 / (p24 + m24)
 
         return {
             "uptime_s": round(uptime_s, 3),
@@ -249,6 +261,7 @@ class MetricsRegistry:
                 "zombie_readers": self._gauge("source_zombie_readers"),
             },
             "read_rate_1h": read_rate,
+            "read_rate_24h": read_rate_24h,
             "events": {
                 "handled": self._gauge("events_handled"),
                 "sink_errors": self._gauge("sink_errors"),

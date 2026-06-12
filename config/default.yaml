@@ -4,6 +4,10 @@
 source:
   type: synthetic   # synthetic | video | camera
   camera: null      # cameras[].id to run; optional when exactly one entry
+  # A/B trial mode: one pipeline per listed cameras[].id with cross-camera
+  # business dedup (per-camera stats stay independent). Mutually exclusive
+  # with source.camera; requires type: camera and >= 2 entries.
+  cameras: null     # e.g. [cam-color, cam-mono]
 
 synthetic:
   width: 1280
@@ -122,6 +126,23 @@ sinks:
 metrics:
   window_s: 60.0        # wall-clock window for the fps rate
   latency_samples: 2048 # decode wall-time reservoir size
+
+# Dashboard (FastAPI). Localhost-bound and UNAUTHENTICATED — auth is future
+# work (spec §12); do not bind beyond this host. Enable here or per-run
+# with --dashboard; `palletscan dashboard` serves an existing DB read-only.
+web:
+  enabled: false
+  host: 127.0.0.1
+  port: 8000            # 0 = ephemeral (the CLI prints the picked port)
+  preview_fps: 10.0     # MJPEG pacing per client
+  preview_quality: 80   # JPEG encode quality for the live view
+  preview_width: 640    # live view downscale target
+
+report:
+  # CSV of expected pallet payloads (first column, optional header row).
+  # Fallback for reconciliation when no manifest was uploaded via the
+  # dashboard (POST /api/manifest).
+  manifest_path: null
 
 logging:
   level: INFO

@@ -2,13 +2,16 @@
 
 Production-grade, 24/7 fixed-camera scanning that reads QR / Data Matrix
 codes on pallets as forklifts carry them past stationary USB cameras.
-**Phases 1–3** (this state of the repo): the complete core pipeline on
+**Phases 1–4** (this state of the repo): the complete core pipeline on
 synthetic input; video replay, metrics, a store-and-forward HTTP sink and
-the soak harness; and the live-camera stack — device enumeration by name,
+the soak harness; the live-camera stack — device enumeration by name,
 empirical mode probing, a verified control layer, the reconnect watchdog,
 and the `run`/`calibrate`/`selftest` CLIs — code-complete and tested
 against fakes (cameras are in transit; see `ARRIVAL_CHECKLIST.md` for
-exactly what to verify when they land).
+exactly what to verify when they land); and the dashboard + A/B trial
+stack — live MJPEG views with decode/motion overlays, stats tiles, a miss
+gallery with mark-reviewed, cross-camera business dedup, the A/B
+comparison report (markdown/CSV export) and manifest reconciliation.
 
 ```
 FrameSource → MotionGate → DecodeEngine → Dedup/PassTracker → EventBus → Sinks
@@ -33,6 +36,8 @@ palletscan replay data/clips/demo.avi --speed 0 --truth data/clips/demo.truth.js
 palletscan selftest                        # refuse-to-run-blind startup checks
 palletscan calibrate --list                # enumerate cameras by name
 palletscan run                             # run the configured source (cameras when present)
+palletscan synth --ab --dashboard          # A/B demo: two synthetic cameras + live dashboard
+palletscan dashboard                       # review a finished trial read-only
 ```
 
 On Windows, skip the `brew` line — the `pyzbar`/`pylibdmtx` wheels bundle
@@ -48,9 +53,10 @@ ground truth).
 
 | command | what it does |
 |---|---|
-| `palletscan run [--config Y] [--camera ID] [--data-dir D] [--stats-interval S]` | run the configured source — live cameras in production (synthetic/video configs work too) |
-| `palletscan synth [--passes N] [--seed S] [--config Y] [--data-dir D] [--stats-interval S]` | run the full pipeline on generated pallet passes |
-| `palletscan replay <file> [--speed N] [--loop N] [--truth T.jsonl] [--fps-override F]` | replay a recorded clip as if live (`--speed 0` = unpaced, `--truth` reconciles decoded payloads) |
+| `palletscan run [--config Y] [--camera ID] [--data-dir D] [--stats-interval S] [--dashboard]` | run the configured source — live cameras in production; `source.cameras: [a, b]` routes through the A/B station (one pipeline per camera, cross-camera business dedup) |
+| `palletscan synth [--passes N] [--seed S] [--ab] [--config Y] [--data-dir D] [--stats-interval S] [--dashboard]` | run the full pipeline on generated pallet passes; `--ab` runs two same-seed synthetic cameras through the station |
+| `palletscan replay <file> [--speed N] [--loop N] [--truth T.jsonl] [--fps-override F] [--dashboard]` | replay a recorded clip as if live (`--speed 0` = unpaced, `--truth` reconciles decoded payloads) |
+| `palletscan dashboard [--config Y] [--data-dir D]` | serve the dashboard read-only against an existing events DB (no runners) — how a finished trial gets reviewed |
 | `palletscan calibrate [--list] [--camera ID] [--name SUBSTR] [--fourcc/--width/--height/--fps pins] [--exposure E] [--gain G] [--no-auto-exposure] [--seconds N] [--save] [--preview]` | probe modes empirically, verify controls (readback + exposure effect), stream fps/focus/decode lines, lock-and-save to the config |
 | `palletscan selftest [--skip-camera] [--data-dir D]` | startup checks: enumerate + achieved-fps gate, bundled symbols through the full pipeline, disk space |
 | `palletscan version` | print version |
@@ -125,14 +131,52 @@ endpoint exists (`~7 events/min` makes one-per-POST fine).
 Test it locally: `python tools/echo_server.py`, then enable `sinks.http`
 in your config.
 
+## Dashboard + A/B trial (Phase 4)
+
+```bash
+palletscan synth --ab --dashboard     # the full demo, no hardware needed
+open http://127.0.0.1:8000            # live views, tiles, events, miss gallery
+```
+
+`--dashboard` (or `web.enabled: true`) serves, while the pipeline runs:
+live MJPEG per camera with motion/decode overlay boxes (`/live/<id>`),
+stats tiles backed by `/stats.json`, the last-events table, and the miss
+gallery (evidence thumbnails, mark-reviewed with notes — reviews live in
+the events DB keyed by event id, so they survive evidence pruning).
+`palletscan dashboard` serves the same UI read-only against an existing DB
+after the station stops.
+
+**Security note:** the dashboard binds `127.0.0.1` and has **no
+authentication** — auth is explicitly future work (spec §12). Do not bind
+it beyond the host.
+
+**A/B mode** (`synth --ab`, or `source.cameras: [idA, idB]` for live
+cameras) runs one full pipeline per camera — own motion gate, decode
+budget, metrics, watchdog — so each camera's stats are its independent
+performance. Business events dedupe across cameras at the event layer: the
+first sighting of a payload publishes immediately and a second camera's
+sighting within `dedup.window_s` merges into the same `event_id` with a
+bumped `revision` (storage keeps the highest revision, so out-of-order
+re-emits can never regress a merged row). The report compares the arms:
+
+- `GET /api/report/ab` — per camera: passes seen, passes decoded, read
+  rate, time-to-first-decode median/p95 (same-camera timestamps, immune to
+  cross-camera clock skew), decodes/pass, misses.
+- `/report/ab.md`, `/report/ab.csv` — downloadable comparison.
+- **Manifest reconciliation**: upload a CSV of expected pallet IDs (or set
+  `report.manifest_path`) → `/api/report/reconciliation` buckets
+  matched/missing/unexpected and computes the *true* read rate;
+  `/report/reconciliation.csv` exports it.
+
 ## Metrics
 
 Every runner owns a `MetricsRegistry`; its `snapshot()` dict (fps, queue
-depths, decode wall-time p50/p95, passes/hour, rolling-1h read rate, miss
-count, drop/error counters, uptime, outbox depth/age) is the stable
-contract that Phase 4's `/stats.json` will serve verbatim. `--stats-interval N`
-on `synth`/`replay` logs a snapshot line every N seconds; the final
-snapshot is part of the run summary.
+depths, decode wall-time p50/p95, passes/hour, rolling 1h/24h read rates,
+miss count, drop/error counters, uptime, outbox depth/age) is the stable
+contract that `/stats.json` serves verbatim per camera under
+`cameras.<source_id>` (plus a `business` section in A/B mode).
+`--stats-interval N` on `synth`/`replay` logs a snapshot line every N
+seconds; the final snapshot is part of the run summary.
 
 ## Soak
 
@@ -192,10 +236,13 @@ palletscan/
                     control layer (QUIRKS), mode probing, render functions
   pipeline/         MotionGate, DecodeEngine, decoders, preprocess,
                     RollingFrameBuffer, PassTracker
+  station.py        StationRunner: one pipeline per camera + business bus
   events/           EventBus, sinks (console/JSONL/SQLite/HTTP outbox),
-                    EvidenceWriter
+                    EvidenceWriter, cross-camera deduper
   reliability/      bounded queues, FlakySource, reconnect WatchdogSource
-  web/              (dashboard arrives Phase 4)
+  reporting/        A/B report math, manifest reconciliation, md/csv render
+  web/              FastAPI app, MJPEG LivePreview, SQLite ReadStore,
+                    uvicorn DashboardServer, vendored static UI (no CDN)
 tools/              record_synthetic, echo_server, soak, bench_decoders,
                     make_selftest_assets
 tests/

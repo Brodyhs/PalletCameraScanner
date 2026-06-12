@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import palletscan
-from palletscan.config import apply_overrides, load_config
+from palletscan.config import AppConfig, apply_overrides, load_config
 from palletscan.logging_setup import setup_logging
 
 if TYPE_CHECKING:
     from palletscan.app import PipelineRunner
+    from palletscan.station import StationRunner
+    from palletscan.web.server import DashboardServer
 
 
 def _add_synth_parser(sub: "argparse._SubParsersAction") -> None:
@@ -33,6 +36,12 @@ def _add_synth_parser(sub: "argparse._SubParsersAction") -> None:
     p.add_argument("--passes", type=int, default=None, help="number of passes")
     p.add_argument("--seed", type=int, default=None, help="scenario seed")
     p.add_argument(
+        "--ab",
+        action="store_true",
+        help="A/B mode: two same-seed synthetic sources (synthA/synthB) "
+        "through per-camera pipelines with cross-camera business dedup",
+    )
+    p.add_argument(
         "--data-dir",
         type=Path,
         default=None,
@@ -40,6 +49,7 @@ def _add_synth_parser(sub: "argparse._SubParsersAction") -> None:
         "directory (default: keep the paths from the config file)",
     )
     _add_stats_interval(p)
+    _add_dashboard_flag(p)
 
 
 def _add_stats_interval(p: argparse.ArgumentParser) -> None:
@@ -50,6 +60,63 @@ def _add_stats_interval(p: argparse.ArgumentParser) -> None:
         metavar="SECONDS",
         help="log a structured metrics snapshot line every N seconds",
     )
+
+
+def _add_dashboard_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="serve the live dashboard while running (also enabled by "
+        "web.enabled in the config); localhost-bound, no auth",
+    )
+
+
+class _DashboardUnavailable(Exception):
+    """Dashboard prerequisites missing (configuration error, exit 2)."""
+
+
+def _start_dashboard(
+    cfg: AppConfig,
+    runners: "dict[str, PipelineRunner]",
+    business: Callable[[], dict[str, Any]] | None,
+) -> "DashboardServer":
+    """Build previews + context and start the server (before runner.run)."""
+    from palletscan.web.app import DashboardContext, create_app
+    from palletscan.web.preview import LivePreview
+    from palletscan.web.server import DashboardServer
+    from palletscan.web.store import ReadStore
+
+    from palletscan.web.server import DashboardServerError
+
+    if not cfg.sinks.sqlite.enabled:
+        raise _DashboardUnavailable(
+            "the dashboard reads events from SQLite; enable sinks.sqlite "
+            "in the config to use --dashboard"
+        )
+    snapshots = {}
+    previews = {}
+    for source_id, runner in runners.items():
+        preview = LivePreview(source_id, cfg.web)
+        runner.preview = preview
+        previews[source_id] = preview
+        snapshots[source_id] = runner.metrics.snapshot
+    ctx = DashboardContext(
+        snapshots=snapshots,
+        previews=previews,
+        business=business,
+        store=ReadStore(cfg.sinks.sqlite.path, cfg.report.manifest_path),
+        evidence_root=cfg.evidence.dir,
+        web=cfg.web,
+    )
+    server = DashboardServer(create_app(ctx), cfg.web.host, cfg.web.port)
+    try:
+        server.start()
+    except DashboardServerError as exc:
+        # Port in use / bad bind: a clean message, not a stack dump, is the
+        # operator's first impression of the trial run.
+        raise _DashboardUnavailable(str(exc)) from exc
+    print(f"dashboard serving on {server.url}")
+    return server
 
 
 def _add_replay_parser(sub: "argparse._SubParsersAction") -> None:
@@ -92,6 +159,7 @@ def _add_replay_parser(sub: "argparse._SubParsersAction") -> None:
         "directory (default: keep the paths from the config file)",
     )
     _add_stats_interval(p)
+    _add_dashboard_flag(p)
 
 
 def _add_run_parser(sub: "argparse._SubParsersAction") -> None:
@@ -113,6 +181,23 @@ def _add_run_parser(sub: "argparse._SubParsersAction") -> None:
         "directory (default: keep the paths from the config file)",
     )
     _add_stats_interval(p)
+    _add_dashboard_flag(p)
+
+
+def _add_dashboard_parser(sub: "argparse._SubParsersAction") -> None:
+    p = sub.add_parser(
+        "dashboard",
+        help="serve the dashboard read-only against an existing events DB "
+        "(no runners; how a finished trial gets reviewed)",
+    )
+    p.add_argument("--config", type=Path, default=None, help="YAML config path")
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="read events.jsonl / palletscan.db / evidence from this "
+        "directory (matches the --data-dir the run used)",
+    )
 
 
 def _add_calibrate_parser(sub: "argparse._SubParsersAction") -> None:
@@ -167,7 +252,7 @@ def _add_selftest_parser(sub: "argparse._SubParsersAction") -> None:
     )
 
 
-def _install_sigint(runner: "PipelineRunner") -> None:
+def _install_sigint(runner: "PipelineRunner | StationRunner") -> None:
     import signal
 
     def _on_sigint(*_: object) -> None:
@@ -190,27 +275,51 @@ def _exit_code_for(exc: BaseException) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     from palletscan.app import PipelineRunner
+    from palletscan.station import StationRunner
 
     cfg = load_config(args.config)
     cfg = apply_overrides(cfg, data_dir=args.data_dir)
     if args.camera is not None:
+        # An explicit --camera narrows an A/B config to one arm.
         cfg = cfg.model_copy(
-            update={"source": cfg.source.model_copy(update={"camera": args.camera})}
+            update={
+                "source": cfg.source.model_copy(
+                    update={"camera": args.camera, "cameras": None}
+                )
+            }
         )
     setup_logging(cfg.logging.level)
     try:
-        runner = PipelineRunner.from_config(cfg)
+        runner: PipelineRunner | StationRunner = (
+            StationRunner(cfg)
+            if cfg.source.cameras is not None
+            else PipelineRunner.from_config(cfg)
+        )
     except Exception as exc:
         # Fail-fast construction (refuse to run blind): bad selector,
         # missing device, capture that will not open.
         print(f"run: {exc}", file=sys.stderr)
         return 1
     _install_sigint(runner)
+    dashboard = None
+    if args.dashboard or cfg.web.enabled:
+        if isinstance(runner, StationRunner):
+            runners, business = runner.runners, runner.deduper.stats
+        else:
+            runners, business = {runner.source.source_id: runner}, None
+        try:
+            dashboard = _start_dashboard(cfg, runners, business)
+        except _DashboardUnavailable as exc:
+            print(f"run: {exc}", file=sys.stderr)
+            return 2
     try:
         summary = runner.run(stats_interval_s=args.stats_interval)
     except RuntimeError as exc:
         print(f"run: {exc.__cause__ or exc}", file=sys.stderr)
         return _exit_code_for(exc)
+    finally:
+        if dashboard is not None:
+            dashboard.stop()
     print(summary.format())
     return 0
 
@@ -260,16 +369,119 @@ def _cmd_synth(args: argparse.Namespace) -> int:
         cfg, num_passes=args.passes, seed=args.seed, data_dir=args.data_dir
     )
     setup_logging(cfg.logging.level)
+    truth_dir = args.data_dir if args.data_dir is not None else Path("data")
+    truth_path = truth_dir / "truth.jsonl"
+    if args.ab:
+        from palletscan.sources.factory import synthetic_tail_s
+        from palletscan.station import StationRunner
+
+        # Same-seed sources produce bit-identical pass schedules: two
+        # "cameras" on one zone, exercising the full cross-camera merge
+        # path without hardware.
+        tail = synthetic_tail_s(cfg)
+        sources = [
+            SyntheticSource(cfg.synthetic, source_id=source_id, tail_s=tail)
+            for source_id in ("synthA", "synthB")
+        ]
+        station = StationRunner(cfg, sources=sources)
+        _install_sigint(station)
+        dashboard = None
+        if args.dashboard or cfg.web.enabled:
+            try:
+                dashboard = _start_dashboard(
+                    cfg, station.runners, station.deduper.stats
+                )
+            except _DashboardUnavailable as exc:
+                print(f"synth: {exc}", file=sys.stderr)
+                return 2
+        try:
+            station_summary = station.run(stats_interval_s=args.stats_interval)
+        finally:
+            if dashboard is not None:
+                dashboard.stop()
+        sources[0].write_truth_jsonl(truth_path)
+        print(f"truth written to {truth_path}")
+        print(station_summary.format())
+        return 0 if station_summary.unaccounted == 0 else 1
     runner = PipelineRunner.from_config(cfg)
     _install_sigint(runner)
-    summary = runner.run(stats_interval_s=args.stats_interval)
+    dashboard = None
+    if args.dashboard or cfg.web.enabled:
+        try:
+            dashboard = _start_dashboard(
+                cfg, {runner.source.source_id: runner}, None
+            )
+        except _DashboardUnavailable as exc:
+            print(f"synth: {exc}", file=sys.stderr)
+            return 2
+    try:
+        summary = runner.run(stats_interval_s=args.stats_interval)
+    finally:
+        if dashboard is not None:
+            dashboard.stop()
     if isinstance(runner.source, SyntheticSource):
-        truth_dir = args.data_dir if args.data_dir is not None else Path("data")
-        truth_path = truth_dir / "truth.jsonl"
         runner.source.write_truth_jsonl(truth_path)
         print(f"truth written to {truth_path}")
     print(summary.format())
     return 0 if summary.unaccounted == 0 else 1
+
+
+def _wait_for_interrupt() -> None:
+    """Block until Ctrl-C (patchable seam for tests)."""
+    import time
+
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    from palletscan.web.app import DashboardContext, create_app
+    from palletscan.web.server import DashboardServer, DashboardServerError
+    from palletscan.web.store import ReadStore
+
+    cfg = load_config(args.config)
+    cfg = apply_overrides(cfg, data_dir=args.data_dir)
+    setup_logging(cfg.logging.level)
+    if not cfg.sinks.sqlite.enabled:
+        print(
+            "dashboard: sinks.sqlite is disabled in this config; there is "
+            "no events DB to serve",
+            file=sys.stderr,
+        )
+        return 2
+    db = cfg.sinks.sqlite.path
+    if not db.is_file():
+        # Refuse to invent an empty DB: a typo'd path silently showing
+        # "no events" would misreport a finished trial.
+        print(
+            f"dashboard: events DB not found at {db}; pass the same "
+            "--config/--data-dir the run used",
+            file=sys.stderr,
+        )
+        return 2
+    ctx = DashboardContext(
+        snapshots={},
+        previews={},
+        business=None,
+        store=ReadStore(db, cfg.report.manifest_path),
+        evidence_root=cfg.evidence.dir,
+        web=cfg.web,
+    )
+    server = DashboardServer(create_app(ctx), cfg.web.host, cfg.web.port)
+    try:
+        server.start()
+    except DashboardServerError as exc:
+        print(f"dashboard: {exc}", file=sys.stderr)
+        return 2
+    print(f"dashboard serving on {server.url} (read-only; Ctrl-C to stop)")
+    try:
+        _wait_for_interrupt()
+    finally:
+        server.stop()
+    return 0
 
 
 def _cmd_replay(args: argparse.Namespace) -> int:
@@ -313,7 +525,20 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     setup_logging(cfg.logging.level)
     runner = PipelineRunner.from_config(cfg)
     _install_sigint(runner)
-    summary = runner.run(stats_interval_s=args.stats_interval)
+    dashboard = None
+    if args.dashboard or cfg.web.enabled:
+        try:
+            dashboard = _start_dashboard(
+                cfg, {runner.source.source_id: runner}, None
+            )
+        except _DashboardUnavailable as exc:
+            print(f"replay: {exc}", file=sys.stderr)
+            return 2
+    try:
+        summary = runner.run(stats_interval_s=args.stats_interval)
+    finally:
+        if dashboard is not None:
+            dashboard.stop()
     if args.truth is not None:
         fps = runner.source.nominal_fps or 30.0
         summary.reconciliation = reconcile_truth(
@@ -333,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_run_parser(sub)
     _add_synth_parser(sub)
     _add_replay_parser(sub)
+    _add_dashboard_parser(sub)
     _add_calibrate_parser(sub)
     _add_selftest_parser(sub)
 
@@ -346,6 +572,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_synth(args)
     if args.command == "replay":
         return _cmd_replay(args)
+    if args.command == "dashboard":
+        return _cmd_dashboard(args)
     if args.command == "calibrate":
         return _cmd_calibrate(args)
     if args.command == "selftest":
