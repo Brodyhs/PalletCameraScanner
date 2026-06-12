@@ -28,6 +28,7 @@ SNAPSHOT_KEYS = {
     "decode",
     "passes",
     "misses",
+    "source",  # Phase 3 watchdog counters (approved API extension)
     "read_rate_1h",
     "events",
     "outbox",

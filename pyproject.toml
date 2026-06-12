@@ -22,6 +22,9 @@ dependencies = [
     # pylibdmtx 0.1.10 imports distutils (removed in Python 3.12);
     # setuptools provides the import shim.
     "setuptools>=68",
+    # DirectShow device-name enumeration on the Windows factory PC
+    # (pure Python + comtypes); never installed on macOS dev machines.
+    "pygrabber>=0.2 ; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -40,11 +43,14 @@ palletscan = "palletscan.cli:main"
 [tool.setuptools.packages.find]
 include = ["palletscan*"]
 
+[tool.setuptools.package-data]
+palletscan = ["assets/*.png"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "acceptance: long-running end-to-end synthetic acceptance tests",
-    "soak_short: ~3-minute soak variant (memory flatness, injected failures)",
+    "soak_short: ~6-minute soak variant (memory flatness, injected failures)",
 ]
 
 [tool.mypy]

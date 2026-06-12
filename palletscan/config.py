@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import enum
 import math
+import os
+import tempfile
+import time
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from palletscan.types import Symbology
 
@@ -23,9 +26,11 @@ class _StrictModel(BaseModel):
 
 
 class SourceConfig(_StrictModel):
-    """Which FrameSource to run (Phase 3 adds "camera")."""
+    """Which FrameSource to run."""
 
-    type: Literal["synthetic", "video"] = "synthetic"
+    type: Literal["synthetic", "video", "camera"] = "synthetic"
+    #: ``cameras[].id`` to run; optional when exactly one entry exists.
+    camera: str | None = None
 
 
 class VideoConfig(_StrictModel):
@@ -261,10 +266,149 @@ class LoggingConfig(_StrictModel):
     level: str = "INFO"
 
 
+class Backend(enum.StrEnum):
+    """Capture backend selector. ``auto`` picks the platform default
+    (DSHOW on Windows, AVFoundation on macOS); the per-backend control
+    quirks live as data in :mod:`palletscan.sources.controls`."""
+
+    AUTO = "auto"
+    DSHOW = "dshow"
+    MSMF = "msmf"
+    AVFOUNDATION = "avfoundation"
+
+
+class CameraSettings(_StrictModel):
+    """UVC control values persisted per camera and re-applied on every
+    (re)connect.
+
+    Exposure and gain are stored as **raw backend values** — the number
+    handed to ``CAP_PROP_EXPOSURE``/``CAP_PROP_GAIN`` — not milliseconds:
+    DSHOW's log2 scaling vs MSMF's semantics make unit conversion a guess
+    that cannot be verified without hardware. Calibrate records what
+    *worked*; reconnect replays exactly that. ``None`` means "do not touch
+    this control".
+    """
+
+    exposure_auto: bool = True
+    exposure: float | None = None
+    gain: float | None = None
+    brightness: float | None = None
+
+
+class CameraConfig(_StrictModel):
+    """One physical camera, identified by device-name substring (never a
+    bare index — indexes shuffle on reboot/replug)."""
+
+    id: str
+    name: str
+    backend: Backend = Backend.AUTO
+    fourcc: str | None = None  # None = leave the device's default format
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+    convert_rgb: bool = True
+    #: Last-resort index when the platform yields no device names.
+    fallback_index: int | None = None
+    read_fail_limit: int = 5
+    #: Achieved-fps sample seconds per (re)connect; 0 disables.
+    connect_verify_s: float = 1.0
+    settings: CameraSettings = Field(default_factory=CameraSettings)
+
+    @field_validator("id", "name")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("cameras[].id and name must be non-empty")
+        return v
+
+    @field_validator("fourcc")
+    @classmethod
+    def _fourcc_four_chars(cls, v: str | None) -> str | None:
+        if v is not None and len(v) != 4:
+            raise ValueError(f"fourcc must be exactly 4 characters, got {v!r}")
+        return v
+
+    @field_validator("width", "height")
+    @classmethod
+    def _dim_positive(cls, v: int | None) -> int | None:
+        if v is not None and v <= 0:
+            raise ValueError(f"width/height must be > 0, got {v}")
+        return v
+
+    @field_validator("fps")
+    @classmethod
+    def _fps_positive(cls, v: float | None) -> float | None:
+        if v is not None and (not math.isfinite(v) or v <= 0):
+            raise ValueError(f"cameras[].fps must be finite and > 0, got {v}")
+        return v
+
+    @field_validator("fallback_index")
+    @classmethod
+    def _index_non_negative(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError(f"fallback_index must be >= 0, got {v}")
+        return v
+
+    @field_validator("read_fail_limit")
+    @classmethod
+    def _limit_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"read_fail_limit must be >= 1, got {v}")
+        return v
+
+    @field_validator("connect_verify_s")
+    @classmethod
+    def _verify_non_negative(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(f"connect_verify_s must be finite and >= 0, got {v}")
+        return v
+
+
+class WatchdogConfig(_StrictModel):
+    """Stall detection and reconnect policy for live camera sources.
+
+    The watchdog never gives up by default (process exit cannot fix an
+    unplugged camera); the two escalation valves are ``max_outage_s``
+    (None = off) and ``max_zombie_readers`` — abandoned reader threads
+    stuck in hung ``read()`` calls are the wedged-USB-stack signature,
+    and only a process restart resets a wedged stack (exit code 3).
+    """
+
+    stall_timeout_s: float = 2.0
+    retry: RetryConfig = Field(
+        default_factory=lambda: RetryConfig(base_s=0.5, cap_s=15.0)
+    )
+    max_outage_s: float | None = None
+    max_zombie_readers: int = 3
+
+    @field_validator("stall_timeout_s")
+    @classmethod
+    def _timeout_positive(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"watchdog.stall_timeout_s must be > 0, got {v}")
+        return v
+
+    @field_validator("max_outage_s")
+    @classmethod
+    def _outage_positive(cls, v: float | None) -> float | None:
+        if v is not None and (not math.isfinite(v) or v <= 0):
+            raise ValueError(f"watchdog.max_outage_s must be > 0 or null, got {v}")
+        return v
+
+    @field_validator("max_zombie_readers")
+    @classmethod
+    def _zombies_non_negative(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"watchdog.max_zombie_readers must be >= 1, got {v}")
+        return v
+
+
 class AppConfig(_StrictModel):
     source: SourceConfig = Field(default_factory=SourceConfig)
     synthetic: SyntheticConfig = Field(default_factory=SyntheticConfig)
     video: VideoConfig = Field(default_factory=VideoConfig)
+    cameras: list[CameraConfig] = Field(default_factory=list)
+    watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
     motion: MotionConfig = Field(default_factory=MotionConfig)
     decode: DecodeConfig = Field(default_factory=DecodeConfig)
     dedup: DedupConfig = Field(default_factory=DedupConfig)
@@ -273,6 +417,100 @@ class AppConfig(_StrictModel):
     sinks: SinksConfig = Field(default_factory=SinksConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+    @model_validator(mode="after")
+    def _unique_camera_ids(self) -> "AppConfig":
+        ids = [c.id for c in self.cameras]
+        dupes = sorted({i for i in ids if ids.count(i) > 1})
+        if dupes:
+            raise ValueError(f"duplicate cameras[].id: {dupes}")
+        return self
+
+
+def resolve_camera(cfg: AppConfig) -> CameraConfig:
+    """Resolve ``source.camera`` to a ``cameras[]`` entry.
+
+    A single entry is the default; multiple entries require an explicit
+    selector. Errors always list what *is* configured.
+    """
+    ids = [c.id for c in cfg.cameras]
+    if not cfg.cameras:
+        raise ValueError(
+            "source.type=camera requires at least one cameras[] entry "
+            "(run `palletscan calibrate --save` to create one)"
+        )
+    if cfg.source.camera is None:
+        if len(cfg.cameras) == 1:
+            return cfg.cameras[0]
+        raise ValueError(
+            f"multiple cameras configured ({ids}); set source.camera "
+            "or pass --camera to pick one"
+        )
+    for cam in cfg.cameras:
+        if cam.id == cfg.source.camera:
+            return cam
+    raise ValueError(
+        f"source.camera {cfg.source.camera!r} not found; configured ids: {ids}"
+    )
+
+
+def upsert_camera_yaml(path: Path | str, camera: CameraConfig) -> None:
+    """Replace-or-append one ``cameras[]`` entry in a YAML config file.
+
+    Narrow and targeted: every other key in the file is preserved (key
+    order survives; comments do not — ``config/default.yaml`` remains the
+    commented reference). The merged result is validated as a full
+    AppConfig **before** anything touches disk, so a corrupt save can
+    never brick the station; the write is tmp-file + ``os.replace`` with
+    a timestamped ``.bak`` of the original.
+    """
+    path = Path(path)
+    raw: dict = {}
+    existed = path.is_file()
+    if existed:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if loaded is None:
+            loaded = {}
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                f"config root must be a mapping, got {type(loaded).__name__}"
+            )
+        raw = loaded
+    entry = camera.model_dump(mode="json")
+    cams = raw.get("cameras")
+    if cams is None:
+        cams = []
+    if not isinstance(cams, list):
+        raise ValueError("cameras must be a list")
+    for i, existing in enumerate(cams):
+        if isinstance(existing, dict) and existing.get("id") == camera.id:
+            cams[i] = entry
+            break
+    else:
+        cams.append(entry)
+    raw["cameras"] = cams
+    AppConfig.model_validate(raw)  # refuse to write anything unloadable
+
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    header = f"# updated by palletscan calibrate {stamp}\n"
+    body = header + yaml.safe_dump(raw, sort_keys=False, default_flow_style=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if existed:
+        backup = path.with_name(f"{path.name}.{stamp}.bak")
+        backup.write_bytes(path.read_bytes())
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:

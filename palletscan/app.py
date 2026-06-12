@@ -30,6 +30,7 @@ from palletscan.pipeline.motion_gate import MotionGate
 from palletscan.pipeline.pass_tracker import PassTracker
 from palletscan.pipeline.rolling_buffer import RollingFrameBuffer
 from palletscan.reliability.queues import SENTINEL, DroppingQueue
+from palletscan.reliability.watchdog import WatchdogSource
 from palletscan.sources.base import FrameSource
 from palletscan.sources.factory import create_source
 from palletscan.sources.synthetic import SyntheticSource
@@ -245,6 +246,15 @@ class PipelineRunner:
             fallback_calls=lambda: self._engine.counters.fallback_calls,
             budget_overruns=lambda: self._engine.counters.budget_overruns,
         )
+        # Watchdog counters stay the single source of truth (same lazy-gauge
+        # pattern); non-camera runs report zeros in the "source" section.
+        if isinstance(source, WatchdogSource):
+            self.metrics.register_gauges(
+                source_stalls=lambda: source.stalls_detected,
+                source_reconnects=lambda: source.reconnects,
+                source_reopen_failures=lambda: source.reopen_failures,
+                source_zombie_readers=lambda: source.zombie_readers,
+            )
         self.metrics.register_queue("frames", self._frame_q.qsize)
         self.metrics.register_queue("events", self._bus.queue.qsize)
         for sink in sinks:
@@ -273,6 +283,12 @@ class PipelineRunner:
     def stop(self) -> None:
         """Request a graceful shutdown (drains queues before exiting)."""
         self._stop.set()
+        # A watchdog-wrapped source mid-outage never yields a frame, so the
+        # source thread cannot observe _stop between frames; closing the
+        # wrapper (idempotent, thread-safe) interrupts its stall-wait and
+        # backoff so shutdown stays prompt even with a dead camera.
+        if isinstance(self.source, WatchdogSource):
+            self.source.close()
 
     # -- threads ---------------------------------------------------------------
 

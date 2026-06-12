@@ -22,6 +22,11 @@ def create_source(cfg: AppConfig) -> FrameSource:
         return SyntheticSource(cfg.synthetic, tail_s=synthetic_tail_s(cfg))
     if cfg.source.type == "video":
         return VideoFileSource(cfg.video)
+    if cfg.source.type == "camera":
+        # Lazy: the live-camera stack only loads when actually configured.
+        from palletscan.sources.camera import build_camera_source
+
+        return build_camera_source(cfg)
     raise ValueError(
         f"unsupported source type {cfg.source.type!r}"
     )  # pragma: no cover - Literal-validated upstream

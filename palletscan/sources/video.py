@@ -28,13 +28,26 @@ from palletscan.types import Frame
 log = logging.getLogger(__name__)
 
 
-def to_gray(img: np.ndarray) -> np.ndarray:
-    """Normalize a decoded frame to 2-D grayscale (BGR or single-channel in)."""
-    if img.ndim == 2:
-        return img
-    if img.shape[2] == 1:
-        return img[:, :, 0]
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def to_gray(img: np.ndarray, *, packed_luma_channel: int = 0) -> np.ndarray:
+    """Normalize any capture layout to 2-D uint8 grayscale, once, at ingest.
+
+    Handles every layout the cameras can deliver: 2-D uint8 (passthrough,
+    same object), 2-D uint16 (Y16 -> high byte), HxWx1 (squeeze), HxWx2
+    (packed YUV with CONVERT_RGB=0: ``packed_luma_channel`` selects the
+    luma plane — 0 for YUY2/YUYV, 1 for UYVY; CameraSource derives it
+    from the configured fourcc, arrival-day verified), and HxWx3
+    (BGR -> gray).
+    """
+    if img.ndim == 3:
+        if img.shape[2] == 1:
+            img = img[:, :, 0]
+        elif img.shape[2] == 2:
+            img = img[:, :, packed_luma_channel]
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if img.dtype == np.uint16:
+        img = (img >> 8).astype(np.uint8)
+    return img
 
 
 class VideoFileSource(FrameSource):

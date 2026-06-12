@@ -2,7 +2,8 @@
 # synthetic-mode defaults. Unknown keys are rejected.
 
 source:
-  type: synthetic   # synthetic | video
+  type: synthetic   # synthetic | video | camera
+  camera: null      # cameras[].id to run; optional when exactly one entry
 
 synthetic:
   width: 1280
@@ -33,6 +34,41 @@ video:
   fps_override: null     # set when the file's fps metadata is broken
   speed: 1.0             # wall-clock pacing only: 1.0 as-if-live, >1 faster, 0 unpaced
   loop: 1                # play count; 0 = loop forever (soak)
+
+# Live cameras, identified by device-name substring (never bare index —
+# indexes shuffle on replug). Lock entries with `palletscan calibrate --save`;
+# exposure/gain are RAW backend values (DSHOW log2 stops vs MSMF semantics),
+# stored next to the backend they were calibrated under.
+cameras: []
+#  - id: cam-color
+#    name: "See3CAM_24CUG"        # device-name substring, case-insensitive
+#    backend: auto                # auto | dshow | msmf | avfoundation
+#    fourcc: UYVY                 # null = leave the device default
+#    width: 1920
+#    height: 1200
+#    fps: 120.0
+#    convert_rgb: true
+#    fallback_index: null         # only when the platform yields no names
+#    read_fail_limit: 5           # consecutive read failures before reconnect
+#    connect_verify_s: 1.0        # achieved-fps sample per (re)connect; 0 disables
+#    settings: {exposure_auto: false, exposure: -6, gain: 10, brightness: null}
+#  - id: cam-mono
+#    name: "See3CAM_37CUGM"
+#    backend: auto
+#    fourcc: GREY                 # Y8; probing may pick convert_rgb: false
+#    width: 2064
+#    height: 1552
+#    fps: 72.0
+#    settings: {exposure_auto: false, exposure: -6, gain: 10, brightness: null}
+
+# Stall detection + reconnect for live cameras (synthetic/video unaffected).
+# Never gives up by default: backoff caps at retry.cap_s forever; the two
+# escalation valves below exit the process with code 3 for the supervisor.
+watchdog:
+  stall_timeout_s: 2.0
+  retry: {base_s: 0.5, cap_s: 15.0}
+  max_outage_s: null       # outage seconds before giving up (null = never)
+  max_zombie_readers: 3    # hung reader threads = wedged USB stack signature
 
 motion:
   algorithm: framediff   # framediff | mog2

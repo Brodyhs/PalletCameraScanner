@@ -115,7 +115,7 @@ def test_analyze_rss_flags_growth() -> None:
 
 @pytest.mark.soak_short
 def test_short_soak_invariants(tmp_path: Path) -> None:
-    """~2.5-minute synthetic soak with a failure injected every 30 source-
+    """~6-minute synthetic soak with a failure injected every 30 source-
     seconds — the CI-sized version of the 2h manual run."""
     cfg_path = tmp_path / "soak.yaml"
     cfg_path.write_text(
@@ -135,18 +135,26 @@ def test_short_soak_invariants(tmp_path: Path) -> None:
     )
     args = soak.parse_args(
         [
-            "--minutes", "2.5",
+            # 6 min / 90 s warmup (owner ruling at Phase 3 close-out; was
+            # 2.5 min / 45 s): the short run fit almost entirely inside
+            # macOS's lazy page-reclaim ramp — freed segment memory stays
+            # resident until the kernel reclaims it, so a fresh process
+            # measured +260..+800 MB/min "growth" on leak-free code
+            # (pristine Phase 2 HEAD included), while a 6-min window
+            # measured -6 MB/min with the final RSS *below* baseline. The
+            # longer window spans the plateau; thresholds are unchanged.
+            "--minutes", "6",
             "--mode", "synthetic",
             "--inject-every-s", "30",
             "--config", str(cfg_path),
             "--data-dir", str(tmp_path / "data"),
             "--seed", "7",
             "--rss-interval-s", "1",
-            "--warmup-s", "45",
-            # A ~100 s fit window over-extrapolates settling noise (a few
+            "--warmup-s", "90",
+            # A short fit window over-extrapolates settling noise (a few
             # MB of gc/allocator drift reads as MB/min, and varies run to
             # run with machine load); the strict 1.0 default is for the 2h
-            # run, where the window dilutes that noise ~80x. 8.0 still
+            # run, where the window dilutes that noise. 8.0 still
             # catches leak-class slopes (the pre-fix restart churn measured
             # +323 MB/min) and the 1.3x final/baseline ratio stays the
             # absolute-growth guard.

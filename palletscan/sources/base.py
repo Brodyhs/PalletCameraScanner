@@ -33,7 +33,10 @@ class FrameSource(ABC):
 
     @abstractmethod
     def frames(self) -> Iterator[Frame]:
-        """Yield frames in order. Single-use: call once per source instance.
+        """Yield frames in order. Single-use **per connection**: call once
+        per source instance — except that after a successful
+        ``Reopenable.reopen()`` the reliability watchdog may call it again
+        for a fresh stream; all other callers still call it exactly once.
 
         A finite source (synthetic, replay) simply stops iterating; a live
         source iterates until :meth:`close`.

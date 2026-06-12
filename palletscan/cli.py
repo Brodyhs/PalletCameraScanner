@@ -1,8 +1,13 @@
 """``palletscan`` command-line interface.
 
-Subcommands: ``synth`` (run the full pipeline on the synthetic source),
-``replay`` (run a recorded clip through the pipeline), ``version``. Later
-phases add ``run``, ``calibrate``, ``selftest`` as further subparsers.
+Subcommands: ``run`` (the configured source — live cameras in
+production), ``synth`` (the synthetic source), ``replay`` (a recorded
+clip), ``calibrate`` (probe/verify/lock camera settings), ``selftest``
+(refuse-to-run-blind startup checks), ``version``.
+
+Exit codes: 0 clean; 1 software failure (check logs); 2 usage error;
+**3 watchdog escalation** ("USB stack wedged, check cable/hub") — the
+supervisor must restart the process on any nonzero exit.
 """
 
 from __future__ import annotations
@@ -89,6 +94,79 @@ def _add_replay_parser(sub: "argparse._SubParsersAction") -> None:
     _add_stats_interval(p)
 
 
+def _add_run_parser(sub: "argparse._SubParsersAction") -> None:
+    p = sub.add_parser(
+        "run", help="run the pipeline on the configured source (live cameras)"
+    )
+    p.add_argument("--config", type=Path, default=None, help="YAML config path")
+    p.add_argument(
+        "--camera",
+        type=str,
+        default=None,
+        help="cameras[].id to run (overrides source.camera)",
+    )
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="rebase events.jsonl / palletscan.db / evidence under this "
+        "directory (default: keep the paths from the config file)",
+    )
+    _add_stats_interval(p)
+
+
+def _add_calibrate_parser(sub: "argparse._SubParsersAction") -> None:
+    p = sub.add_parser(
+        "calibrate",
+        help="probe camera modes, verify controls, lock-and-save settings",
+    )
+    p.add_argument("--config", type=Path, default=None, help="YAML config path")
+    p.add_argument("--list", action="store_true", help="list devices and exit")
+    p.add_argument("--camera", type=str, default=None, help="cameras[].id")
+    p.add_argument(
+        "--name", type=str, default=None,
+        help="device-name substring (creates a fresh entry; pairs with --camera as its id)",
+    )
+    p.add_argument("--fourcc", type=str, default=None, help="pin a FOURCC")
+    p.add_argument("--width", type=int, default=None, help="pin a width")
+    p.add_argument("--height", type=int, default=None, help="pin a height")
+    p.add_argument("--fps", type=float, default=None, help="pin a frame rate")
+    p.add_argument("--exposure", type=float, default=None, help="raw backend value")
+    p.add_argument("--gain", type=float, default=None, help="raw backend value")
+    auto = p.add_mutually_exclusive_group()
+    auto.add_argument(
+        "--auto-exposure", dest="auto_exposure", action="store_true", default=None
+    )
+    auto.add_argument(
+        "--no-auto-exposure", dest="auto_exposure", action="store_false"
+    )
+    p.add_argument(
+        "--seconds", type=int, default=5, help="live metrics loop duration"
+    )
+    p.add_argument(
+        "--save", action="store_true",
+        help="upsert the locked entry into the --config file",
+    )
+    p.add_argument(
+        "--preview", action="store_true",
+        help="cv2 preview window (main thread only; q quits, s saves)",
+    )
+
+
+def _add_selftest_parser(sub: "argparse._SubParsersAction") -> None:
+    p = sub.add_parser(
+        "selftest", help="startup checks: cameras, full-pipeline decode, disk"
+    )
+    p.add_argument("--config", type=Path, default=None, help="YAML config path")
+    p.add_argument(
+        "--skip-camera", action="store_true", help="skip the camera checks"
+    )
+    p.add_argument(
+        "--data-dir", type=Path, default=None,
+        help="scratch directory for the pipeline-decode check outputs",
+    )
+
+
 def _install_sigint(runner: "PipelineRunner") -> None:
     import signal
 
@@ -99,6 +177,78 @@ def _install_sigint(runner: "PipelineRunner") -> None:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     signal.signal(signal.SIGINT, _on_sigint)
+
+
+def _exit_code_for(exc: BaseException) -> int:
+    """Map a pipeline failure to its exit code (3 = watchdog escalation,
+    ruling #5: 'USB stack wedged, check cable/hub' vs 'software crashed,
+    check logs' — distinguishable at the supervisor without log diving)."""
+    from palletscan.reliability.watchdog import WatchdogEscalation
+
+    return 3 if isinstance(exc.__cause__, WatchdogEscalation) else 1
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    from palletscan.app import PipelineRunner
+
+    cfg = load_config(args.config)
+    cfg = apply_overrides(cfg, data_dir=args.data_dir)
+    if args.camera is not None:
+        cfg = cfg.model_copy(
+            update={"source": cfg.source.model_copy(update={"camera": args.camera})}
+        )
+    setup_logging(cfg.logging.level)
+    try:
+        runner = PipelineRunner.from_config(cfg)
+    except Exception as exc:
+        # Fail-fast construction (refuse to run blind): bad selector,
+        # missing device, capture that will not open.
+        print(f"run: {exc}", file=sys.stderr)
+        return 1
+    _install_sigint(runner)
+    try:
+        summary = runner.run(stats_interval_s=args.stats_interval)
+    except RuntimeError as exc:
+        print(f"run: {exc.__cause__ or exc}", file=sys.stderr)
+        return _exit_code_for(exc)
+    print(summary.format())
+    return 0
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    from palletscan.calibrate import CalibrateOptions, run_calibration
+
+    cfg = load_config(args.config)
+    setup_logging(cfg.logging.level)
+    opts = CalibrateOptions(
+        list_only=args.list,
+        camera=args.camera,
+        name=args.name,
+        fourcc=args.fourcc,
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        exposure=args.exposure,
+        gain=args.gain,
+        auto_exposure=args.auto_exposure,
+        seconds=args.seconds,
+        save=args.save,
+        config_path=args.config,
+        preview=args.preview,
+    )
+    return run_calibration(cfg, opts)
+
+
+def _cmd_selftest(args: argparse.Namespace) -> int:
+    from palletscan.selftest import run_selftest
+
+    cfg = load_config(args.config)
+    setup_logging(cfg.logging.level)
+    report = run_selftest(
+        cfg, skip_camera=args.skip_camera, data_dir=args.data_dir
+    )
+    print(report.format())
+    return 0 if report.ok else 1
 
 
 def _cmd_synth(args: argparse.Namespace) -> int:
@@ -180,17 +330,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("version", help="print version")
+    _add_run_parser(sub)
     _add_synth_parser(sub)
     _add_replay_parser(sub)
+    _add_calibrate_parser(sub)
+    _add_selftest_parser(sub)
 
     args = parser.parse_args(argv)
     if args.command == "version":
         print(palletscan.__version__)
         return 0
+    if args.command == "run":
+        return _cmd_run(args)
     if args.command == "synth":
         return _cmd_synth(args)
     if args.command == "replay":
         return _cmd_replay(args)
+    if args.command == "calibrate":
+        return _cmd_calibrate(args)
+    if args.command == "selftest":
+        return _cmd_selftest(args)
     parser.error(f"unknown command {args.command!r}")
     return 2
 

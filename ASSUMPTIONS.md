@@ -170,7 +170,7 @@ arrives.
     with it (`resource.getrusage` doesn't exist on the Windows target);
     the runtime package never imports it. Soak thresholds: post-warmup
     least-squares slope < 1 MB/min and final RSS < 1.3× the post-warmup
-    baseline; `pytest -m soak_short` runs a ~2.5-minute variant of the
+    baseline; `pytest -m soak_short` runs a ~6-minute variant of the
     same invariants.
 28. **2h soak results** (2026-06-11, Apple Silicon dev Mac,
     `python tools/soak.py --hours 2 --mode replay --stats-interval 300`,
@@ -192,3 +192,142 @@ arrives.
     process-total across cores under *unpaced* load — a paced 30 fps
     camera feed is ~9x lighter; the spec §11 ≤50%-of-4-cores measurement
     under realistic burst load is re-verified in Phase 5 ops hardening.
+
+## Phase 3: live cameras (code-complete against fakes)
+
+29. **Live timestamps anchor once, never re-anchor on reopen.**
+    `CameraSource` samples `ts = clock() - t0` right after `read()`
+    returns, with `t0` fixed at construction. A reconnect therefore shows
+    up as a *real gap in source time* — which is what dedup windows,
+    rolling-buffer eviction and miss deadlines should see — and ts stays
+    monotonic across any number of reopens. `frame_index` likewise
+    increments monotonically across reopens (allocated *before* the
+    yield, so an iterator abandoned mid-yield by the watchdog can never
+    reissue an index). `CAP_PROP_POS_MSEC` is not used: it is unreliable
+    for live devices. `frames()` is single-use **per connection**; only
+    the reliability watchdog calls it again, after `reopen()`.
+30. **Exposure/gain are stored as raw backend values, beside their
+    backend.** The number handed to `CAP_PROP_EXPOSURE` is what the
+    config persists — no millisecond abstraction. DSHOW's log2 stops vs
+    MSMF's semantics make unit conversion a guess we cannot verify
+    without hardware; calibrate records what *worked* and reconnect
+    replays exactly that. `cameras[].backend` is saved alongside so the
+    values travel with the semantics they were calibrated under. The
+    per-backend quirk knowledge (auto-exposure magic values, log2
+    quantization tolerance, AVFoundation ignoring controls) is data in
+    one table (`QUIRKS` in sources/controls.py), corrected on arrival
+    day (ARRIVAL_CHECKLIST step 3).
+31. **First connect fails fast; everything after is the watchdog's.**
+    `CameraSource.__init__` must enumerate-by-name, open, and apply
+    mode+settings or it raises (consistent with VideoFileSource and
+    "refuse to run blind" — a station that cannot see its camera at
+    startup should say so, not retry silently). At run/(re)connect,
+    control-readback mismatches warn-and-continue (frames at
+    slightly-wrong exposure beat no frames); calibrate/selftest are the
+    strict paths (hard fail on `controls_reliable` backends, honest
+    warning on AVFoundation).
+32. **The watchdog never gives up, with two escalation valves.** Capped
+    jittered backoff (0.5 s → 15 s, attempt counter reset only when a
+    frame actually flows) retries reopen forever: process exit cannot fix
+    an unplugged camera. Valves: `watchdog.max_outage_s` (default null =
+    off) and `max_zombie_readers: 3` — reader threads stuck in hung
+    `read()` calls that `release()` failed to unblock are the
+    wedged-USB-stack signature, and only a process restart resets a
+    wedged stack. Escalation raises `WatchdogEscalation` through the
+    crash-only chain; the CLI maps it to **exit code 3** (vs 1 for
+    software failure) so ops can distinguish "check cable/hub" from
+    "check logs" at the supervisor. Zombie output can never poison the
+    stream: every handoff item carries a generation token and stale
+    generations are discarded. `PipelineRunner.stop()` explicitly closes
+    a watchdog-wrapped source — a source mid-outage never yields, so the
+    source thread cannot observe the stop flag between frames; without
+    the explicit close, shutdown during an outage would hang.
+33. **macOS enumeration is best-effort, by design.** `system_profiler
+    SPCameraDataType` names paired with CAP_AVFOUNDATION in profiler
+    order; profiler-order-vs-index-order is *not* guaranteed and is
+    documented as such. When a platform yields no names at all,
+    enumeration returns `[]` loudly and `cameras[].fallback_index` is the
+    escape hatch. Production targets Windows, where pygrabber's
+    DirectShow filter order is the supported path.
+34. **DSHOW list-order == CAP_DSHOW-index-order is an assumption.**
+    pygrabber returns DirectShow filter names in graph-enumeration order
+    and OpenCV's CAP_DSHOW indexes devices the same way — believed but
+    unverifiable without hardware; ARRIVAL_CHECKLIST step 1 verifies it
+    and `_list_windows()` is the one place to fix if it is wrong.
+    Name matching is case-insensitive substring and must match exactly
+    one device — ambiguity is as fatal as absence, because opening "a"
+    camera when two match would silently run the wrong experiment arm.
+35. **`calibrate --save` loses YAML comments (key order survives).**
+    The upsert is narrow (replace-or-append one `cameras[]` entry), the
+    merged result is validated as a full AppConfig *before* anything
+    touches disk (a corrupt save can never brick the station), and the
+    write is tmp-file + `os.replace` with a timestamped `.bak`. PyYAML
+    drops comments on round-trip; ruamel.yaml would preserve them but
+    adds a dependency for cosmetics (spec §12 says no). The commented
+    reference lives in `config/default.yaml`.
+36. **`snapshot()` gained a top-level `"source"` section** —
+    `{stalls, reconnects, reopen_failures, zombie_readers}` (spec §5
+    requires a reconnect count). This is the approved Phase 3 API
+    extension to the stats contract (`SNAPSHOT_KEYS` in
+    tests/test_metrics.py was amended accordingly — the only existing
+    test edited in Phase 3); Phase 4's `/stats.json` inherits the shape.
+    Non-camera runs report zeros.
+37. **Selftest assets are committed, not generated at runtime.**
+    `palletscan/assets/selftest_qr.png` / `selftest_dm.png` (payloads
+    `PALLETSCAN-SELFTEST-QR` / `-DM`) were produced once by
+    `tools/make_selftest_assets.py` from the repo's own render functions
+    (qrcode + pylibdmtx encode) at 8 px/module — vendored per the
+    InfoSec posture (spec §3), provenance documented in the tool.
+    Selftest sweeps them across a synthetic frame through the *full*
+    pipeline (motion → decode → tracker → bus → evidence) and demands
+    exactly the expected pass events with zero misses, so it proves the
+    deployed station can decode, not merely that files exist. Guard
+    tests pin both assets to their payloads.
+38. **Plan rationales and deliberate deviations (post-review).** Recorded
+    here so nothing diverges silently. Rationales the plan referenced:
+    the watchdog is a *wrapper*, not internal to CameraSource (single
+    responsibility: detection is testable against stalled synthetic
+    sources, recovery against CameraSource+fakes, and the runner needs a
+    `frames()` that keeps yielding across reopens — the wrapper is where
+    that absorption lives); `cameras:` is a *list*, not a single block
+    (the trial runs two cameras with different native modes, calibrate
+    must persist per-device settings without clobbering the other, and
+    Phase 4 A/B runs both); probe candidate matrices are suggestions to
+    *try*, never assumptions (unknown combos fail readback or measure
+    low and lose the ranking). Deviations from the plan text, all
+    deliberate: (a) `cameras[].width/height/fps/fourcc` are nullable
+    (null = leave the device default) — calibrate always locks concrete
+    values, but a hand-written minimal entry should not be forced to
+    guess; fps checks are skipped/soft when unset. (b) `to_gray` picks
+    the packed-YUV luma plane by fourcc (UYVY → channel 1) instead of
+    the plan's hard-coded channel 0, which is wrong for UYVY (U Y V Y
+    interleave) and would have made every raw UYVY frame undecodable
+    chroma; arrival checklist still verifies. (c) The `Backend` enum
+    lives in config.py (the field that validates against it lives
+    there); the quirk *data* stays in sources/controls.py as planned.
+    (d) `calibrate --name` (+ id default `cam-main`) can create a fresh
+    entry on a machine with an empty config — without it, first-ever
+    calibration would require hand-writing YAML first. (e)
+    `PipelineRunner.stop()` closes a watchdog-wrapped source (see #32) —
+    found during integration testing; without it, graceful shutdown
+    during a camera outage hangs forever. (f) BUFFERSIZE is reported
+    honestly but marked informational and never fed to a hard gate:
+    DSHOW/MSMF do not implement it, and gating on it would have failed
+    every Windows calibrate/selftest (found by adversarial review).
+    Residual known gap: a driver hang inside the `cv2.VideoCapture()`
+    *constructor* (before any handle exists) is not releasable by
+    `close()`; reads/sets after construction are covered. If constructor
+    hangs appear on arrival day, move reopen onto a supervised worker
+    thread with the zombie accounting.
+39. **soak_short lengthened 2.5 → 6 minutes (owner ruling at Phase 3
+    close-out).** The 2.5-minute fit window sat almost entirely inside
+    macOS's lazy page-reclaim ramp: freed per-segment memory stays
+    resident until the kernel reclaims it, so a fresh process measured
+    +260..+800 MB/min of phantom "growth" on leak-free code — reproduced
+    on pristine Phase 2 HEAD in a clean worktree, while a 6-minute run of
+    the identical harness measured **−6 MB/min with final RSS below the
+    post-warmup baseline** (no leak; the harness already `gc.collect()`s
+    each dead runner's cyclic graph per segment). The amendment changes
+    only the window (6 min, 90 s warmup); the 8 MB/min slope gate and
+    1.3× final/baseline ratio are unchanged, and the 2 h `tools/soak.py`
+    run remains the authoritative memory gate.

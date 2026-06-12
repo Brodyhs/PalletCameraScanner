@@ -54,6 +54,10 @@ _KNOWN_GAUGES = frozenset(
         "dmtx_calls",
         "fallback_calls",
         "budget_overruns",
+        "source_stalls",
+        "source_reconnects",
+        "source_reopen_failures",
+        "source_zombie_readers",
     }
 )
 
@@ -238,6 +242,12 @@ class MetricsRegistry:
                 "per_hour": round(per_hour, 2),
             },
             "misses": {"emitted": self._gauge("misses_emitted")},
+            "source": {
+                "stalls": self._gauge("source_stalls"),
+                "reconnects": self._gauge("source_reconnects"),
+                "reopen_failures": self._gauge("source_reopen_failures"),
+                "zombie_readers": self._gauge("source_zombie_readers"),
+            },
             "read_rate_1h": read_rate,
             "events": {
                 "handled": self._gauge("events_handled"),
