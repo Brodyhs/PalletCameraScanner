@@ -87,6 +87,7 @@ class EvidenceWriter:
             return EvidenceRef(directory=None, frame_count=0, error=repr(exc))
         kept = frames[:: max(1, cfg.frame_stride)]
         written: list[Frame] = []
+        error: str | None = None
         for f in kept:
             path = target / f"frame_{f.frame_index:08d}.jpg"
             # cv2.imwrite signals failure (full disk, lost permission,
@@ -98,6 +99,15 @@ class EvidenceWriter:
             else:
                 log.error("evidence frame write failed: %s", path)
         if len(written) < len(kept):
+            # Lost frames are an evidence failure too: the meta.json that
+            # follows can still write on a near-full disk (it is tiny), so
+            # without flagging here the miss would report fully-evidenced
+            # with frames silently dropped, defeating the loud-degradation
+            # guarantee the error field exists for (REVIEW finding 1).
+            error = (
+                f"{len(kept) - len(written)}/{len(kept)} "
+                "evidence frame(s) failed to write"
+            )
             log.error(
                 "evidence burst %s incomplete: %d/%d frames written",
                 candidate_id,
@@ -112,13 +122,16 @@ class EvidenceWriter:
             "written_utc": now_iso(),
             **meta,
         }
-        error: str | None = None
         try:
             (target / "meta.json").write_text(
                 json.dumps(payload, indent=2), encoding="utf-8"
             )
         except OSError as exc:
-            error = repr(exc)
+            # Append, never clobber: a burst that lost frames AND its meta
+            # (the same full disk causes both) must report both causes, not
+            # just the last one observed.
+            meta_err = repr(exc)
+            error = meta_err if error is None else f"{error}; meta.json: {meta_err}"
             log.error(
                 "evidence meta.json for %s failed (%r); burst kept %d "
                 "frame(s) without metadata", candidate_id, exc, len(written),

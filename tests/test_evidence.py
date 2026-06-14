@@ -141,6 +141,51 @@ def test_meta_json_failure_keeps_frames_and_flags_ref(
     assert ref.error is not None
 
 
+def test_lost_frames_flag_ref_even_when_meta_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REVIEW finding 1 (this commit's residual gap): cv2.imwrite fails
+    soft (returns False) on a near-full disk, but the few-hundred-byte
+    meta.json still squeaks through — so write_burst returned error=None
+    and the miss reported fully-evidenced with 0 frames. A frame-loss burst
+    must flag error so evidence_failures / MissEvent.evidence_error fire."""
+    import cv2
+
+    cfg = EvidenceConfig(dir=tmp_path / "ev", frame_stride=1)
+    writer = EvidenceWriter(cfg)
+    monkeypatch.setattr(cv2, "imwrite", lambda *a, **k: False)
+    ref = writer.write_burst("cam0-000020", _frames(3), {})  # must not raise
+    assert ref.directory is not None
+    assert ref.frame_count == 0  # every frame failed to write
+    assert ref.error is not None  # the regression: was None pre-fix
+    assert "3/3" in ref.error
+    # meta.json still landed — proving the flag came from the frame path,
+    # not the meta path (the discriminator against pre-fix code).
+    assert (ref.directory / "meta.json").is_file()
+
+
+def test_partial_frame_loss_flags_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Half the strided frames fail: the burst is degraded, not clean."""
+    import cv2
+
+    cfg = EvidenceConfig(dir=tmp_path / "ev", frame_stride=1)
+    writer = EvidenceWriter(cfg)
+    original = cv2.imwrite
+    calls = {"n": 0}
+
+    def fail_every_other(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs) if calls["n"] % 2 else False
+
+    monkeypatch.setattr(cv2, "imwrite", fail_every_other)
+    ref = writer.write_burst("cam0-000021", _frames(4), {})
+    assert ref.directory is not None
+    assert 0 < ref.frame_count < 4
+    assert ref.error is not None
+
+
 def test_same_candidate_id_never_overwrites_existing_burst(
     tmp_path: Path,
 ) -> None:
