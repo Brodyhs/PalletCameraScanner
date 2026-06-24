@@ -247,6 +247,8 @@ def test_snapshot_key_contract() -> None:
         "dmtx_calls",
         "fallback_calls",
         "budget_overruns",
+        "spurious_rejected",
+        "idle_reads",
     }
     assert set(snap["passes"]) == {"emitted", "merged", "per_hour"}
     assert set(snap["frames"]) == {"processed", "dropped", "errors"}

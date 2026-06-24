@@ -357,10 +357,14 @@ def test_close_unblocks_read_hung_inside_connect_verify() -> None:
     assert errors and "closed during connect" in str(errors[0])
 
 
-def test_connect_warns_but_continues_on_ignored_controls(
+def test_connect_reports_backend_unverifiable_controls_as_info_not_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Run-path policy: frames at slightly-wrong exposure beat no frames."""
+    """Run-path readback honesty: on a controls-unreliable backend
+    (AVFoundation) the controls were APPLIED but readback can't confirm
+    them — that is 'asserted but unverifiable' (INFO), NOT a 'control
+    unverified after connect' failure (WARNING + mismatch). Frames still
+    flow either way."""
     from palletscan.config import Backend as B
     from tests.camera_fakes import avfoundation_hooks
 
@@ -374,18 +378,26 @@ def test_connect_warns_but_continues_on_ignored_controls(
         backend=B.AVFOUNDATION,
         settings={"exposure_auto": False, "exposure": -6.0, "gain": 5.0},
     )
-    with caplog.at_level(logging.WARNING, logger="palletscan.sources.camera"):
+    with caplog.at_level(logging.INFO, logger="palletscan.sources.camera"):
         src = CameraSource(
             cfg,
             capture_factory=factory,
             device_lister=_lister(backend=int(cv2.CAP_AVFOUNDATION)),
             clock=clock,
         )
-    warning = next(
-        r for r in caplog.records if "unverified after connect" in r.message
+    # No genuine-failure WARNING and no mismatch bump for these.
+    assert not any(
+        "unverified after connect" in r.message for r in caplog.records
     )
-    assert "exposure" in warning.message
-    assert "buffersize" not in warning.message  # informational: never warned
+    assert src.connect_mismatches == 0
+    info = next(
+        r
+        for r in caplog.records
+        if "asserted but unverifiable" in r.message
+    )
+    assert "avfoundation" in info.message
+    assert "exposure" in info.message
+    assert "buffersize" not in info.message  # informational: never reported here
     assert len(list(itertools.islice(src.frames(), 2))) == 2  # still streams
     src.close()
 

@@ -72,7 +72,7 @@ def test_many_decodes_one_pass_event(setup) -> None:
     _feed_frames(tracker, buffer, range(0, 10))
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))
     for i in (11, 13, 15):
-        tracker.on_decode([_decode("PLT-000001", i)])
+        tracker.on_decode("cam0-000001", [_decode("PLT-000001", i)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 20))
     assert len(events) == 1
     ev = events[0]
@@ -98,7 +98,7 @@ def test_confirmed_set_on_first_decode(setup) -> None:
     tracker, _, _ = setup
     ctx = tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 5))
     assert not ctx.confirmed
-    tracker.on_decode([_decode("PLT-000002", 6)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-000002", 6)])
     assert ctx.confirmed
 
 
@@ -106,12 +106,12 @@ def test_same_payload_within_window_merges(setup) -> None:
     tracker, buffer, events = setup
     # first sighting closes at frame 20 (t=0.67s)
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))
-    tracker.on_decode([_decode("PLT-000003", 12)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-000003", 12)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 20))
     # second sighting ~5 s later -> merged
     base = 20 + int(5 * FPS)
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000002", base))
-    tracker.on_decode([_decode("PLT-000003", base + 2)])
+    tracker.on_decode("cam0-000002", [_decode("PLT-000003", base + 2)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000002", base + 10))
     assert len([e for e in events if isinstance(e, PassEvent)]) == 1
     assert tracker.passes_merged == 1
@@ -120,11 +120,11 @@ def test_same_payload_within_window_merges(setup) -> None:
 def test_same_payload_after_window_is_new_pass(setup) -> None:
     tracker, buffer, events = setup
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))
-    tracker.on_decode([_decode("PLT-000004", 12)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-000004", 12)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 20))
     base = 20 + int(13 * FPS)  # 13 s later, > 12 s window
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000002", base))
-    tracker.on_decode([_decode("PLT-000004", base + 2)])
+    tracker.on_decode("cam0-000002", [_decode("PLT-000004", base + 2)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000002", base + 10))
     assert len([e for e in events if isinstance(e, PassEvent)]) == 2
 
@@ -169,7 +169,7 @@ def test_flush_finalizes_pending_misses(setup) -> None:
 def test_flush_closes_open_decoded_segment(setup) -> None:
     tracker, buffer, events = setup
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))
-    tracker.on_decode([_decode("PLT-000009", 12)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-000009", 12)])
     tracker.flush()
     assert len(events) == 1
     assert isinstance(events[0], PassEvent)
@@ -311,7 +311,7 @@ def test_pass_wall_time_uses_close_ts_mapping() -> None:
         _RecordingWriter(), ts_to_wall=lambda ts: iso_at(2000.0 + ts)
     )
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))
-    tracker.on_decode([_decode("PLT-000020", 12)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-000020", 12)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 20))
     assert len(events) == 1
     assert events[0].wall_time_iso == iso_at(2000.0 + 20 / FPS)
@@ -326,13 +326,13 @@ def test_seed_recent_bridges_restart_window() -> None:
     tracker.seed_recent({"PLT-RESTART": -5.0})
     # Re-sighting closing at ts 5.0: 10 s since the stored pass <= 12.
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 148))
-    tracker.on_decode([_decode("PLT-RESTART", 149)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-RESTART", 149)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 150))
     assert events == []
     assert tracker.passes_merged == 1
     # A different payload is unaffected.
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000002", 160))
-    tracker.on_decode([_decode("PLT-FRESH", 161)])
+    tracker.on_decode("cam0-000002", [_decode("PLT-FRESH", 161)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000002", 170))
     assert [e.payload for e in events if isinstance(e, PassEvent)] == ["PLT-FRESH"]
 
@@ -344,7 +344,7 @@ def test_seed_recent_beyond_window_emits() -> None:
     tracker.seed_recent({"PLT-RESTART": -5.0})
     close = int(8.0 * FPS)  # close_ts 8.0: 13 s since the stored pass > 12
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", close - 10))
-    tracker.on_decode([_decode("PLT-RESTART", close - 5)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-RESTART", close - 5)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", close))
     assert len([e for e in events if isinstance(e, PassEvent)]) == 1
     assert tracker.passes_merged == 0
@@ -353,8 +353,92 @@ def test_seed_recent_beyond_window_emits() -> None:
 def test_two_payloads_in_one_segment_emit_two_events(setup) -> None:
     tracker, buffer, events = setup
     tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))
-    tracker.on_decode([_decode("PLT-000010", 11)])
-    tracker.on_decode([_decode("PLT-000011", 12)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-000010", 11)])
+    tracker.on_decode("cam0-000001", [_decode("PLT-000011", 12)])
     tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 20))
     payloads = {e.payload for e in events if isinstance(e, PassEvent)}
     assert payloads == {"PLT-000010", "PLT-000011"}
+
+
+# -- TIER 2: concurrent segments (multi-object tracking) ----------------------
+
+
+def test_concurrent_segments_decode_independently(setup) -> None:
+    """Two segments open at once; decodes route to the right one by
+    candidate_id, yielding two distinct PassEvents."""
+    tracker, buffer, events = setup
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 10))
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000002", 11))
+    tracker.on_decode("cam0-000001", [_decode("PLT-AAA", 12)])
+    tracker.on_decode("cam0-000002", [_decode("PLT-BBB", 12)])
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 20))
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000002", 21))
+    passes = [e for e in events if isinstance(e, PassEvent)]
+    assert {p.payload for p in passes} == {"PLT-AAA", "PLT-BBB"}
+    by_payload = {p.payload: p for p in passes}
+    assert by_payload["PLT-AAA"].candidate_ids == ["cam0-000001"]
+    assert by_payload["PLT-BBB"].candidate_ids == ["cam0-000002"]
+
+
+def test_one_concurrent_segment_misses_while_other_passes(setup) -> None:
+    """The core account-for-everything win: A decodes, B does not. Exactly
+    one PassEvent(A) and one MissEvent(B), with DISTINCT evidence dirs — a
+    decoded pallet can no longer swallow a co-located undecoded one's miss."""
+    tracker, buffer, events = setup
+    _feed_frames(tracker, buffer, range(0, 30))
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 30))  # A
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000002", 30))  # B
+    _feed_frames(tracker, buffer, range(30, 50))
+    tracker.on_decode("cam0-000001", [_decode("PLT-PASS", 35)])  # only A decodes
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 50))
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000002", 50))
+    # A emits immediately; B's miss waits out the post-roll deadline.
+    _feed_frames(tracker, buffer, range(50, 50 + int(2.0 * FPS) + 2))
+    passes = [e for e in events if isinstance(e, PassEvent)]
+    misses = [e for e in events if isinstance(e, MissEvent)]
+    assert len(passes) == 1 and passes[0].payload == "PLT-PASS"
+    assert len(misses) == 1 and misses[0].candidate_id == "cam0-000002"
+    # Distinct evidence directories (separate reservoirs).
+    assert Path(misses[0].evidence_dir).is_dir()
+    assert misses[0].candidate_id not in passes[0].candidate_ids
+
+
+def test_on_frame_feeds_all_open_reservoirs(tmp_path: Path) -> None:
+    """on_frame feeds EVERY open segment's reservoir, so two concurrent misses
+    each get their own non-empty evidence burst.
+
+    The reservoir is the ONLY frame source here: pre-roll is empty (the
+    segments open before any frame is buffered) and post-roll is disabled
+    (``post_s=0`` -> the post re-extract window ``ts > close_ts`` is empty). So
+    a non-empty burst REQUIRES the per-segment reservoir feed in ``on_frame``;
+    if that feed were a no-op the bursts would be empty and this fails. (The
+    weaker version of this test passed even with the feed disabled, because a
+    2 s post-roll backfilled the segment window from the shared buffer.)"""
+    events: list = []
+    buffer = RollingFrameBuffer(horizon_s=5.0)
+    tracker = PassTracker(
+        dedup_cfg=DedupConfig(window_s=12.0),
+        # pre_s=0: even the open-time snapshot extracts nothing (and the buffer
+        # is empty at open anyway). post_s=0: no post-roll backfill.
+        buffer_cfg=BufferConfig(pre_s=0.0, post_s=0.0),
+        evidence=EvidenceWriter(EvidenceConfig(dir=tmp_path / "ev", frame_stride=1)),
+        buffer=buffer,
+        emit=events.append,
+        source_id="cam0",
+    )
+    # Open BOTH segments with an empty buffer -> no pre-roll snapshot.
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000001", 20))
+    tracker.on_segment_open(_seg(SegmentKind.OPEN, "cam0-000002", 20))
+    _feed_frames(tracker, buffer, range(20, 40))  # ONLY the reservoir feed here
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000001", 40))
+    tracker.on_segment_close(_seg(SegmentKind.CLOSE, "cam0-000002", 40))
+    # post_s=0 -> deadline == close_ts; the next frame's clock tick finalizes.
+    _feed_frames(tracker, buffer, range(40, 45))
+    misses = [e for e in events if isinstance(e, MissEvent)]
+    assert len(misses) == 2
+    for m in misses:
+        d = Path(m.evidence_dir)
+        assert d.is_dir()
+        # Frames here can ONLY have come from the reservoir feed.
+        assert list(d.glob("*.jpg")), f"{m.candidate_id} got an empty burst"
+        assert m.evidence_frame_count > 0, m.candidate_id

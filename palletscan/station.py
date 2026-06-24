@@ -34,7 +34,7 @@ from palletscan.app import (
     build_sinks,
     reconcile_truth,
 )
-from palletscan.config import AppConfig
+from palletscan.config import AppConfig, StationPolicy
 from palletscan.events.bus import EventBus
 from palletscan.events.dedup import (
     CrossCameraDeduper,
@@ -231,9 +231,22 @@ class StationRunner:
         except Exception as exc:
             with self._lock:
                 self._errors.append((source_id, exc))
-            log.exception("station runner %s failed; stopping the others", source_id)
-            # A half-running trial silently biases the A/B comparison.
-            self.stop()
+            if self._cfg.station.on_arm_failure is StationPolicy.STOP_ALL:
+                # A half-running trial silently biases the A/B comparison, so the
+                # default stops every arm and lets the supervisor restart all.
+                log.exception(
+                    "station runner %s failed; stop_all -> stopping the others",
+                    source_id,
+                )
+                self.stop()
+            else:
+                # continue_others: one camera beats none — the healthy arm(s)
+                # keep scanning; only this arm is lost (REVIEW REL-1).
+                log.exception(
+                    "station runner %s failed; continue_others -> healthy arm(s) "
+                    "keep running",
+                    source_id,
+                )
 
     def run(self, stats_interval_s: float | None = None) -> StationSummary:
         """Run all per-camera pipelines to completion and report."""
@@ -270,13 +283,29 @@ class StationRunner:
                 )
             )
         if self._errors:
-            source_id, exc = self._errors[0]
-            # Chain from the runner error's cause so a WatchdogEscalation
-            # survives to the CLI's exit-code mapping (cli inspects
-            # exc.__cause__ -> exit 3).
-            raise RuntimeError(
-                f"station runner {source_id!r} failed"
-            ) from (exc.__cause__ or exc)
+            # continue_others tolerates ARM failures as long as a healthy arm
+            # produced a summary (one camera beats none); a business-bus drain
+            # failure is never tolerated. stop_all raises on any error as before.
+            bus_errors = [(s, e) for s, e in self._errors if s == "business-bus"]
+            tolerate = (
+                self._cfg.station.on_arm_failure is StationPolicy.CONTINUE_OTHERS
+                and bool(self._summaries)
+                and not bus_errors
+            )
+            if tolerate:
+                for s, e in self._errors:
+                    log.error(
+                        "station arm %r failed but continue_others kept the other "
+                        "arm(s) scanning: %r", s, e,
+                    )
+            else:
+                source_id, exc = self._errors[0]
+                # Chain from the runner error's cause so a WatchdogEscalation
+                # survives to the CLI's exit-code mapping (cli inspects
+                # exc.__cause__ -> exit 3).
+                raise RuntimeError(
+                    f"station runner {source_id!r} failed"
+                ) from (exc.__cause__ or exc)
 
         reconciliation = None
         synth_sources = [

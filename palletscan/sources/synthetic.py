@@ -48,6 +48,13 @@ class _PassPlan:
     pole_x: int | None  # static foreground occluder (pallet passes behind it)
     pole_w: int
     params: dict
+    # Generalized 2-D trajectory (top-left start + per-frame velocity). Default
+    # None/0 keeps the legacy horizontal model (SyntheticSource uses y_top +
+    # px_per_frame); CameraInjectionSource sets these for varied directions.
+    x0: float | None = None
+    y0: float | None = None
+    vx: float = 0.0
+    vy: float = 0.0
 
 
 class SyntheticSource(FrameSource):

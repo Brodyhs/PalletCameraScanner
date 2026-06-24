@@ -26,7 +26,7 @@ from palletscan.events.evidence import EvidenceWriter
 from palletscan.events.http_sink import HttpSink
 from palletscan.events.sinks import ConsoleSink, JsonlSink, Sink, SqliteSink
 from palletscan.metrics import MetricsRegistry
-from palletscan.pipeline.decode_engine import DecodeEngine
+from palletscan.pipeline.decode_engine import DecodeEngine, PassDecodeContext
 from palletscan.pipeline.motion_gate import MotionGate
 from palletscan.pipeline.pass_tracker import PassTracker
 from palletscan.pipeline.rolling_buffer import RollingFrameBuffer
@@ -42,6 +42,7 @@ from palletscan.types import (
     GroundTruthRecord,
     MissEvent,
     PassEvent,
+    Roi,
     SegmentKind,
     iso_at,
 )
@@ -212,7 +213,7 @@ class PipelineRunner:
         self.metrics = MetricsRegistry(cfg.metrics)
         self._collector = _ListSink()
         self._bus = EventBus(sinks + [self._collector, _MetricsSink(self.metrics)])
-        self._frame_q = DroppingQueue(maxsize=64)
+        self._frame_q = DroppingQueue(maxsize=cfg.frame_queue_size)
         self._executor: Executor = (
             ThreadPoolExecutor(
                 max_workers=cfg.decode.workers, thread_name_prefix="decode"
@@ -221,6 +222,11 @@ class PipelineRunner:
             else ProcessPoolExecutor(max_workers=cfg.decode.workers)
         )
         self._gate = MotionGate(cfg.motion, source.source_id)
+        # Static/idle scan (opt-in motion.idle_scan_s): read static codes when no
+        # motion segment is open. Additive — never feeds the pass/miss accounting.
+        self._idle_scan_s = cfg.motion.idle_scan_s
+        self._last_idle_scan = 0.0
+        self._idle_reads = 0
         self._engine = DecodeEngine(
             cfg.decode, self._executor, observe_wall_ms=self.metrics.record_decode_wall_ms
         )
@@ -296,6 +302,8 @@ class PipelineRunner:
             dmtx_calls=lambda: self._engine.counters.dmtx_calls,
             fallback_calls=lambda: self._engine.counters.fallback_calls,
             budget_overruns=lambda: self._engine.counters.budget_overruns,
+            spurious_rejected=lambda: self._engine.counters.spurious_rejected,
+            idle_reads=lambda: self._idle_reads,
         )
         # Watchdog counters stay the single source of truth (same lazy-gauge
         # pattern); non-camera runs report zeros in the "source" section.
@@ -376,8 +384,7 @@ class PipelineRunner:
             # post-gap frames are never pallet-exit evidence, and a segment
             # spanning the gap would let a decoded pallet on this side
             # swallow the pre-gap pallet's MissEvent (REVIEW finding 2).
-            broke = self._gate.break_segment()
-            if broke is not None:
+            for broke in self._gate.break_segment():
                 self._tracker.on_segment_close(broke)
             self._tracker.flush_pending()
         # Deadline work runs BEFORE this frame enters the rolling buffer: a
@@ -385,16 +392,47 @@ class PipelineRunner:
         # before _finalize_miss harvests them (REVIEW finding b4).
         self._tracker.on_frame(frame)
         self._buffer.append(frame)
-        result, seg_event = self._gate.update(frame)
-        if seg_event is not None and seg_event.kind is SegmentKind.OPEN:
-            self._tracker.on_segment_open(seg_event)
-        ctx = self._tracker.open_ctx
+        result, seg_events = self._gate.update(frame)
+        # Opens first so a same-frame open->decode sees its own context.
+        for ev in seg_events:
+            if ev.kind is SegmentKind.OPEN:
+                self._tracker.on_segment_open(ev)
         decodes: list[DecodeResult] = []
-        if result.active and result.roi is not None and ctx is not None:
-            decodes = self._engine.decode_frame(frame, result.roi, ctx)
-            self._tracker.on_decode(decodes)
-        if seg_event is not None and seg_event.kind is SegmentKind.CLOSE:
-            self._tracker.on_segment_close(seg_event)
+        if result.tracks:
+            # Multi-object mode: decode each OPEN track's ROI independently and
+            # route its decodes to that track's segment, so a decoded pallet
+            # never swallows a co-located undecoded one's MissEvent. A track's
+            # ``track_id`` IS its segment candidate_id (set by the gate).
+            for track in result.tracks:
+                ctx = self._tracker.ctx_for(track.track_id)
+                if ctx is None:
+                    continue
+                td = self._engine.decode_frame(frame, track.roi, ctx)
+                self._tracker.on_decode(track.track_id, td)
+                if td:
+                    decodes = decodes + td
+        elif result.active and result.roi is not None:
+            ctx = self._tracker.open_ctx
+            if ctx is not None:
+                decodes = self._engine.decode_frame(frame, result.roi, ctx)
+                self._tracker.on_decode(result.candidate_id, decodes)
+        if (
+            not self._tracker.has_open
+            and self._idle_scan_s > 0.0
+            and frame.ts - self._last_idle_scan >= self._idle_scan_s
+        ):
+            # No motion segment open: periodically full-frame-decode so a STOPPED
+            # pallet / static code is still read + shown. Additive to the preview
+            # + idle_reads counter ONLY — never the segment pass/miss accounting.
+            self._last_idle_scan = frame.ts
+            h, w = frame.image.shape[:2]
+            idle = self._engine.decode_frame(frame, Roi(0, 0, w, h), PassDecodeContext())
+            if idle:
+                self._idle_reads += len(idle)
+                decodes = decodes + idle
+        for ev in seg_events:
+            if ev.kind is SegmentKind.CLOSE:
+                self._tracker.on_segment_close(ev)
         if self.preview is not None:
             self.preview.update(frame, result, decodes)
 
@@ -427,8 +465,7 @@ class PipelineRunner:
             # Always flush: pending misses must become events even when the
             # loop died, or open segments vanish without a trace.
             try:
-                tail = self._gate.flush()
-                if tail is not None:
+                for tail in self._gate.flush():
                     self._tracker.on_segment_close(tail)
                 self._tracker.flush()
             except Exception as exc:

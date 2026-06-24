@@ -73,9 +73,34 @@ class LivePreview:
             stamp = self._stamp
         if frame is None:
             return None, stamp
-        # All drawing happens on a private BGR copy outside the lock.
-        image = cv2.cvtColor(frame.image, cv2.COLOR_GRAY2BGR)
-        if motion is not None and motion.active and motion.roi is not None:
+        # All drawing happens on a private BGR copy outside the lock. Apply the
+        # cosmetic preview brightness boost to the camera image FIRST so overlays
+        # drawn on top stay vivid (view-only; capture/decode are unaffected).
+        base = frame.image
+        if self._cfg.preview_gain != 1.0:
+            base = cv2.convertScaleAbs(base, alpha=self._cfg.preview_gain)
+        image = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+        if motion is not None and motion.tracks:
+            # Multi-object mode: one amber box + small track-id label per track.
+            for track in motion.tracks:
+                roi = track.roi.clamp(frame.image.shape)
+                cv2.rectangle(
+                    image,
+                    (roi.x, roi.y),
+                    (roi.x + roi.w, roi.y + roi.h),
+                    _MOTION_COLOR,
+                    2,
+                )
+                cv2.putText(
+                    image,
+                    track.track_id,
+                    (roi.x, max(14, roi.y - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    _MOTION_COLOR,
+                    1,
+                )
+        elif motion is not None and motion.active and motion.roi is not None:
             roi = motion.roi.clamp(frame.image.shape)
             cv2.rectangle(
                 image,

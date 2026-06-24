@@ -10,6 +10,7 @@ from __future__ import annotations
 import enum
 import math
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -132,6 +133,17 @@ class SyntheticConfig(_StrictModel):
     idle_s_range: tuple[float, float] = (0.3, 1.5)
     realtime: bool = False
     payload_prefix: str = "PLT-"
+    #: Travel directions a pass may take across the frame (one chosen per pass).
+    #: Default ["right"] preserves the original left->right behavior (tests rely
+    #: on it); the demo passes a varied set. Allowed: right left up down
+    #: upright upleft downright downleft.
+    directions: list[str] = Field(default_factory=lambda: ["right"])
+    #: Max simultaneously-composited passes (CameraInjectionSource only). 1 =
+    #: one code at a time (default; tests rely on it). >1 shows MULTIPLE moving
+    #: codes at once for multi-object demos (decode + preview already render a
+    #: box per code). NOTE: concurrent codes share one motion segment, so an
+    #: undecoded co-located code is not miss-flagged — keep them decodable.
+    max_concurrent: int = 1
 
     @field_validator(
         "speed_mph_range",
@@ -174,11 +186,90 @@ class MotionConfig(_StrictModel):
     open_frames: int = 3
     quiet_frames: int = 8  # consecutive quiet frames to close a segment
     roi_pad_px: int = 32
+    #: Static/idle scan (user request): 0 (default) = purely motion-gated
+    #: (CPU-cheap; static codes are NOT read). Set > 0 to ALSO full-frame-decode
+    #: every N seconds while no motion segment is open, so a STOPPED pallet /
+    #: static code is still read + shown. These idle reads are additive (shown on
+    #: the dashboard + counted as decode.idle_reads) and never feed the
+    #: motion-segment pass/miss accounting.
+    idle_scan_s: float = 0.0
+    #: TIER 2 multi-object tracking (opt-in). "single" (default) is the
+    #: historical whole-mask-union gate — ONE segment at a time — byte-for-byte
+    #: unchanged. "multi" segments the motion mask into per-object blobs,
+    #: associates them across frames (greedy IoU + centroid), and runs an
+    #: INDEPENDENT open/close debounce + decode + pass/miss accounting per
+    #: track, so two pallets crossing the zone at once are each accounted for
+    #: (a decoded pallet can no longer swallow a co-located undecoded one's
+    #: MissEvent). ``min_area_frac`` stays the WHOLE-MASK floor in both modes.
+    tracking: Literal["single", "multi"] = "single"
+    #: Multi mode: cap on simultaneously-tracked blobs per frame (largest by
+    #: area win); bounds the per-frame association cost.
+    track_max_objects: int = 8
+    #: Multi mode: minimum IoU for a blob<->track association candidate.
+    track_iou_gate: float = 0.2
+    #: Multi mode: centroid-distance association fallback, as a fraction of the
+    #: frame diagonal (covers fast objects whose boxes no longer overlap).
+    track_centroid_max_frac: float = 0.15
+    #: Multi mode: per-blob area floor as a fraction of the (downscaled) mask
+    #: area — rejects noise specks that the whole-mask floor would let through.
+    track_min_blob_area_frac: float = 0.004
+    #: Multi mode: a split/merge ambiguity must persist this many consecutive
+    #: frames before it is committed (anti-churn hysteresis).
+    track_merge_hysteresis_frames: int = 4
+    #: Multi mode: morphological-close kernel as a fraction of downscale_width,
+    #: applied to the mask before connected-components so ONE object's fragmented
+    #: motion blob coalesces into a SINGLE component instead of minting several
+    #: churny micro-tracks (each of which opens + closes as a spurious miss).
+    #: Sized to bridge intra-object gaps without fusing separate objects; 0 off.
+    track_close_kernel_frac: float = 0.04
+
+    @field_validator("track_max_objects")
+    @classmethod
+    def _max_objects_min(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"motion.track_max_objects must be >= 1, got {v}")
+        return v
+
+    @field_validator(
+        "track_iou_gate",
+        "track_centroid_max_frac",
+        "track_min_blob_area_frac",
+    )
+    @classmethod
+    def _frac_unit_interval(cls, v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f"motion track fraction must be in (0, 1], got {v}")
+        return v
+
+    @field_validator("track_merge_hysteresis_frames")
+    @classmethod
+    def _hysteresis_min(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"motion.track_merge_hysteresis_frames must be >= 1, got {v}"
+            )
+        return v
+
+    @field_validator("track_close_kernel_frac")
+    @classmethod
+    def _close_frac_unit(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(
+                f"motion.track_close_kernel_frac must be in [0, 1], got {v}"
+            )
+        return v
 
 
 class ExecutorKind(enum.StrEnum):
     THREAD = "thread"
     PROCESS = "process"
+
+
+class DecodeEngineKind(enum.StrEnum):
+    """Which decode backend the cascade uses."""
+
+    LEGACY = "legacy"  # pyzbar (QR) + pylibdmtx (DM) cascade — the default
+    ZXING = "zxing"  # zxing-cpp: one call, both symbologies, more robust
 
 
 class DecodeConfig(_StrictModel):
@@ -187,12 +278,20 @@ class DecodeConfig(_StrictModel):
     symbology_priority: list[Symbology] = Field(
         default_factory=lambda: [Symbology.QR, Symbology.DATAMATRIX]
     )
+    engine: DecodeEngineKind = DecodeEngineKind.LEGACY
     frame_budget_ms: float = 50.0
     dm_timeout_ms: int = 40
     executor: ExecutorKind = ExecutorKind.THREAD
     workers: int = 2
     fallback_after_frames: int = 4  # undecoded frames before preprocessing variants
     confirmations: int = 1
+    #: Optional payload-shape gate (REVIEW DEC-01): a regex a decoded payload
+    #: must match to count as a real pass — the defense against decoder
+    #: false-positives becoming "phantom" passes. None = permissive (only empty/
+    #: control-byte garbage is dropped, no behavior change). For a trial, set to
+    #: your label format, e.g. "^PLT-\\d{6}$". Non-matching decodes are dropped
+    #: and counted as decode.spurious_rejected.
+    payload_pattern: str | None = None
 
 
 class DedupConfig(_StrictModel):
@@ -297,6 +396,10 @@ class WebConfig(_StrictModel):
     preview_fps: float = 10.0  # MJPEG pacing per client
     preview_quality: int = 80  # JPEG encode quality
     preview_width: int = 640  # downscale target for the live view
+    #: Cosmetic brightness multiplier for the live view ONLY (does not touch
+    #: capture / exposure / decode) — brighten a dim unlit scene without the
+    #: fps / lag / noise cost of raising exposure or gain. 1.0 = off.
+    preview_gain: float = 1.0
 
     @field_validator("port")
     @classmethod
@@ -417,6 +520,10 @@ class Backend(enum.StrEnum):
     DSHOW = "dshow"
     MSMF = "msmf"
     AVFOUNDATION = "avfoundation"
+    #: DirectShow SampleGrabber via pygrabber — for mono (Y8/Y12) cameras that
+    #: OpenCV's MSMF/DSHOW backends cannot read (e.g. See3CAM_37CUGM). See
+    #: palletscan.sources.pygrabber_capture.
+    PYGRABBER = "pygrabber"
 
 
 class CameraSettings(_StrictModel):
@@ -437,6 +544,43 @@ class CameraSettings(_StrictModel):
     brightness: float | None = None
 
 
+class CameraIdentity(_StrictModel):
+    """Stable-hardware identity guard for the MSMF wrong-camera-swap risk.
+
+    The color See3CAM_24CUG runs ``backend: msmf`` + a pinned index, so it
+    is opened BY POSITION with no identity check: a replug reorder or an
+    OBS Virtual Camera grabbing index 0 silently swaps in the wrong camera
+    at the same 1920x1200, which the first-frame shape gate cannot catch.
+    This block lets an operator pin the expected hardware fingerprint and
+    choose how hard a drift is enforced.
+
+    DORMANT BY DEFAULT: ``policy='warn'`` reproduces today's exact
+    non-raising behavior (a single WARNING + a connect_mismatches bump,
+    never an exception). Operators opt into ``'strict'`` deliberately,
+    after ``calibrate --save`` has stamped a fingerprint to compare
+    against. ``expected_vid_pid``/``expected_device_path`` are normally
+    populated by calibrate, not hand-edited.
+    """
+
+    policy: Literal["strict", "warn", "off"] = "warn"
+    #: ``xxxx:xxxx`` hex (vid:pid), normalized to lowercase. None = not pinned.
+    expected_vid_pid: str | None = None
+    #: Full Windows DevicePath; the strongest fingerprint when present.
+    expected_device_path: str | None = None
+
+    @field_validator("expected_vid_pid")
+    @classmethod
+    def _vid_pid_shape(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        norm = v.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", norm):
+            raise ValueError(
+                f"expected_vid_pid must be 'xxxx:xxxx' hex (vid:pid), got {v!r}"
+            )
+        return norm
+
+
 class CameraConfig(_StrictModel):
     """One physical camera, identified by device-name substring (never a
     bare index — indexes shuffle on reboot/replug)."""
@@ -455,6 +599,8 @@ class CameraConfig(_StrictModel):
     #: Achieved-fps sample seconds per (re)connect; 0 disables.
     connect_verify_s: float = 1.0
     settings: CameraSettings = Field(default_factory=CameraSettings)
+    #: MSMF wrong-camera-swap guard; dormant (warn) by default.
+    identity: CameraIdentity = Field(default_factory=CameraIdentity)
 
     @field_validator("id", "name")
     @classmethod
@@ -545,12 +691,34 @@ class WatchdogConfig(_StrictModel):
         return v
 
 
+class StationPolicy(enum.StrEnum):
+    """What a multi-camera (A/B) station does when ONE arm's pipeline fails."""
+
+    #: Stop the whole station so the supervisor restarts everything. Keeps an
+    #: A/B comparison valid (a half-running trial silently biases it) — the
+    #: right default for science / a matched A/B validation run.
+    STOP_ALL = "stop_all"
+    #: Let the failed arm stop in isolation while the healthy arm(s) keep
+    #: scanning and publishing — one camera beats none for an unattended
+    #: PRODUCTION station (REVIEW REL-1).
+    CONTINUE_OTHERS = "continue_others"
+
+
+class StationConfig(_StrictModel):
+    """Multi-camera (A/B) station behavior."""
+
+    #: stop_all preserves the existing fail-fast default; continue_others is the
+    #: availability-first option for an unattended deployment.
+    on_arm_failure: StationPolicy = StationPolicy.STOP_ALL
+
+
 class AppConfig(_StrictModel):
     source: SourceConfig = Field(default_factory=SourceConfig)
     synthetic: SyntheticConfig = Field(default_factory=SyntheticConfig)
     video: VideoConfig = Field(default_factory=VideoConfig)
     cameras: list[CameraConfig] = Field(default_factory=list)
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
+    station: StationConfig = Field(default_factory=StationConfig)
     motion: MotionConfig = Field(default_factory=MotionConfig)
     decode: DecodeConfig = Field(default_factory=DecodeConfig)
     dedup: DedupConfig = Field(default_factory=DedupConfig)
@@ -562,6 +730,11 @@ class AppConfig(_StrictModel):
     report: ReportConfig = Field(default_factory=ReportConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     lock: LockConfig = Field(default_factory=LockConfig)
+    #: Per-source capture->pipeline frame buffer depth (drops oldest when full).
+    #: 64 absorbs decode bursts for account-for-everything; a live-view/demo wants
+    #: it SMALL — a FIFO backlog is queue_depth/fps of latency when the pipeline
+    #: can't keep up (the heavy mono cam at 72fps shows ~1s lag at depth 64).
+    frame_queue_size: int = 64
 
     @model_validator(mode="after")
     def _unique_camera_ids(self) -> "AppConfig":

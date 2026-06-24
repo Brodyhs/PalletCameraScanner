@@ -33,11 +33,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from palletscan.config import AppConfig, apply_overrides
+from palletscan.config import AppConfig, Backend, apply_overrides
 from palletscan.sources.base import FrameSource
 from palletscan.sources.camera import (
     CaptureFactory,
     DeviceLister,
+    _pygrabber_capture_factory,
     default_capture_factory,
 )
 from palletscan.sources.controls import (
@@ -203,7 +204,12 @@ def _check_cameras(
         except ValueError as exc:
             checks.append(CheckResult(f"{name}/resolve", False, str(exc)))
             continue
-        cap = capture_factory(index, flag)
+        # Per-backend capture dispatch (mirrors CameraSource.__init__): the
+        # pygrabber mono cannot be opened by cv2, so it needs its own factory.
+        if cam.backend is Backend.PYGRABBER and capture_factory is default_capture_factory:
+            cap = _pygrabber_capture_factory(cam)(index, flag)
+        else:
+            cap = capture_factory(index, flag)
         try:
             if not cap.isOpened():
                 checks.append(
@@ -217,10 +223,18 @@ def _check_cameras(
             )
             quirks = quirks_for(cam.backend)
             reports = apply_mode(cap, cam) + apply_settings(
-                cap, cam.settings, quirks
+                cap, cam.settings, quirks, backend_name=cam.backend.value
             )
+            # Readback honesty: a control whose readback the backend cannot
+            # confirm (verifiable=False) is 'asserted', not failed — count it
+            # as bad ONLY if the device actively REJECTED the set (accepted
+            # False). Otherwise the rule is unchanged: verified or
+            # informational pass; a reliable-backend mismatch fails.
             bad = [
-                r.prop for r in reports if not (r.verified or r.informational)
+                r.prop
+                for r in reports
+                if not (r.verified or r.informational)
+                and not (not r.verifiable and r.accepted)
             ]
             checks.append(
                 CheckResult(

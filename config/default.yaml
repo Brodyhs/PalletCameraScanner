@@ -56,6 +56,14 @@ cameras: []
 #    read_fail_limit: 5           # consecutive read failures before reconnect
 #    connect_verify_s: 1.0        # achieved-fps sample per (re)connect; 0 disables
 #    settings: {exposure_auto: false, exposure: -6, gain: 10, brightness: null}
+#    # Wrong-camera-swap guard (MSMF opens by position). DORMANT by default:
+#    # policy 'warn' = today's behavior (warn + count, never raise). Flip to
+#    # 'strict' only AFTER `calibrate --save` stamps the fingerprint below;
+#    # 'off' skips the check. expected_* are normally written by calibrate.
+#    identity:
+#      policy: warn                # strict | warn | off
+#      expected_vid_pid: null      # "xxxx:xxxx" hex (vid:pid); calibrate fills it
+#      expected_device_path: null  # full Windows DevicePath; strongest fingerprint
 #  - id: cam-mono
 #    name: "See3CAM_37CUGM"
 #    backend: auto
@@ -64,6 +72,7 @@ cameras: []
 #    height: 1552
 #    fps: 72.0
 #    settings: {exposure_auto: false, exposure: -6, gain: 10, brightness: null}
+#    identity: {policy: warn, expected_vid_pid: null, expected_device_path: null}
 
 # Stall detection + reconnect for live cameras (synthetic/video unaffected).
 # Never gives up by default: backoff caps at retry.cap_s forever; the two

@@ -890,6 +890,20 @@ def _cmd_replay(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to a legacy code page (cp1252) and so does the
+    # locale encoding used when stdout is piped; the formatted reports use
+    # non-ASCII glyphs (box rules etc.), which raises UnicodeEncodeError and
+    # crashes selftest/synth/run output on the factory PC. Force UTF-8 up front
+    # (no-op where stdout is already UTF-8, e.g. macOS/Linux; guarded so a
+    # replaced/captured stream without reconfigure() is simply skipped).
+    for _stream in (sys.stdout, sys.stderr):
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if _reconfigure is not None:
+            try:
+                _reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
     # No option abbreviations anywhere: an abbreviated --data-dir spelling
     # ("--data") used to slip past supervise's append gate and silently run
     # the child on the wrong data dir (REVIEW finding b1).

@@ -28,6 +28,64 @@ TASKS_PER_RUN = 60
 WORKER_COUNTS = (1, 2, 4)
 
 
+def _make_hard_workload() -> list[tuple[str, np.ndarray, Symbology, str]]:
+    """Harder QR+DM crops (low pitch x heavier motion blur) to separate a
+    robust decoder from a fragile one. Each item carries its true payload."""
+    work = []
+    for ppm in (2.5, 3.0, 4.0):
+        for blur_modules in (0.5, 1.0, 1.5):
+            payload = f"PLT-{int(ppm * 100):06d}"
+            for rendered in (render_qr(payload, ppm), render_datamatrix(payload, ppm)):
+                img = motion_blur(rendered.image, blur_modules * ppm)
+                canvas = np.full((img.shape[0] + 80, img.shape[1] + 80), 120, np.uint8)
+                canvas[40 : 40 + img.shape[0], 40 : 40 + img.shape[1]] = img
+                work.append(
+                    (
+                        f"{rendered.symbology.value}@{ppm}ppm/{blur_modules}mod",
+                        canvas,
+                        rendered.symbology,
+                        payload,
+                    )
+                )
+    return work
+
+
+def _compare_read_rate() -> None:
+    """Legacy (pyzbar+pylibdmtx) vs zxing-cpp: read rate + latency on hard codes."""
+    work = _make_hard_workload()
+    pyz, dmtx = PyzbarDecoder(), PylibdmtxDecoder()
+
+    def legacy(img: np.ndarray, sym: Symbology) -> list[str]:
+        dec = pyz if sym is Symbology.QR else dmtx
+        hits = dec.decode(img) if sym is Symbology.QR else dec.decode(img, 100)
+        return [h.payload for h in hits]
+
+    engines: list[tuple[str, object]] = [("legacy", legacy)]
+    try:
+        from palletscan.pipeline.decoders import ZxingDecoder
+
+        zx = ZxingDecoder()
+        engines.append(("zxing", lambda img, _sym: [h.payload for h in zx.decode(img)]))
+    except RuntimeError:
+        print("(zxing-cpp not installed — pip install zxing-cpp to compare)\n")
+
+    print(f"== Read rate on {len(work)} hard QR/DM codes (low pitch x motion blur) ==")
+    print(f"{'engine':<10} {'reads':>8} {'rate':>7} {'p50 ms':>8} {'p95 ms':>8}")
+    for label, fn in engines:
+        reads, lat = 0, []
+        for _name, img, sym, payload in work:
+            t = time.perf_counter()
+            got = fn(img, sym)
+            lat.append((time.perf_counter() - t) * 1000)
+            reads += payload in got
+        p95 = statistics.quantiles(lat, n=20)[18] if len(lat) >= 20 else max(lat)
+        print(
+            f"{label:<10} {reads:>5}/{len(work):<2} {reads / len(work):>6.0%} "
+            f"{statistics.median(lat):>8.1f} {p95:>8.1f}"
+        )
+    print()
+
+
 def _make_workload() -> list[tuple[str, np.ndarray, Symbology]]:
     """QR + DM crops at 3 pitches x 2 degradation levels, pasted on gray."""
     work = []
@@ -76,6 +134,8 @@ def _bench(executor_cls, workers: int, tasks) -> tuple[float, float, float]:
 
 
 def main() -> int:
+    _compare_read_rate()
+
     base = _make_workload()
     tasks = (base * (TASKS_PER_RUN // len(base) + 1))[:TASKS_PER_RUN]
 

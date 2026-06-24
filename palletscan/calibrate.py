@@ -9,7 +9,8 @@ into the YAML config (spec §8). ``--preview`` adds an optional cv2 window
 
 Hard-fail policy mirrors the control layer's: unverified controls or a
 dead exposure control fail calibration on ``controls_reliable`` backends
-and print an honest warning on AVFoundation dev machines.
+(DSHOW) and print an honest warning where readback is unreliable (MSMF,
+AVFoundation).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from palletscan.config import (
     AppConfig,
     Backend,
     CameraConfig,
+    CameraIdentity,
     resolve_camera,
     upsert_camera_yaml,
 )
@@ -46,7 +48,12 @@ from palletscan.sources.controls import (
     quirks_for,
     verify_exposure_effect,
 )
-from palletscan.sources.devices import backend_flag, find_device, list_devices
+from palletscan.sources.devices import (
+    backend_flag,
+    find_device,
+    identity_for_name,
+    list_devices,
+)
 from palletscan.sources.probe import (
     ModeCandidate,
     candidates_for,
@@ -192,6 +199,12 @@ def run_calibration(
     quirks = quirks_for(backend)
     make_cap = lambda: capture_factory(index, flag)  # noqa: E731
 
+    # Capture the chosen device's stable hardware fingerprint so --save can
+    # stamp it for the identity guard. The POLICY is left at its default
+    # ('warn'): calibrate records the fingerprint, the operator opts into
+    # 'strict' deliberately later. None on macOS / when no DevicePath.
+    captured_identity = identity_for_name(devices, entry.name)
+
     # -- probe ---------------------------------------------------------------
     pinned = any(v is not None for v in (opts.fourcc, opts.width, opts.height, opts.fps))
     seed_cap = make_cap()
@@ -235,6 +248,24 @@ def run_calibration(
         settings = settings.model_copy(update={"exposure": opts.exposure})
     if opts.gain is not None:
         settings = settings.model_copy(update={"gain": opts.gain})
+    # Stamp the identity fingerprint (device_path + vid:pid) onto the entry,
+    # keeping whatever policy the operator already configured (default 'warn')
+    # so the strict opt-in is deliberate. When no identity is available the
+    # block is left at its defaults.
+    if captured_identity is not None:
+        vid_pid = (
+            f"{captured_identity.vid}:{captured_identity.pid}"
+            if captured_identity.vid and captured_identity.pid
+            else None
+        )
+        identity = entry.identity.model_copy(
+            update={
+                "expected_device_path": captured_identity.device_path,
+                "expected_vid_pid": vid_pid,
+            }
+        )
+    else:
+        identity = entry.identity
     locked = entry.model_copy(
         update={
             "backend": backend,
@@ -243,16 +274,40 @@ def run_calibration(
             "height": chosen.candidate.height,
             "fps": chosen.candidate.fps,
             "settings": settings,
+            "identity": identity,
         }
     )
+    if captured_identity is not None:
+        say(
+            "captured identity fingerprint: "
+            f"device_path={captured_identity.device_path!r} "
+            f"vid:pid={locked.identity.expected_vid_pid} "
+            f"(policy={locked.identity.policy})"
+        )
+    else:
+        say(
+            "captured identity fingerprint: unavailable on this platform/device "
+            "(no DevicePath) — identity guard will fall back to NAME match only"
+        )
 
     rc = 0
     cap = make_cap()
     try:
-        reports = apply_mode(cap, locked) + apply_settings(cap, settings, quirks)
+        reports = apply_mode(cap, locked) + apply_settings(
+            cap, settings, quirks, backend_name=backend.value
+        )
         log_reports(f"calibrate cameras[{locked.id}]", reports)
         for r in reports:
-            mark = "ok" if r.verified else ("info" if r.informational else "MISMATCH")
+            if r.verified:
+                mark = "ok"
+            elif r.informational:
+                mark = "info"
+            elif not r.verifiable:
+                # Applied, but readback can't confirm it on this backend:
+                # honest 'asserted', NOT a failure (would read as MISMATCH).
+                mark = "asserted"
+            else:
+                mark = "MISMATCH"
             say(
                 f"  {r.prop:<14} requested {r.requested:<12g} readback "
                 f"{r.readback:<12g} {mark} {r.note}"
@@ -273,8 +328,9 @@ def run_calibration(
                 rc = 1
             else:
                 say(
-                    "warning: controls unverified — expected on AVFoundation "
-                    "dev machines; verify on the Windows target"
+                    "warning: controls unverified — readback is unreliable on "
+                    "this backend; trusting the exposure-effect and "
+                    "achieved-fps checks instead"
                 )
 
         # -- live metrics loop -------------------------------------------------

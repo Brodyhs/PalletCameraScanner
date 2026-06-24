@@ -14,16 +14,16 @@ from palletscan.calibrate import CalibrateOptions, focus_metric, run_calibration
 from palletscan.config import AppConfig, load_config
 from palletscan.selftest import SELFTEST_ASSETS
 from palletscan.sources.controls import fourcc_float
-from palletscan.sources.devices import devices_from_names
+from palletscan.sources.devices import DeviceInfo, IdentityInfo, devices_from_names
 from palletscan.types import Symbology
 from tests.camera_fakes import FakeCapture, FakeCaptureFactory, FakeClock
 
 MSMF = int(cv2.CAP_MSMF)
 
 
-def _lister(*names: str):
+def _lister(*names: str, backend: int = MSMF):
     return lambda: devices_from_names(
-        list(names) or ["See3CAM_24CUG"], MSMF
+        list(names) or ["See3CAM_24CUG"], backend
     )
 
 
@@ -162,6 +162,61 @@ def test_save_upserts_locked_entry(tmp_path: Path) -> None:
     assert saved.dedup.window_s == 9.0  # neighbors untouched
 
 
+def test_save_stamps_identity_fingerprint_leaving_policy_default(
+    tmp_path: Path,
+) -> None:
+    """calibrate --save stamps the chosen device's device_path + vid:pid into
+    identity, but leaves policy at the default 'warn' so the operator opts
+    into strict deliberately. The captured fingerprint is also printed."""
+    clock = FakeClock()
+    config_path = tmp_path / "station.yaml"
+
+    def lister():
+        return [
+            DeviceInfo(
+                name="See3CAM_24CUG",
+                index=0,
+                backend=MSMF,
+                identity=IdentityInfo(
+                    friendly_name="See3CAM_24CUG",
+                    device_path=r"usb#vid_2560&pid_c128&mi_00#calib",
+                    vid="2560",
+                    pid="c128",
+                ),
+            )
+        ]
+
+    opts = CalibrateOptions(
+        seconds=0, exposure=-6.0, save=True, config_path=config_path
+    )
+    rc, out = _run(_cfg(), opts, _see3cam_factory(clock), lister, clock)
+    assert rc == 0, out
+    assert "captured identity fingerprint" in out
+    assert "vid:pid=2560:c128" in out
+    saved = load_config(config_path)
+    ident = saved.cameras[0].identity
+    assert ident.policy == "warn"  # operator opts into strict deliberately
+    assert ident.expected_vid_pid == "2560:c128"
+    assert ident.expected_device_path == r"usb#vid_2560&pid_c128&mi_00#calib"
+
+
+def test_save_without_identity_leaves_fingerprint_unset(tmp_path: Path) -> None:
+    """No identity available (macOS / name-only enumeration): --save still
+    works, prints the 'unavailable' note, and leaves the fingerprint unset."""
+    clock = FakeClock()
+    config_path = tmp_path / "station.yaml"
+    opts = CalibrateOptions(
+        seconds=0, exposure=-6.0, save=True, config_path=config_path
+    )
+    rc, out = _run(_cfg(), opts, _see3cam_factory(clock), _lister(), clock)
+    assert rc == 0, out
+    assert "captured identity fingerprint: unavailable" in out
+    ident = load_config(config_path).cameras[0].identity
+    assert ident.policy == "warn"
+    assert ident.expected_vid_pid is None
+    assert ident.expected_device_path is None
+
+
 def test_save_without_config_is_usage_error() -> None:
     clock = FakeClock()
     rc, out = _run(
@@ -210,10 +265,10 @@ def test_rejected_control_hard_fails_on_reliable_backend() -> None:
         )
 
     rc, out = _run(
-        _cfg(),  # backend msmf: controls_reliable
+        _cfg(backend="dshow"),  # DSHOW: truthful readback -> hard-fails
         CalibrateOptions(seconds=0, exposure=-6.0),
         FakeCaptureFactory(default=make),
-        _lister(),
+        _lister(backend=int(cv2.CAP_DSHOW)),
         clock,
     )
     assert rc == 1
@@ -242,7 +297,7 @@ def test_unverified_controls_warn_on_avfoundation() -> None:
         clock,
     )
     assert rc == 0, out  # honest warning, not a hard failure
-    assert "verify on the Windows target" in out
+    assert "controls unverified" in out
 
 
 def test_exit_codes_for_failure_paths() -> None:

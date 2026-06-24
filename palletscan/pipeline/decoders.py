@@ -1,8 +1,10 @@
-"""Thin wrappers over pyzbar and pylibdmtx.
+"""Thin wrappers over pyzbar, pylibdmtx, and zxing-cpp.
 
-Normalizes the two libraries' result shapes into :class:`RawDecode`, applies
+Normalizes the libraries' result shapes into :class:`RawDecode`, applies
 libdmtx's native timeout, and turns dylib-loading failures into actionable
-errors instead of bare ImportErrors.
+errors instead of bare ImportErrors. ``ZxingDecoder`` (the optional
+``decode.engine: zxing`` path) reads both QR and Data Matrix in a single call
+and is markedly more robust on blurry / low-contrast / angled codes.
 """
 
 from __future__ import annotations
@@ -27,6 +29,19 @@ def _import_pyzbar() -> ModuleType:
         return pyzbar
     except Exception as exc:
         raise RuntimeError(LIB_HELP.format(lib="zbar", pkg="zbar", err=exc)) from exc
+
+
+def _import_zxingcpp() -> ModuleType:
+    try:
+        import zxingcpp
+
+        return zxingcpp
+    except Exception as exc:
+        raise RuntimeError(
+            "decode.engine: zxing needs the zxing-cpp package — install it with "
+            "`pip install zxing-cpp` (or `pip install -e \".[zxing]\"`). "
+            f"Import failed: {exc}"
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +122,59 @@ class PylibdmtxDecoder:
                     payload=decode_payload(r.data),
                     symbology=Symbology.DATAMATRIX,
                     roi=Roi(rect.left, h - rect.top - rect.height, rect.width, rect.height),
+                )
+            )
+        return out
+
+
+class ZxingDecoder:
+    """QR + Data Matrix via zxing-cpp (the ``decode.engine: zxing`` path).
+
+    One ``read_barcodes`` call covers both symbologies; restricted to QR +
+    Data Matrix so it never burns time on 1D/PDF417 false positives. Payloads
+    go through :func:`decode_payload` (raw bytes -> str) so the lossless
+    UTF-8/Latin-1 contract holds exactly as for the other decoders.
+    """
+
+    name = "zxing"
+
+    def __init__(self) -> None:
+        self._zxing = _import_zxingcpp()
+        self._bf = self._zxing.BarcodeFormat
+        self._fmt = {
+            Symbology.QR: self._bf.QRCode,
+            Symbology.DATAMATRIX: self._bf.DataMatrix,
+        }
+
+    def decode(
+        self, gray: np.ndarray, symbologies: tuple[Symbology, ...] | None = None
+    ) -> list[RawDecode]:
+        syms = symbologies or (Symbology.QR, Symbology.DATAMATRIX)
+        formats = [self._fmt[s] for s in syms if s in self._fmt]
+        if not formats:
+            return []
+        results = self._zxing.read_barcodes(
+            np.ascontiguousarray(gray), formats=formats
+        )
+        out: list[RawDecode] = []
+        for b in results:
+            if not b.valid:
+                continue
+            if b.format == self._bf.QRCode:
+                sym = Symbology.QR
+            elif b.format == self._bf.DataMatrix:
+                sym = Symbology.DATAMATRIX
+            else:
+                continue
+            p = b.position
+            xs = (p.top_left.x, p.top_right.x, p.bottom_right.x, p.bottom_left.x)
+            ys = (p.top_left.y, p.top_right.y, p.bottom_right.y, p.bottom_left.y)
+            x0, y0 = min(xs), min(ys)
+            out.append(
+                RawDecode(
+                    payload=decode_payload(bytes(b.bytes)),
+                    symbology=sym,
+                    roi=Roi(int(x0), int(y0), int(max(xs) - x0), int(max(ys) - y0)),
                 )
             )
         return out

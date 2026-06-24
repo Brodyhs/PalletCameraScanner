@@ -8,6 +8,7 @@ import pytest
 from palletscan.config import Backend, CameraConfig, CameraSettings
 from palletscan.sources.controls import (
     QUIRKS,
+    ControlReport,
     all_verified,
     apply_mode,
     apply_settings,
@@ -135,11 +136,86 @@ def test_dshow_quantized_exposure_counts_as_verified() -> None:
 
 
 def test_avfoundation_ignored_sets_reported_unverified() -> None:
+    # AVFoundation is controls-unreliable: readback cannot confirm the write,
+    # so each control is reported verifiable=False (asserted, not confirmed)
+    # with the backend named in the note — not a verification 'failure'.
     cap = FakeCapture(hooks=avfoundation_hooks())
     settings = CameraSettings(exposure_auto=False, exposure=-6.0, gain=5.0)
-    reports = apply_settings(cap, settings, quirks_for(Backend.AVFOUNDATION))
+    reports = apply_settings(
+        cap, settings, quirks_for(Backend.AVFOUNDATION), backend_name="avfoundation"
+    )
     assert not any(r.verified for r in reports)
-    assert all("rejected" in r.note for r in reports)
+    assert all(not r.verifiable for r in reports)
+    assert all("not confirmed" in r.note.lower() for r in reports)
+    assert all("avfoundation" in r.note for r in reports)
+    # all_verified tolerates an unverifiable control (warn-not-gate).
+    assert all_verified(reports)
+
+
+# -- readback honesty: verifiable=False ----------------------------------------
+
+
+def test_control_report_verifiable_default_true() -> None:
+    r = ControlReport(
+        prop="exposure", requested=-6.0, accepted=True, readback=-6.0, verified=True
+    )
+    assert r.verifiable is True
+
+
+def test_unverifiable_report_renders_asserted_not_confirmed() -> None:
+    # MSMF: readback can't confirm the write -> verified False, verifiable
+    # False, and the note states intent (asserted), naming the backend.
+    cap = FakeCapture(hooks=msmf_hooks())
+    reports = apply_settings(
+        cap,
+        CameraSettings(exposure_auto=False, exposure=-6.0, gain=10.0),
+        quirks_for(Backend.MSMF),
+        backend_name="msmf",
+    )
+    exposure = next(r for r in reports if r.prop == "exposure")
+    assert exposure.verifiable is False
+    assert exposure.verified is False
+    assert "intent asserted, not confirmed" in exposure.note
+    assert "msmf" in exposure.note
+
+
+def test_unverifiable_report_does_not_fail_all_verified() -> None:
+    # A mixed bag: one reliable verified control + one backend-unverifiable
+    # control must still pass all_verified (the unverifiable one is tolerated).
+    good = ControlReport(
+        prop="width", requested=1920.0, accepted=True, readback=1920.0, verified=True
+    )
+    unverifiable = ControlReport(
+        prop="exposure",
+        requested=-6.0,
+        accepted=True,
+        readback=0.0,
+        verified=False,
+        note="applied request=-6; readback 0 NOT trustworthy on msmf — "
+        "intent asserted, not confirmed",
+        verifiable=False,
+    )
+    assert all_verified([good, unverifiable])
+    # A genuinely failed (verifiable) control still fails the gate.
+    failed = ControlReport(
+        prop="width", requested=1920.0, accepted=True, readback=640.0, verified=False
+    )
+    assert not all_verified([good, failed])
+
+
+def test_pygrabber_backend_named_in_unverifiable_note() -> None:
+    # The note must name the ACTUAL backend, not hardcode MSMF: the 37CUGM
+    # pygrabber path says 'pygrabber'.
+    cap = FakeCapture()
+    reports = apply_settings(
+        cap,
+        CameraSettings(exposure_auto=False, exposure=-6.0),
+        quirks_for(Backend.PYGRABBER),
+        backend_name="pygrabber",
+    )
+    exposure = next(r for r in reports if r.prop == "exposure")
+    assert exposure.verifiable is False
+    assert "pygrabber" in exposure.note
 
 
 # -- measure_achieved_fps --------------------------------------------------------

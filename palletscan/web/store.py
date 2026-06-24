@@ -65,7 +65,14 @@ class ReadStore:
 
     @staticmethod
     def _detail(row: sqlite3.Row) -> dict[str, Any]:
-        detail: dict[str, Any] = json.loads(row["detail_json"])
+        # One corrupt/torn detail_json must degrade to a placeholder, not 500 the
+        # whole endpoint (matches the missing-table / pruned-evidence tolerance).
+        try:
+            detail: dict[str, Any] = json.loads(row["detail_json"])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            kind = row["kind"] if "kind" in row.keys() else None
+            log.warning("ReadStore: skipping corrupt detail_json row (kind=%s)", kind)
+            return {"kind": kind, "corrupt": True}
         return detail
 
     def recent_events(

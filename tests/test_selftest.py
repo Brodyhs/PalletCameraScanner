@@ -222,7 +222,7 @@ def test_dead_exposure_control_hard_fails_on_reliable_backend(
                 {
                     "id": "cam",
                     "name": "See3CAM_24CUG",
-                    "backend": "msmf",
+                    "backend": "dshow",  # DSHOW: truthful readback -> hard gate
                     "fps": 30.0,
                     "settings": {"exposure_auto": False, "exposure": -6.0},
                 }
@@ -234,7 +234,7 @@ def test_dead_exposure_control_hard_fails_on_reliable_backend(
     report = run_selftest(
         cfg,
         capture_factory=factory,
-        device_lister=_lister_for("See3CAM_24CUG"),
+        device_lister=_lister_for("See3CAM_24CUG", backend=int(cv2.CAP_DSHOW)),
         disk_usage=_disk(),
         clock=clock,
         data_dir=tmp_path / "scratch",

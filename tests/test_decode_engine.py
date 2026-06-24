@@ -127,3 +127,29 @@ def test_dm_priority_order_runs_dmtx_first(executor) -> None:
     results = engine.decode_frame(frame, roi, PassDecodeContext())
     assert results and results[0].decoder == "pylibdmtx"
     assert engine.counters.pyzbar_calls == 0
+
+
+def test_payload_gate_default_drops_garbage_keeps_text(executor) -> None:
+    # REVIEW DEC-01: with no pattern the gate is permissive — it drops only
+    # empty / control-byte garbage, never normal printable text.
+    engine = DecodeEngine(DecodeConfig(), executor)
+    assert engine._accept("PLT-000001")
+    assert engine._accept("Test DM 4.5 inches")
+    assert engine._accept("a\tb\nc")  # tab/newline-bearing text is fine
+    assert not engine._accept("")  # empty
+    assert not engine._accept("F\x01m")  # C0 control byte = decoder false-positive
+
+
+def test_payload_pattern_rejects_phantom_and_counts(executor) -> None:
+    # A configured pattern drops a spurious-but-valid decode (the "F'm" phantom)
+    # BEFORE it can become a confirmed pass, and counts it as spurious_rejected.
+    from palletscan.pipeline.decoders import RawDecode
+
+    cfg = DecodeConfig(payload_pattern=r"^PLT-\d{6}$")
+    engine = DecodeEngine(cfg, executor)
+    frame, _roi = _frame_with(np.zeros((8, 8), np.uint8))
+    good = RawDecode(payload="PLT-000007", symbology=Symbology.QR, roi=Roi(0, 0, 2, 2))
+    phantom = RawDecode(payload="F'm", symbology=Symbology.QR, roi=Roi(0, 0, 2, 2))
+    out = engine._results([good, phantom], frame, (0, 0), "test", time.perf_counter())
+    assert [r.payload for r in out] == ["PLT-000007"]
+    assert engine.counters.spurious_rejected == 1

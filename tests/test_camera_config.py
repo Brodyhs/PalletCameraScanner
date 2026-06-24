@@ -12,6 +12,7 @@ from palletscan.config import (
     AppConfig,
     Backend,
     CameraConfig,
+    CameraIdentity,
     CameraSettings,
     load_config,
     resolve_camera,
@@ -101,6 +102,51 @@ def test_duplicate_camera_ids_rejected() -> None:
 def test_camera_field_validators(field: str, value: object) -> None:
     with pytest.raises(ValidationError):
         _cam(**{field: value})
+
+
+def test_camera_identity_default_is_dormant_warn() -> None:
+    # The identity guard is additive and dormant by default: a plain camera
+    # gets policy='warn' with no pinned fingerprint (today's behavior).
+    cam = _cam()
+    assert cam.identity.policy == "warn"
+    assert cam.identity.expected_vid_pid is None
+    assert cam.identity.expected_device_path is None
+
+
+def test_camera_identity_vid_pid_normalized_and_validated() -> None:
+    ident = CameraIdentity(expected_vid_pid="2560:C128")
+    assert ident.expected_vid_pid == "2560:c128"  # lowercased
+    assert CameraIdentity(expected_vid_pid=None).expected_vid_pid is None
+    for bad in ["2560-c128", "256:c128", "zzzz:c128", "2560c128", "2560:c12"]:
+        with pytest.raises(ValidationError):
+            CameraIdentity(expected_vid_pid=bad)
+
+
+def test_camera_identity_strict_policy_parses_from_yaml(tmp_path: Path) -> None:
+    p = tmp_path / "cams.yaml"
+    p.write_text(
+        """
+cameras:
+  - id: cam-color
+    name: "See3CAM_24CUG"
+    backend: msmf
+    fallback_index: 0
+    identity:
+      policy: strict
+      expected_vid_pid: "2560:c128"
+      expected_device_path: "usb#vid_2560&pid_c128&mi_00#x"
+""",
+        encoding="utf-8",
+    )
+    cam = load_config(p).cameras[0]
+    assert cam.identity.policy == "strict"
+    assert cam.identity.expected_vid_pid == "2560:c128"
+    assert cam.identity.expected_device_path == "usb#vid_2560&pid_c128&mi_00#x"
+
+
+def test_camera_identity_rejects_unknown_policy() -> None:
+    with pytest.raises(ValidationError):
+        CameraIdentity(policy="paranoid")
 
 
 def test_watchdog_validators() -> None:

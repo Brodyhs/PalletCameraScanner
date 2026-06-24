@@ -42,8 +42,15 @@ from palletscan.sources.controls import (
     log_reports,
     measure_achieved_fps,
     quirks_for,
+    resolve_backend,
 )
-from palletscan.sources.devices import DeviceInfo, backend_flag, find_device, list_devices
+from palletscan.sources.devices import (
+    DeviceInfo,
+    backend_flag,
+    find_device,
+    identity_for_name,
+    list_devices,
+)
 from palletscan.sources.video import packed_luma_channel_for, to_gray
 from palletscan.types import Frame
 
@@ -88,6 +95,19 @@ def default_capture_factory(index: int, backend: int) -> Capture:
     return cv2.VideoCapture(index, backend)
 
 
+def _pygrabber_capture_factory(cfg: CameraConfig) -> CaptureFactory:
+    """Capture factory for the pygrabber backend. Lazy-imports pygrabber so
+    the dependency is only touched when a pygrabber camera is actually built,
+    and closes over ``cfg`` to hand the DirectShow graph its target geometry."""
+
+    def factory(index: int, backend: int) -> Capture:
+        from palletscan.sources.pygrabber_capture import PyGrabberCapture
+
+        return PyGrabberCapture(index, width=cfg.width, height=cfg.height)
+
+    return factory
+
+
 class CameraSource(FrameSource):
     """One live UVC camera, configured and persisted by ``cameras[]`` entry."""
 
@@ -104,8 +124,16 @@ class CameraSource(FrameSource):
     ) -> None:
         self._cfg = cfg
         # Resolved at call time (not def time) so tests can patch the
-        # module-level defaults for end-to-end CLI coverage.
-        self._capture_factory = capture_factory or default_capture_factory
+        # module-level defaults for end-to-end CLI coverage. The pygrabber
+        # backend needs the camera's target geometry at construction (the
+        # DirectShow format is fixed before the graph runs), so it gets a
+        # cfg-closed factory instead of the cv2 default.
+        if capture_factory is not None:
+            self._capture_factory = capture_factory
+        elif cfg.backend is Backend.PYGRABBER:
+            self._capture_factory = _pygrabber_capture_factory(cfg)
+        else:
+            self._capture_factory = default_capture_factory
         self._device_lister = device_lister or list_devices
         self._clock = clock
         # ``epoch`` lets StationRunner anchor every camera's ts=0 at ONE
@@ -138,6 +166,9 @@ class CameraSource(FrameSource):
         #: source.connect_mismatches health metric.
         self.connect_mismatches = 0
         self._shape_checked = False  # first delivered frame per connection
+        #: Live device enumeration captured during _resolve(), reused by
+        #: _guard_identity() so the identity check costs no extra lister call.
+        self._enumerated: list[DeviceInfo] = []
         self._connect()  # fail fast: refuse to run blind
 
     @property
@@ -168,6 +199,10 @@ class CameraSource(FrameSource):
         """
         cfg = self._cfg
         devices = self._device_lister()
+        # Stash the live enumeration so _guard_identity() can resolve the
+        # expected fingerprint WITHOUT a second lister call (reopen counts
+        # lister invocations: one per connect).
+        self._enumerated = devices
         flag = backend_flag(cfg.backend)
         if devices:
             dev = find_device(devices, cfg.name)
@@ -230,8 +265,9 @@ class CameraSource(FrameSource):
                 cap.release()
                 raise CameraConnectError(f"camera {cfg.id}: closed during connect")
             self._cap = cap
+        backend_name = resolve_backend(cfg.backend).value
         reports = apply_mode(cap, cfg) + apply_settings(
-            cap, cfg.settings, quirks_for(cfg.backend)
+            cap, cfg.settings, quirks_for(cfg.backend), backend_name=backend_name
         )
         log_reports(f"camera {cfg.id} connect", reports)
         # (Re)connect policy: control VALUES may differ silently (warned and
@@ -240,19 +276,52 @@ class CameraSource(FrameSource):
         # format the device actually negotiated, and the first delivered
         # frame is shape-verified in frames() (REVIEW findings 3/8 policy).
         self._apply_negotiated_format(fourcc_str(cap.get(cv2.CAP_PROP_FOURCC)))
+        # Loud device-identity line so an operator can catch a wrong-device swap
+        # (esp. the color cam under MSMF, which opens by a PINNED INDEX and cannot
+        # verify the name — REVIEW finding 9). The first-frame shape gate in
+        # frames() rejects a resolution mismatch; this surfaces a same-resolution
+        # impostor by making the opened identity visible in the logs.
+        log.info(
+            "camera %s: OPENED via %s at index %d -> %dx%d fourcc %s (confirm this is %r)",
+            cfg.id, cfg.backend.value, index,
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            fourcc_str(cap.get(cv2.CAP_PROP_FOURCC)), cfg.name,
+        )
+        # Identity guard: dormant under the default policy='warn'. Runs after
+        # the OPENED line (so the operator sees what we opened) and BEFORE
+        # connect-verify (a wrong-camera swap should be caught before we
+        # spend a second sampling its frame rate). May raise under 'strict'.
+        self._guard_identity()
         self._shape_checked = False
-        if not all_verified(reports):
+        # Split the post-connect control accounting into two honest buckets:
+        #   (a) genuinely unverifiable-by-backend (verifiable=False) — the
+        #       write was asserted but readback can't confirm it on this
+        #       backend; INFO, never a mismatch, never logged as 'verified';
+        #   (b) actually failed — accepted=False, or a reliable-backend
+        #       readback mismatch; WARNING + connect_mismatches (the old path).
+        gate_relevant = [r for r in reports if not r.informational]
+        unverifiable = [r for r in gate_relevant if not r.verifiable]
+        failed = [
+            r for r in gate_relevant if r.verifiable and not r.verified
+        ]
+        if unverifiable:
+            log.info(
+                "camera %s: %d control(s) asserted but unverifiable on %s: %s",
+                cfg.id,
+                len(unverifiable),
+                backend_name,
+                [f"{r.prop}=<{r.requested:g}>" for r in unverifiable],
+            )
+        if failed:
             # Warn-and-continue on the run path: frames at slightly-wrong
             # exposure beat no frames. Calibrate/selftest are the strict path.
-            unverified = [
-                r.prop for r in reports if not (r.verified or r.informational)
-            ]
             self.connect_mismatches += 1
             log.warning(
                 "camera %s: %d control(s) unverified after connect: %s",
                 cfg.id,
-                len(unverified),
-                unverified,
+                len(failed),
+                [r.prop for r in failed],
             )
         if cfg.connect_verify_s > 0:
             m = measure_achieved_fps(
@@ -278,6 +347,144 @@ class CameraSource(FrameSource):
             # close() raced the connect: the published capture is already
             # released; report the connect as failed rather than succeeded.
             raise CameraConnectError(f"camera {cfg.id}: closed during connect")
+
+    def _guard_identity(self) -> None:
+        """Detect a silent wrong-camera swap (REVIEW finding 9).
+
+        The color See3CAM_24CUG opens BY POSITION under MSMF (pinned index,
+        no name check), so a replug reorder or an OBS Virtual Camera at the
+        same 1920x1200 swaps in the wrong device under the shape gate's
+        radar. We resolve the EXPECTED identity by finding ``cfg.name`` in
+        the live DSHOW enumeration and compare it to the calibrated
+        fingerprint.
+
+        INDIRECT PROOF, stated plainly: under MSMF the capture index !=
+        the DSHOW enumeration index, so we canNOT fingerprint the handle
+        OpenCV actually opened. We assert instead that the *enumeration*
+        the name resolves to still matches calibration — i.e. it has not
+        drifted. A name+identity match means the configured camera is still
+        present and consistent with calibration, not a direct read of the
+        opened MSMF device.
+
+        Policy ladder (strongest available wins):
+          * device_path (when both expected and actual are present)
+          * else vid:pid (when both present)
+          * else name-only (identity unavailable) — never a strict raise on
+            its own UNLESS MSMF is pinned and nothing could be fingerprinted
+
+        policy='off'  -> skip entirely (no resolution work).
+        policy='warn' -> DEFAULT, today's exact behavior: a single explicit
+            WARNING on mismatch + connect_mismatches; never raises.
+        policy='strict' -> raise CameraConnectError on a VID/PID/device_path
+            mismatch, OR when MSMF is pinned and NO identity could be obtained
+            to even attempt the check.
+        """
+        cfg = self._cfg
+        ident_cfg = cfg.identity
+        if ident_cfg.policy == "off":
+            return
+        strict = ident_cfg.policy == "strict"
+        msmf_pinned = resolve_backend(cfg.backend) is Backend.MSMF
+
+        actual = identity_for_name(self._enumerated, cfg.name)
+        if actual is None:
+            # Identity simply unavailable: macOS/AVFoundation (no property
+            # bag), an unreadable DevicePath, or the fallback_index path
+            # where enumeration is empty. We proceed on NAME match only and
+            # do NOT claim the device is confirmed.
+            msg = (
+                f"camera {cfg.id}: identity unverifiable on this "
+                f"platform/device — proceeding on NAME match only"
+            )
+            if strict and msmf_pinned and (
+                ident_cfg.expected_device_path or ident_cfg.expected_vid_pid
+            ):
+                # Operator pinned a fingerprint and demanded strict under the
+                # by-position MSMF backend, but we cannot obtain ANY identity
+                # to check it: refuse to run blind rather than silently
+                # opening whatever sits at the pinned index.
+                raise CameraConnectError(
+                    f"camera {cfg.id}: identity policy 'strict' under MSMF but "
+                    "no identity could be obtained to verify the configured "
+                    f"name {cfg.name!r} against the pinned fingerprint "
+                    "(expected_device_path/expected_vid_pid). Refusing to open "
+                    "by position with no identity check. Recalibrate, or set "
+                    "identity.policy: warn."
+                )
+            log.info(msg)
+            return
+
+        # Nothing pinned: there is no calibrated fingerprint to compare. We
+        # have the actual identity (visible in the OPENED line + logged here)
+        # but cannot assert drift. Under strict this is benign — strict gates
+        # a *mismatch*, and with no expectation there is nothing to mismatch.
+        expected_path = ident_cfg.expected_device_path
+        expected_vp = ident_cfg.expected_vid_pid
+        if not expected_path and not expected_vp:
+            log.info(
+                "camera %s: identity present (vid:pid %s, path %r) but no "
+                "expected fingerprint pinned — name match only",
+                cfg.id,
+                f"{actual.vid}:{actual.pid}" if actual.vid else None,
+                actual.device_path,
+            )
+            return
+
+        # Strongest available comparison wins (device_path, else vid:pid).
+        mismatch_detail: str | None = None
+        if expected_path and actual.device_path:
+            if expected_path != actual.device_path:
+                mismatch_detail = (
+                    f"expected device_path {expected_path!r}, "
+                    f"got {actual.device_path!r}"
+                )
+        elif expected_vp and actual.vid:
+            actual_vp = f"{actual.vid}:{actual.pid}"
+            if expected_vp != actual_vp:
+                mismatch_detail = (
+                    f"expected vid:pid {expected_vp}, got {actual_vp}"
+                )
+        else:
+            # An expectation is pinned but the actual device carries no
+            # comparable field (e.g. expected a path, device only exposes
+            # vid:pid, or vice-versa): cannot confirm OR deny — unverifiable.
+            log.info(
+                "camera %s: identity unverifiable — pinned fingerprint has no "
+                "comparable field on the live device (expected path=%r vid:pid=%s; "
+                "actual path=%r vid:pid=%s); proceeding on NAME match only",
+                cfg.id,
+                expected_path,
+                expected_vp,
+                actual.device_path,
+                f"{actual.vid}:{actual.pid}" if actual.vid else None,
+            )
+            return
+
+        if mismatch_detail is None:
+            confirmed_by = (
+                f"device_path {actual.device_path!r}"
+                if expected_path and actual.device_path
+                else f"vid:pid {actual.vid}:{actual.pid}"
+            )
+            log.info("camera %s: identity confirmed (%s)", cfg.id, confirmed_by)
+            return
+
+        # Mismatch.
+        if strict:
+            raise CameraConnectError(
+                f"camera {cfg.id}: identity MISMATCH — {mismatch_detail}. The "
+                f"configured name {cfg.name!r} resolves to a different physical "
+                "device than calibration (a replug reorder or a virtual camera "
+                "may have taken the slot). Refusing to scan the wrong camera."
+            )
+        self.connect_mismatches += 1
+        log.warning(
+            "camera %s: identity MISMATCH — %s. Configured name %r resolves to "
+            "a different device than calibration; continuing (policy=warn).",
+            cfg.id,
+            mismatch_detail,
+            cfg.name,
+        )
 
     def _apply_negotiated_format(self, negotiated: str) -> None:
         """Derive the packed-YUV luma channel from the NEGOTIATED fourcc.
