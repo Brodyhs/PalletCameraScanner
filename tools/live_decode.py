@@ -50,7 +50,9 @@ class Decoder(threading.Thread):
         super().__init__(daemon=True)
         self._lock = threading.Lock()
         self._gray = None
-        self._stop = threading.Event()
+        # NOT "_stop": that shadows threading.Thread's private _stop()
+        # method (called by join() on 3.11) — see tools/soak.py.
+        self._stop_evt = threading.Event()
         self.payload = ""
         self.hit_t = 0.0
 
@@ -59,10 +61,10 @@ class Decoder(threading.Thread):
             self._gray = gray
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             with self._lock:
                 gray, self._gray = self._gray, None
             if gray is None:

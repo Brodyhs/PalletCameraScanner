@@ -83,7 +83,12 @@ class RssSampler(threading.Thread):
     def __init__(self, interval_s: float) -> None:
         super().__init__(name="rss-sampler", daemon=True)
         self._interval_s = interval_s
-        self._stop = threading.Event()
+        # NOT "_stop": threading.Thread._stop is a private METHOD that
+        # join() -> _wait_for_tstate_lock() calls on finalization, so an
+        # Event bound to that name makes stop()'s own join() raise
+        # "'Event' object is not callable" (fatal on 3.11; 3.13's join
+        # refactor happened not to hit it).
+        self._stop_evt = threading.Event()
         self.samples: list[tuple[float, float]] = []  # (monotonic_s, rss_mb)
         self.cpu: list[float] = []
 
@@ -92,13 +97,13 @@ class RssSampler(threading.Thread):
 
         proc = psutil.Process()
         proc.cpu_percent(None)  # prime the delta-based meter
-        while not self._stop.wait(self._interval_s):
+        while not self._stop_evt.wait(self._interval_s):
             rss_mb = proc.memory_info().rss / (1024 * 1024)
             self.samples.append((time.monotonic(), rss_mb))
             self.cpu.append(proc.cpu_percent(None))
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
         self.join(timeout=self._interval_s + 2)
 
 
@@ -126,9 +131,11 @@ class SnapshotSampler(threading.Thread):
         self._get_runner = get_runner
         self._rss_sampler = rss_sampler
         self._path = path
-        self._stop = threading.Event()
-        # NOT "_started": threading.Thread owns that attribute (an Event its
-        # start() checks); shadowing it with a float breaks Thread.start().
+        # NOT "_stop": threading.Thread._stop is a private METHOD that
+        # join() calls on finalization — binding an Event there makes this
+        # sampler's stop()/join() raise "'Event' object is not callable"
+        # (fatal on 3.11). Likewise never shadow Thread's own _started.
+        self._stop_evt = threading.Event()
         self._t0 = time.monotonic()
         #: In-memory mirror of the lines written, for post-run drift analysis
         #: (so the gate never has to re-read/parse the file).
@@ -163,14 +170,14 @@ class SnapshotSampler(threading.Thread):
             fh.flush()
 
     def run(self) -> None:
-        while not self._stop.wait(self._interval_s):
+        while not self._stop_evt.wait(self._interval_s):
             try:
                 self._sample_once()
             except Exception:  # noqa: BLE001 — a sampler must never kill the soak
                 pass
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
         self.join(timeout=self._interval_s + 2)
 
 
