@@ -1045,6 +1045,26 @@ and where the review corrected it.
     optional roi. Built via a workflow whose adversarial re-review caught +
     fixed 2 real bugs (blocking shutdown put() on a wedged writer; the
     post_s divergence) - Opus work gets the harder review per the model
-    switch. STILL OWED (6.1 not complete): tools/replay_bursts.py (offline
-    legacy-vs-zxing re-score of a recording dir) and the measure_cpu
-    recording scenario.
+    switch. Replay harness + measure_cpu scenario that complete 6.1 landed
+    separately (see #76).
+
+76. **Replay harness: tools/replay_bursts.py + measure_cpu recording
+    scenario (2026-07-02, Opus 4.8, completes 6.1).** Reads a recording dir
+    (<day>/<candidate>/frame_*.jpg + meta.json), rebuilds an offline
+    DecodeEngine per config variant, replays each burst with an advancing
+    PassDecodeContext (fallback fan-out engages as live), and reports
+    recovery candidates (live misses now decoded), not-reproduced passes,
+    per-decoder attribution, and the legacy-vs-zxing delta. READ-ONLY over
+    the recording dir (no events/sinks/DB; writes only --out); recoveries
+    are flagged HYPOTHETICAL and never fold into the live read rate.
+    FIDELITY LIMIT found via real end-to-end testing (a synth run recorded
+    6 bursts that decoded 6/6 live but 1/6 on replay): replay re-decodes the
+    recorded FULL frames with ONE stored ROI (or full-frame), coarser than
+    the live per-frame motion ROI, so absolute replay counts UNDER-count
+    live and "not reproduced" is usually an ROI artifact, not a config
+    failure. The report leads with the LOAD-BEARING signal - the delta
+    between variants over identical frames (a burst zxing reads that legacy
+    does not). A faithful per-frame-ROI recording is a future upgrade if
+    absolute replay fidelity is ever needed. measure_cpu gains an opt-in
+    `--scenario recording` (baseline + recording ON) for the recorder CPU
+    delta; existing scenarios untouched.
