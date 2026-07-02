@@ -29,15 +29,19 @@ giving a steady stream. ``read()`` blocks for the NEXT frame (a sequence counter
 under a Condition), matching ``cv2.VideoCapture`` semantics — no stale frames, and
 ``measure_achieved_fps`` reads the real rate (~72 fps at Y8 2064x1552).
 
-Known constraint — RGB24 SampleGrabber: pygrabber hardcodes the grabber media
-type to RGB24 and its ``SampleGrabberCallback.BufferCB`` reshapes the buffer as
-``(h, w, 3)``, so a mono Y8 stream is colour-converted by an inserted DirectShow
-filter and full-copied once inside pygrabber (~9.6 MB/frame at 2064x1552) before
-``_on_frame`` slices one luma channel (one further ~3.2 MB copy — the only
-Python-side copy; cv2 needs a contiguous array). Grabbing Y800/GREY directly
-would require replacing BufferCB (pygrabber's is 3-channel-only), i.e. forking
-pygrabber internals; the measured ~63-72 fps at full res does not justify that
-fork today.
+Native Y8 grabber (perf): pygrabber DEFAULTS the grabber media type to RGB24 and
+its ``SampleGrabberCallback.BufferCB`` reshapes ``(h, w, 3)``, which would force a
+mono Y8 stream through an inserted DirectShow colour-converter (~9.6 MB/frame at
+2064x1552) plus a 9.6 MB ``np.copy`` plus a 3.2 MB luma slice — ~22.4 MB/frame,
+all serialised on the DirectShow streaming thread that gates delivery, causing
+frame drops at 72 fps. We avoid all of it: for a mono sensor the grabber is set to
+GUID_NULL ("accept the pin's native subtype") so it connects DIRECTLY to the Y8
+capture pin with no converter, and ``patch_pygrabber_subtypes`` swaps in a
+channel-aware ``BufferCB`` that reshapes ``(h, w)`` for a 1-byte buffer — one
+~3.2 MB copy total, ~7x less bandwidth. ``_on_frame`` then receives a 2-D array
+and skips its slice. If a device won't connect Y8 the connect raises; we set a
+module flag and the watchdog's next reopen falls back to the RGB24 path (which
+still works via the same channel-aware BufferCB, ``(h, w, 3)`` branch).
 
 Frame-rate honesty: pygrabber's ``set_format`` programs the capability's OWN
 media type and exposes no ``AvgTimePerFrame`` hook, so this backend can only
@@ -115,6 +119,60 @@ def _framerate_range(f: dict) -> tuple[float, float] | None:
         return None
     lo, hi = sorted(float(v) for v in lo_hi)  # type: ignore[arg-type]
     return lo, hi
+
+
+#: GUID_NULL subtype: tells the SampleGrabber "accept the pin's native media
+#: subtype" so a Y8 capture pin connects DIRECTLY (no inserted RGB24 converter).
+_GUID_NULL_STR = "{00000000-0000-0000-0000-000000000000}"
+
+#: Flips True if a device ever rejects the native-Y8 grabber connection, so
+#: subsequent opens (watchdog reconnects) fall back to pygrabber's RGB24 default
+#: instead of failing forever. Module-level because CameraSource rebuilds a fresh
+#: PyGrabberCapture per reopen — an instance flag would not survive.
+_native_y8_disabled = False
+
+
+#: Memoized channel-aware SampleGrabberCallback subclass (built lazily so the
+#: Windows-only pygrabber import stays deferred, and so comtypes builds the COM
+#: vtable from the SUBCLASS's own BufferCB — a class-level monkeypatch of the
+#: base does NOT reach comtypes' per-instance vtable and would run the stock
+#: 3-channel BufferCB on a 1-byte Y8 buffer, reading 3x past it: a hard segfault).
+_Y8_CALLBACK_CLASS: type | None = None
+
+
+def _y8_callback_class() -> type:
+    """A ``SampleGrabberCallback`` subclass whose ``BufferCB`` reshapes by the
+    buffer's ACTUAL byte count, so a native Y8 grabber (1 byte/px, ~3.2 MB at
+    2064×1552) is not misread as RGB24. Defensive: the chosen shape can never
+    require more than ``BufferLen`` bytes, so a surprising buffer skips the frame
+    rather than over-reading. Built once, memoized."""
+    global _Y8_CALLBACK_CLASS
+    if _Y8_CALLBACK_CLASS is not None:
+        return _Y8_CALLBACK_CLASS
+    from pygrabber.dshow_graph import SampleGrabberCallback
+
+    class _ChannelAwareCallback(SampleGrabberCallback):
+        def BufferCB(self, this, SampleTime, pBuffer, BufferLen):  # noqa: N802,N803
+            if not self.keep_photo:
+                return 0
+            self.keep_photo = False
+            w, h = self.image_resolution  # pygrabber stores (width, height)
+            px = h * w
+            if px <= 0:
+                return 0
+            if BufferLen >= px * 3:
+                shape: tuple[int, ...] = (h, w, 3)
+            elif BufferLen >= px:
+                shape = (h, w)
+            else:
+                return 0  # buffer smaller than one plane; skip, never over-read
+            img = np.ctypeslib.as_array(pBuffer, shape=shape)
+            img = np.flip(np.copy(img), axis=0)
+            self.callback(img)  # type: ignore[arg-type]
+            return 0
+
+    _Y8_CALLBACK_CLASS = _ChannelAwareCallback
+    return _Y8_CALLBACK_CLASS
 
 
 def patch_pygrabber_subtypes() -> None:
@@ -237,6 +295,7 @@ class PyGrabberCapture:
         self._ready = threading.Event()    # owner thread finished its open attempt
         self._stop = threading.Event()     # request owner thread to tear down
         self._grab_cb = None               # pygrabber SampleGrabberCallback (bool re-arm)
+        self._grabber_native_y8 = False    # True once connected to the native Y8 pin
 
         # camera controls: acquired on the owner thread; set() marshals here.
         self._cmd_q: queue.Queue = queue.Queue()
@@ -297,7 +356,32 @@ class PyGrabberCapture:
             graph.add_sample_grabber(self._on_frame)
             graph.add_null_render()
             self._check_stop()
-            graph.prepare_preview_graph()
+            # Mono: connect the grabber to the device's NATIVE Y8 output
+            # (GUID_NULL subtype = "any") so DirectShow inserts NO Y8->RGB24
+            # converter — cutting per-frame copy bandwidth ~7x (22.4MB -> 3.2MB)
+            # and freeing the streaming thread that gates frame delivery. Replace
+            # the stock 3-channel callback with the channel-aware subclass so the
+            # 1-byte buffer is reshaped correctly. If a quirky UVC stack won't
+            # connect Y8 the connect raises: disable native for future opens
+            # (module flag) and re-raise so the watchdog's next reopen uses RGB24.
+            from pygrabber.dshow_ids import MediaTypes
+            use_native_y8 = self._mono and not _native_y8_disabled
+            if use_native_y8:
+                grabber = graph.filters[FilterType.sample_grabber]
+                grabber.set_callback(  # type: ignore[union-attr]
+                    _y8_callback_class()(self._on_frame), 1)
+                grabber.set_media_type(  # type: ignore[union-attr]
+                    MediaTypes.Video, _GUID_NULL_STR)
+            try:
+                graph.prepare_preview_graph()
+            except Exception:
+                if use_native_y8:
+                    globals()["_native_y8_disabled"] = True
+                    log.warning(
+                        "PyGrabberCapture[%d]: native-Y8 grabber connect failed; "
+                        "falling back to RGB24 on the next open", self._index)
+                raise
+            self._grabber_native_y8 = use_native_y8
             self._check_stop()
             graph.run()
             self._grab_cb = graph.filters[FilterType.sample_grabber].callback
@@ -320,8 +404,13 @@ class PyGrabberCapture:
                 )
                 log.error("PyGrabberCapture[%d]: %s", self._index, self._build_error)
             else:
-                log.info("PyGrabberCapture[%d]: streaming %s %sx%s via DirectShow",
-                         self._index, self._fourcc_name, self._w, self._h)
+                layout = (
+                    "native Y8, no RGB24 converter"
+                    if self._grabber_native_y8 else "RGB24 converter"
+                )
+                log.info(
+                    "PyGrabberCapture[%d]: streaming %s %sx%s via DirectShow [%s]",
+                    self._index, self._fourcc_name, self._w, self._h, layout)
             self._ready.set()
             if got:
                 self._command_loop()  # serve control set()s on this COM thread; frames flow via callback

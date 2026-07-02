@@ -105,6 +105,56 @@ def test_non_mono_three_channel_frame_left_3d(fake_directshow) -> None:
     assert img.ndim == 3  # left 3-channel for downstream to_gray
 
 
+# -- native Y8 grabber (no RGB24 converter) ----------------------------------
+
+
+def test_mono_uses_native_y8_grabber(fake_directshow) -> None:
+    """A mono sensor connects the SampleGrabber to the device's native Y8 pin
+    (GUID_NULL subtype = no inserted RGB24 converter) with the channel-aware
+    callback — cutting per-frame copy bandwidth ~7x."""
+    graph = FakeFilterGraph(formats=_Y8, frames=[_frame(mono=True)])
+    fake_directshow(graph)
+    cap = PyGrabberCapture(0, width=64, height=48, open_timeout_s=2.0)
+    fake_directshow.register(cap)
+
+    assert cap.isOpened()
+    assert cap._grabber_native_y8 is True
+    grabber = graph._grabber
+    assert grabber.media_subtype == pygrabber_capture_mod._GUID_NULL_STR
+    assert grabber.callback_swapped is True
+
+
+def test_color_keeps_rgb24_grabber(fake_directshow) -> None:
+    """A true-color format keeps pygrabber's default RGB24 grabber — the native
+    swap is mono-only."""
+    color = [{"index": 0, "media_type_str": "YUY2", "width": 64, "height": 48}]
+    graph = FakeFilterGraph(formats=color, frames=[_frame(mono=False)])
+    fake_directshow(graph)
+    cap = PyGrabberCapture(0, width=64, height=48, prefer_y8=False, open_timeout_s=2.0)
+    fake_directshow.register(cap)
+
+    assert cap.isOpened()
+    assert cap._grabber_native_y8 is False
+    assert graph._grabber.callback_swapped is False
+
+
+def test_native_y8_disabled_falls_back_to_rgb24(fake_directshow, monkeypatch) -> None:
+    """Once a device rejects the native-Y8 connect, the module flag makes
+    subsequent opens use the RGB24 grabber (no swap) instead of failing."""
+    monkeypatch.setattr(pygrabber_capture_mod, "_native_y8_disabled", True)
+    graph = FakeFilterGraph(formats=_Y8, frames=[_frame(mono=True)])
+    fake_directshow(graph)
+    cap = PyGrabberCapture(0, width=64, height=48, open_timeout_s=2.0)
+    fake_directshow.register(cap)
+
+    assert cap.isOpened()  # still opens, just via RGB24
+    assert cap._grabber_native_y8 is False
+    assert graph._grabber.callback_swapped is False
+    # The 3-channel RGB24 frame is still collapsed to 2-D downstream.
+    ok, img = cap.read()
+    assert ok and img is not None and img.ndim == 2
+
+
 # -- liveness timeout (graph builds but never delivers a frame) --------------
 
 

@@ -170,6 +170,21 @@ class FakeFilterType(IntEnum):
     sample_grabber = 4
 
 
+class FakeSampleGrabberCallback:
+    """Plain stand-in for pygrabber's comtypes ``SampleGrabberCallback`` base, so
+    the native-Y8 path's ``_y8_callback_class()`` can subclass + instantiate it
+    without real COM. Its ``BufferCB`` is inert here — the fake graph delivers
+    frames straight to the wrapped user callback (see ``FakeSampleGrabber``)."""
+
+    def __init__(self, callback: Callable[[np.ndarray], None]) -> None:
+        self.callback = callback
+        self.keep_photo = False
+        self.image_resolution: tuple[int, int] = (0, 0)
+
+    def BufferCB(self, this, SampleTime, pBuffer, BufferLen):  # noqa: N802,N803
+        return 0
+
+
 class FakeSampleGrabber:
     """Holds the one-shot re-arm flag (``keep_photo``) and the user callback,
     matching the attribute surface PyGrabberCapture touches."""
@@ -178,6 +193,18 @@ class FakeSampleGrabber:
         self.callback = self
         self._user_cb = callback
         self.keep_photo = False
+        self.media_subtype: str | None = None  # last set_media_type request
+        self.callback_swapped = False          # native-Y8 replaced the callback
+
+    def set_media_type(self, major: str, minor: str) -> None:
+        """Record the requested subtype (native-Y8 sends GUID_NULL)."""
+        self.media_subtype = minor
+
+    def set_callback(self, cb: object, which: int) -> None:
+        """Native-Y8 swaps in a channel-aware callback wrapping the same user
+        cb; unwrap it so the fake keeps delivering frames through ``_on_frame``."""
+        self._user_cb = getattr(cb, "callback", self._user_cb)
+        self.callback_swapped = True
 
     def deliver(self, image: np.ndarray) -> bool:
         """Mirror the real ``SampleGrabberCallback.BufferCB`` one-shot
@@ -410,13 +437,24 @@ def install_fake_directshow(
     graph_mod = types.ModuleType("pygrabber.dshow_graph")
     graph_mod.FilterGraph = lambda: factory_holder[0]()  # type: ignore[attr-defined]
     graph_mod.FilterType = FakeFilterType  # type: ignore[attr-defined]
+    # The native-Y8 path subclasses this to build a channel-aware callback.
+    graph_mod.SampleGrabberCallback = FakeSampleGrabberCallback  # type: ignore[attr-defined]
+    # Rebuild the memoized subclass against THIS install's fake base.
+    from palletscan.sources import pygrabber_capture as _pgc
+    _pgc._Y8_CALLBACK_CLASS = None
 
     # pygrabber.dshow_ids -- patch_pygrabber_subtypes() needs a `subtypes` dict
-    # with pygrabber's own YUY2 entry present (it only setdefault()s).
+    # with pygrabber's own YUY2 entry present (it only setdefault()s); the
+    # native-Y8 grabber setup imports MediaTypes.
     ids_mod = types.ModuleType("pygrabber.dshow_ids")
     ids_mod.subtypes = {  # type: ignore[attr-defined]
         "{32595559-0000-0010-8000-00AA00389B71}": "YUY2",
     }
+
+    class _FakeMediaTypes:
+        Video = "{73646976-0000-0010-8000-00AA00389B71}"
+
+    ids_mod.MediaTypes = _FakeMediaTypes  # type: ignore[attr-defined]
 
     pkg = types.ModuleType("pygrabber")
     pkg.dshow_graph = graph_mod  # type: ignore[attr-defined]
