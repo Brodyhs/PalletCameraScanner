@@ -66,8 +66,16 @@ def test_server_lifecycle_smoke(tmp_path: Path) -> None:
         server.stop()
     assert server._thread is None  # joined cleanly
     server.stop()  # idempotent
-    with pytest.raises(httpx.TransportError):
-        httpx.get(f"http://127.0.0.1:{server.port}/stats.json", timeout=2)
+    # "Stopped" cannot be asserted as "nothing listens on the port": the
+    # freed ephemeral port can be re-bound instantly by an unrelated process
+    # on a shared machine (the CI-runner flake of this test). The real
+    # property is that OUR app no longer answers there.
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{server.port}/stats.json", timeout=2)
+    except httpx.TransportError:
+        pass  # nothing listening — the server is gone
+    else:
+        assert "camA" not in resp.text, "server still serving after stop()"
 
 
 def test_stop_is_bounded_with_connected_mjpeg_client(tmp_path: Path) -> None:
