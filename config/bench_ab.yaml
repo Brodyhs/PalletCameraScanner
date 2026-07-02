@@ -1,0 +1,158 @@
+# PalletScan A/B bench profile — BOTH cameras through the product pipeline.
+#
+# The dual-camera live-validation drill (BENCH_PROTOCOL.md §4) WITHOUT
+# touching the pinned config/station.yaml: color (24CUG/MSMF) + mono
+# (37CUGM/pygrabber) run as one station with cross-camera business dedup, so
+# one code waved in front of both arms merges to ONE business pass. Exercises
+# the time-based debounce (motion.open_s/quiet_s) that equalizes the 55 vs
+# 72 fps arms. Bench-tuned motion (small hand-held object).
+#
+#   palletscan run --dashboard --config config\bench_ab.yaml --data-dir data\ab
+
+source:
+  type: camera
+  camera: null
+  cameras: [cam-color, cam-mono]
+
+synthetic:
+  width: 1280
+  height: 720
+  fps: 30.0
+  seed: 42
+  num_passes: 20
+  speed_mph_range: [2.0, 10.0]
+  angle_deg_range: [0.0, 35.0]
+  px_per_module_range: [3.0, 6.0]
+  module_size_mm: 5.0
+  exposure_fraction: 0.03
+  contrast_range: [0.45, 1.0]
+  noise_sigma_range: [2.0, 8.0]
+  lighting_gradient_max: 30.0
+  occlusion_max_frac: 0.15
+  symbologies: [qr, datamatrix]
+  idle_s_range: [0.3, 1.5]
+  realtime: false
+  payload_prefix: "PLT-"
+
+video:
+  path: ""
+  fps_override: null
+  speed: 1.0
+  loop: 1
+
+cameras:
+  - id: cam-color
+    name: "See3CAM_24CUG"
+    backend: msmf
+    fourcc: UYVY
+    width: 1920
+    height: 1200
+    fps: 55.0
+    convert_rgb: true
+    fallback_index: 0
+    read_fail_limit: 5
+    connect_verify_s: 1.0
+    settings: {exposure_auto: false, exposure: -6, gain: 10, brightness: null}
+    identity:
+      policy: warn
+      expected_vid_pid: "2560:c128"
+      expected_device_path: '\\?\usb#vid_2560&pid_c128&mi_00#7&1250ea3a&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global'
+  - id: cam-mono
+    name: "See3CAM_37CUGM"
+    backend: pygrabber
+    fourcc: "Y8  "
+    width: 2064
+    height: 1552
+    fps: 72.0
+    convert_rgb: true
+    fallback_index: 1
+    read_fail_limit: 5
+    connect_verify_s: 1.0
+    settings: {exposure_auto: false, exposure: -8, gain: 10, brightness: null}
+
+watchdog:
+  stall_timeout_s: 2.0
+  retry: {base_s: 0.5, cap_s: 15.0}
+  max_outage_s: 120
+  max_zombie_readers: 3
+
+station:
+  on_arm_failure: continue_others   # test resilience: one arm hiccup keeps the other alive
+
+motion:
+  algorithm: framediff
+  downscale_width: 160
+  diff_threshold: 12
+  min_area_frac: 0.003
+  open_frames: 3
+  quiet_frames: 8
+  open_s: 0.06
+  quiet_s: 0.15
+  roi_pad_px: 32
+  idle_scan_s: 2.0
+
+decode:
+  symbology_priority: [qr, datamatrix]
+  engine: zxing
+  frame_budget_ms: 50.0
+  dm_timeout_ms: 40
+  executor: thread
+  workers: 2
+  fallback_after_frames: 4
+  confirmations: 1
+  payload_pattern: null
+
+dedup:
+  window_s: 12.0
+
+buffer:
+  pre_s: 2.0
+  post_s: 2.0
+
+evidence:
+  dir: data/evidence
+  frame_stride: 3
+  jpeg_quality: 85
+  max_total_mb: 500.0
+  max_age_days: 14.0
+
+sinks:
+  console: {enabled: true}
+  jsonl: {enabled: true, path: data/events.jsonl}
+  sqlite: {enabled: true, path: data/palletscan.db}
+  http:
+    enabled: false
+    url: "http://127.0.0.1:8808/events"
+    headers: {}
+    timeout_s: 5.0
+    outbox_path: data/outbox.db
+    retry: {base_s: 1.0, cap_s: 60.0}
+    max_mb: 200.0
+    max_age_days: 14.0
+
+metrics:
+  window_s: 60.0
+  latency_samples: 2048
+
+web:
+  enabled: false
+  host: 127.0.0.1
+  port: 8000
+  preview_fps: 10.0
+  preview_quality: 80
+  preview_width: 640
+
+report:
+  manifest_path: null
+
+logging:
+  level: INFO
+  file:
+    enabled: true
+    dir: data/logs
+    max_mb: 20.0
+    backups: 5
+    max_age_days: 14.0
+
+lock:
+  path: data/palletscan.lock

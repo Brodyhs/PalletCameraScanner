@@ -803,13 +803,8 @@ and where the review corrected it.
     graph lives on ONE dedicated COM-initialized owner thread
     (DirectShow objects are apartment-bound; the watchdog reopens from
     other threads), hidden behind the existing `Capture` protocol so
-    CameraSource/watchdog/settings run unchanged. Accepted constraint:
-    pygrabber hardcodes the SampleGrabber media type to RGB24, so every
-    mono frame takes a colour round-trip plus two copies (~13 MB/frame
-    at 2064×1552); grabbing Y800/GREY directly requires forking
-    pygrabber internals (its BufferCB is 3-channel-only), which the
-    measured ~63–72 fps at full res does not justify today. Revisit if
-    CPU headroom becomes the binding constraint.
+    CameraSource/watchdog/settings run unchanged. (Former RGB24 constraint
+    RESOLVED — see #77.)
 
 62. **zxing engine: promoted in station.yaml on thin evidence; the
     promotion bench is still owed.** `config/station.yaml` ships
@@ -1068,3 +1063,37 @@ and where the review corrected it.
     absolute replay fidelity is ever needed. measure_cpu gains an opt-in
     `--scenario recording` (baseline + recording ON) for the recorder CPU
     delta; existing scenarios untouched.
+
+77. **Mono camera performance: native Y8 grabber + downscale-first preview
+    (2026-07-02, Opus 4.8; supersedes the RGB24 constraint in #61).** On
+    real hardware the mono arm (pygrabber Y8 2064x1552 @72fps) dropped ~12%
+    of frames and its dashboard live view lagged; the color arm did not.
+    Profiling found two mono-specific costs. (1) CAPTURE: pygrabber DEFAULTS
+    the SampleGrabber to RGB24, so DirectShow inserted a Y8->RGB24 converter
+    (9.6MB/frame) that BufferCB np.copy'd (9.6MB) before _on_frame sliced one
+    luma channel (3.2MB) = ~22.4MB/frame, all serialized on the ONE
+    DirectShow streaming thread that gates delivery (can't re-arm within the
+    13.9ms budget). FIX: for a mono sensor the grabber is set to GUID_NULL
+    ("accept the pin's native subtype") so it connects DIRECTLY to the Y8
+    pin with NO converter, plus a channel-aware BufferCB (a
+    SampleGrabberCallback SUBCLASS - a class-level monkeypatch does not reach
+    comtypes' per-instance vtable and segfaults reading (h,w,3) on a 1-byte
+    buffer) reshaping by actual BufferLen: one ~3.2MB copy, ~7x less
+    bandwidth. Defensive: never over-reads the buffer; if a device rejects
+    the native connect a module flag makes the watchdog's next reopen use
+    RGB24. (2) PREVIEW: render_jpeg did a full-res GRAY->BGR + overlay draw +
+    INTER_AREA + encode on the HTTP thread EVERY poll; FIX: downscale to
+    preview_width FIRST then convert/draw/encode small (~2x cheaper) + a
+    stamp cache so idle keepalive re-polls don't re-encode. VERIFIED on
+    hardware: native Y8 confirmed (raw frame ndim=2), and an A/B run showed
+    mono 72.0fps with 0 dropped (was ~12%), color 0 dropped. Gated to mono;
+    color/RGB24 unchanged. NOTE (separate, environmental): the color 24CUG
+    (MSMF) delivered only ~19fps in dim light because its manual exposure is
+    unverifiable on MSMF (readback lies) and a long effective exposure caps
+    fps - the documented exposure<->fps<->light coupling (OPTICS_SPEC 8),
+    not a code issue; needs scan-zone lighting or a verified exposure pin.
+    STILL-CONDITIONAL: inline zxing decode has no per-call timeout, so a
+    large moving-pallet ROI can block the pipeline thread and drop frames
+    during motion (distinct from the steady-state capture drops now fixed);
+    bounding the decode ROI is the ready lever if field pallet motion shows
+    pipeline drops.
