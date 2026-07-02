@@ -1017,3 +1017,34 @@ and where the review corrected it.
     payload-level reconcile() windowed to the session (rows_in_window) -
     a whole-DB reconciliation would hide a payload scanned before the
     session began.
+
+75. **Trial recording mode: SegmentRecorder, default OFF (2026-07-02,
+    Opus 4.8, PLAN_PHASE6 REV2 6.1).** A flagged mode (recording.enabled,
+    default False) that persists EVERY motion segment - passes AND misses
+    with post-roll padding - as capped evidence-style JPEG bursts off the
+    hot path, so a field trial produces a re-analyzable corpus the
+    injection harness cannot (it certifies decode+pipeline under a physics
+    model, not the real lens). SegmentRecorder (palletscan/pipeline/
+    segment_recorder.py) owns a daemon thread + bounded queue + its OWN
+    EvidenceWriter into a DISJOINT dir (data/recordings, own 2000MB cap);
+    submit() is non-blocking drop-newest (the pipeline NEVER stalls on
+    recording I/O - the opposite of the EventBus, whose events ARE the
+    product and block). PassTracker gains a tap entirely behind
+    `self._recorder is not None`: a _PendingRecord per segment on BOTH
+    finalize branches (N concurrent segments -> N records), drained by the
+    same post-roll clock as misses; the miss and record post-roll harvests
+    share one _harvest_post(post_s) helper so they cannot drift.
+    recording.post_s is the record's own post-roll length (not pinned to
+    buffer.post_s), and the rolling-buffer horizon widens to
+    max(buffer.post_s, recording.post_s) when enabled so a larger record
+    window does not harvest evicted frames. DEFAULT OFF is byte-identical:
+    no recorder thread, no dir, inert tap, and the "recording" /stats.json
+    key + gauges are ABSENT unless enabled (pinned). meta.json =
+    schema "recording/v1" + outcome/payloads(ground-truth label)/
+    symbologies/source_id/tracking/engine/segment_frames/segment_ts/
+    optional roi. Built via a workflow whose adversarial re-review caught +
+    fixed 2 real bugs (blocking shutdown put() on a wedged writer; the
+    post_s divergence) - Opus work gets the harder review per the model
+    switch. STILL OWED (6.1 not complete): tools/replay_bursts.py (offline
+    legacy-vs-zxing re-score of a recording dir) and the measure_cpu
+    recording scenario.

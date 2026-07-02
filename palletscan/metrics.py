@@ -58,6 +58,10 @@ _KNOWN_GAUGES = frozenset(
         "spurious_rejected",
         "idle_reads",
         "evidence_failures",
+        "recorder_enqueued",
+        "recorder_dropped",
+        "recorder_written",
+        "recorder_write_failures",
         "source_stalls",
         "source_reconnects",
         "source_reopen_failures",
@@ -237,7 +241,7 @@ class MetricsRegistry:
             if p24 + m24:
                 read_rate_24h = p24 / (p24 + m24)
 
-        return {
+        snap: dict[str, Any] = {
             "uptime_s": round(uptime_s, 3),
             "fps": round(self._fps.rate(now, uptime_s), 2),
             "frames": {
@@ -287,3 +291,14 @@ class MetricsRegistry:
             },
             "outbox": self._outbox_probe() if self._outbox_probe else None,
         }
+        # Recording gauges are registered only when trial recording is ON, so
+        # the "recording" key is ABSENT by default — the snapshot key contract
+        # (and /stats.json) stays byte-identical unless recording is enabled.
+        if "recorder_enqueued" in self._gauges:
+            snap["recording"] = {
+                "enqueued": self._gauge("recorder_enqueued"),
+                "dropped": self._gauge("recorder_dropped"),
+                "written": self._gauge("recorder_written"),
+                "write_failures": self._gauge("recorder_write_failures"),
+            }
+        return snap

@@ -335,6 +335,33 @@ class EvidenceConfig(_StrictModel):
     max_age_days: float = 14.0
 
 
+class RecordingConfig(_StrictModel):
+    """Trial recording mode (Phase 6.1): persist EVERY motion segment —
+    passes AND misses, with post-roll padding — as capped evidence-style
+    JPEG bursts off the hot path, for offline replay under arbitrary decode
+    configs.
+
+    DEFAULT OFF (``enabled=False``): the pipeline stays byte-for-byte
+    unchanged — no recorder thread, no recording directory, no tracker tap.
+    Its ``evidence`` block is DISJOINT from miss evidence (``data/recordings``
+    vs ``data/evidence``, its own caps) so the two never prune each other;
+    the cap is larger because a recording holds passes too.
+    """
+
+    enabled: bool = False
+    #: Seconds of source-time post-roll padding held past a segment's close
+    #: before its burst is written (mirrors the miss post-roll).
+    post_s: float = 2.0
+    #: Bounded hand-off queue depth to the recorder thread; submit() is
+    #: non-blocking drop-newest, so recording I/O never stalls the pipeline.
+    queue_maxsize: int = Field(default=64, ge=1)
+    evidence: EvidenceConfig = Field(
+        default_factory=lambda: EvidenceConfig(
+            dir=Path("data/recordings"), max_total_mb=2000.0
+        )
+    )
+
+
 class ConsoleSinkConfig(_StrictModel):
     enabled: bool = True
 
@@ -746,6 +773,7 @@ class AppConfig(_StrictModel):
     dedup: DedupConfig = Field(default_factory=DedupConfig)
     buffer: BufferConfig = Field(default_factory=BufferConfig)
     evidence: EvidenceConfig = Field(default_factory=EvidenceConfig)
+    recording: RecordingConfig = Field(default_factory=RecordingConfig)
     sinks: SinksConfig = Field(default_factory=SinksConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     web: WebConfig = Field(default_factory=WebConfig)
@@ -898,6 +926,13 @@ def apply_overrides(
     if data_dir is not None:
         base = Path(data_dir)
         update["evidence"] = cfg.evidence.model_copy(update={"dir": base / "evidence"})
+        update["recording"] = cfg.recording.model_copy(
+            update={
+                "evidence": cfg.recording.evidence.model_copy(
+                    update={"dir": base / "recordings"}
+                )
+            }
+        )
         update["sinks"] = cfg.sinks.model_copy(
             update={
                 "jsonl": cfg.sinks.jsonl.model_copy(

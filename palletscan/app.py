@@ -36,6 +36,7 @@ from palletscan.pipeline.decode_engine import DecodeEngine, PassDecodeContext
 from palletscan.pipeline.motion_gate import MotionGate
 from palletscan.pipeline.pass_tracker import PassTracker
 from palletscan.pipeline.rolling_buffer import RollingFrameBuffer
+from palletscan.pipeline.segment_recorder import SegmentRecorder
 from palletscan.reliability.queues import SENTINEL, DroppingQueue
 from palletscan.reliability.watchdog import WatchdogSource
 from palletscan.sources.base import FrameSource
@@ -272,8 +273,15 @@ class PipelineRunner:
                 )
         # The tracker snapshots pre-roll/segment evidence while a segment is
         # open, so the buffer only ever serves pre-roll (at open) and
-        # post-roll (at the miss deadline) lookbacks.
-        horizon = cfg.buffer.pre_s + cfg.buffer.post_s + 1.0
+        # post-roll (at the miss deadline) lookbacks. Recording mode (default
+        # OFF) harvests its OWN post-roll over recording.post_s at a later
+        # deadline; when it can outrun the miss window the buffer must retain
+        # that far back too, else the record would harvest evicted (empty)
+        # frames — the opposite of the post-roll padding it configures.
+        post_horizon_s = cfg.buffer.post_s
+        if cfg.recording.enabled:
+            post_horizon_s = max(post_horizon_s, cfg.recording.post_s)
+        horizon = cfg.buffer.pre_s + post_horizon_s + 1.0
         fps = source.nominal_fps or 30.0
         self._buffer = RollingFrameBuffer(
             horizon_s=horizon, maxlen=max(512, int(horizon * fps * 1.25))
@@ -287,6 +295,14 @@ class PipelineRunner:
         ts_to_wall = None
         if epoch_wall is not None:
             ts_to_wall = lambda ts, _e=float(epoch_wall): iso_at(_e + ts)  # noqa: E731
+        # Trial recording mode (Phase 6.1, default OFF): its own daemon thread
+        # + EvidenceWriter into the disjoint recording dir. None => the tracker
+        # tap is wholly inert and behavior is byte-identical. Each A/B arm gets
+        # its own recorder into the shared recording dir (candidate-id
+        # namespacing keeps bursts collision-safe, same as miss evidence).
+        self._recorder: SegmentRecorder | None = None
+        if cfg.recording.enabled:
+            self._recorder = SegmentRecorder(cfg.recording)
         self._tracker = PassTracker(
             dedup_cfg=cfg.dedup,
             buffer_cfg=cfg.buffer,
@@ -296,6 +312,10 @@ class PipelineRunner:
             source_id=source.source_id,
             confirmations=cfg.decode.confirmations,
             ts_to_wall=ts_to_wall,
+            recorder=self._recorder,
+            record_post_s=cfg.recording.post_s,
+            record_tracking=cfg.motion.tracking,
+            record_engine=cfg.decode.engine.value,
         )
         if epoch_wall is not None and cfg.sinks.sqlite.enabled:
             from palletscan.events.dedup import load_restart_seeds
@@ -355,6 +375,18 @@ class PipelineRunner:
                 source_zombie_readers=lambda: source.zombie_readers,
                 source_connect_mismatches=lambda: source.connect_mismatches,
             )
+        # Recording gauges stay off the snapshot entirely when disabled
+        # (default), keeping /stats.json byte-identical; when enabled they
+        # surface under a "recording" section + a "recording" queue depth.
+        if self._recorder is not None:
+            recorder = self._recorder
+            self.metrics.register_gauges(
+                recorder_enqueued=lambda: recorder.enqueued,
+                recorder_dropped=lambda: recorder.dropped,
+                recorder_written=lambda: recorder.written,
+                recorder_write_failures=lambda: recorder.write_failures,
+            )
+            self.metrics.register_queue("recording", recorder.queue.qsize)
         self.metrics.register_queue("frames", self._frame_q.qsize)
         self.metrics.register_queue("events", self._bus.queue.qsize)
         for sink in sinks:
@@ -468,6 +500,7 @@ class PipelineRunner:
                     continue
                 td = self._engine.decode_frame(frame, track.roi, ctx)
                 self._tracker.on_decode(track.track_id, td)
+                self._tracker.note_roi(track.track_id, track.roi)
                 if td:
                     decodes = decodes + td
                 if time.perf_counter() >= deadline:
@@ -477,6 +510,7 @@ class PipelineRunner:
             if ctx is not None:
                 decodes = self._engine.decode_frame(frame, result.roi, ctx)
                 self._tracker.on_decode(result.candidate_id, decodes)
+                self._tracker.note_roi(result.candidate_id, result.roi)
         idle = self._harvest_idle_scan()
         if idle:
             self._idle_reads += len(idle)
@@ -586,6 +620,8 @@ class PipelineRunner:
         metrics snapshot (the ``--stats-interval`` CLI flag).
         """
         self._bus.start()
+        if self._recorder is not None:
+            self._recorder.start()
         source_t = threading.Thread(
             target=self._source_loop, name="source", daemon=True
         )
@@ -614,6 +650,12 @@ class PipelineRunner:
                 self._idle_executor.shutdown(wait=True)
             self._executor.shutdown(wait=True)
             drained = self._bus.shutdown()
+            # After the bus: the tracker's flush() (in the pipeline thread's
+            # finally) has already submitted every pending record, so draining
+            # the recorder last loses nothing. Undrained bursts are non-fatal —
+            # recording never fails a run.
+            if self._recorder is not None:
+                self._recorder.shutdown()
         if self._thread_errors:
             raise RuntimeError("pipeline thread failure") from self._thread_errors[0]
         if not drained:

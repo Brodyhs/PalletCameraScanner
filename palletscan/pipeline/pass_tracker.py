@@ -22,6 +22,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from palletscan.config import BufferConfig, DedupConfig
 from palletscan.events.evidence import EvidenceRef, EvidenceWriter
@@ -33,9 +34,13 @@ from palletscan.types import (
     Frame,
     MissEvent,
     PassEvent,
+    Roi,
     SegmentEvent,
     now_iso,
 )
+
+if TYPE_CHECKING:
+    from palletscan.pipeline.segment_recorder import SegmentRecorder
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +79,10 @@ class _SegmentState:
     decodes: list[DecodeResult] = field(default_factory=list)
     payload_counts: dict[str, int] = field(default_factory=dict)
     evidence: _FrameReservoir = field(default_factory=_FrameReservoir)
+    #: Last full-res decode ROI observed for this segment (recording mode
+    #: only; set via note_roi). None when the segment was never decode-eligible
+    #: — replay then falls back to full-frame.
+    last_roi: Roi | None = None
 
 
 @dataclass(slots=True)
@@ -86,6 +95,30 @@ class _PendingMiss:
     close_ts: float
     deadline_ts: float
     frames: list[Frame]
+
+
+@dataclass(slots=True)
+class _PendingRecord:
+    """A motion segment awaiting its post-roll before being recorded.
+
+    Mirrors :class:`_PendingMiss` but exists for BOTH outcomes: ``outcome``
+    is ``"pass"`` (``payloads`` = the decoded ground-truth label) or
+    ``"miss"`` (``payloads`` = ``[]``). One is appended per segment on both
+    finalize branches, so N concurrent segments yield N independent records.
+    """
+
+    candidate_id: str
+    source_id: str
+    open_frame: int
+    open_ts: float
+    close_frame: int
+    close_ts: float
+    deadline_ts: float
+    frames: list[Frame]
+    outcome: str
+    payloads: list[str]
+    symbologies: list[str]
+    roi: Roi | None
 
 
 class PassTracker:
@@ -101,6 +134,10 @@ class PassTracker:
         source_id: str,
         confirmations: int = 1,
         ts_to_wall: Callable[[float], str] | None = None,
+        recorder: "SegmentRecorder | None" = None,
+        record_post_s: float = 2.0,
+        record_tracking: str = "single",
+        record_engine: str = "legacy",
     ) -> None:
         self._dedup = dedup_cfg
         self._buffer_cfg = buffer_cfg
@@ -109,6 +146,14 @@ class PassTracker:
         self._emit = emit
         self._source_id = source_id
         self._confirmations = max(1, int(confirmations))
+        # Trial recording tap (Phase 6.1); None => wholly inert, default path
+        # byte-identical. Everything recording-related is behind
+        # ``self._recorder is not None``.
+        self._recorder = recorder
+        self._record_post_s = record_post_s
+        self._record_tracking = record_tracking
+        self._record_engine = record_engine
+        self._pending_records: list[_PendingRecord] = []
         # Maps a source-clock ts to the wall-clock ISO stamp of that
         # moment (sources with a known epoch provide it). Events are then
         # attributed to when the pallet PASSED, not when the deferred
@@ -179,6 +224,20 @@ class PassTracker:
         seg = self._open.get(candidate_id)
         return seg.ctx if seg is not None else None
 
+    def note_roi(self, candidate_id: str | None, roi: Roi) -> None:
+        """Record the last decode ROI for a segment (recording mode only).
+
+        No-op unless a recorder is attached, so the default path pays only a
+        single ``is None`` check at each decode site. The recorded ROI lets
+        replay crop exactly as the live decoder did; an un-noted segment
+        replays full-frame.
+        """
+        if self._recorder is None:
+            return
+        seg = self._open.get(candidate_id) if candidate_id is not None else None
+        if seg is not None:
+            seg.last_roi = roi
+
     def on_decode(
         self, candidate_id: str, results: list[DecodeResult]
     ) -> None:
@@ -214,6 +273,8 @@ class PassTracker:
         """Advance the clock: finalize pending misses whose post-roll is full."""
         while self._pending and self._pending[0].deadline_ts <= ts:
             self._finalize_miss(self._pending.pop(0))
+        while self._pending_records and self._pending_records[0].deadline_ts <= ts:
+            self._finalize_record(self._pending_records.pop(0))
 
     def flush_pending(self) -> None:
         """Finalize every pending miss now, post-roll deadlines or not.
@@ -225,6 +286,8 @@ class PassTracker:
         """
         while self._pending:
             self._finalize_miss(self._pending.pop(0))
+        while self._pending_records:
+            self._finalize_record(self._pending_records.pop(0))
 
     def seed_recent(self, entries: dict[str, float]) -> None:
         """Seed the payload dedup window from a previous process's stored
@@ -273,6 +336,8 @@ class PassTracker:
                     frames=seg.evidence.frames,
                 )
             )
+            if self._recorder is not None:
+                self._queue_record(seg, close_frame, close_ts, "miss", {})
             return
         for payload, decodes in confirmed.items():
             last_seen = self._recent.get(payload)
@@ -312,6 +377,11 @@ class PassTracker:
                 )
             )
             self.passes_emitted += 1
+        # A decoded segment is a "pass" record regardless of whether its
+        # PassEvent emitted or merged into a recent sighting — the segment
+        # DID decode. Queued after the emit loop so pass timing is untouched.
+        if self._recorder is not None:
+            self._queue_record(seg, close_frame, close_ts, "pass", confirmed)
         # Expire stale dedup entries lazily.
         cutoff = close_ts - self._dedup.window_s
         self._recent = {p: t for p, t in self._recent.items() if t >= cutoff}
@@ -320,22 +390,97 @@ class PassTracker:
         """Wall-clock stamp for a source-clock instant (now when unmapped)."""
         return self._ts_to_wall(ts) if self._ts_to_wall is not None else now_iso()
 
-    def _finalize_miss(self, miss: _PendingMiss) -> None:
-        # Pre-roll + segment frames were captured while the segment was
-        # open; only the post-roll still lives in the rolling buffer.
-        # Quiet-gap frames (ts > close_ts) were already sampled into the
-        # reservoir while the segment wound down, so the post-roll must
-        # exclude them or the burst double-writes frames and overstates
-        # evidence_frame_count (REVIEW finding b11).
-        have = {f.frame_index for f in miss.frames}
+    def _harvest_post(
+        self, close_ts: float, frames: list[Frame], post_s: float
+    ) -> list[Frame]:
+        """Segment frames + the ``post_s``-second post-roll pulled from the
+        rolling buffer.
+
+        Pre-roll + segment frames were captured while the segment was open;
+        only the post-roll still lives in the rolling buffer. Quiet-gap
+        frames (ts > close_ts) were already sampled into the reservoir while
+        the segment wound down, so the post-roll must exclude them or the
+        burst double-writes frames and overstates the frame count (REVIEW
+        finding b11). Builds a NEW list — never mutates the shared reservoir.
+
+        Shared by ``_finalize_miss`` and ``_finalize_record`` so the two
+        harvests' extract/dedup logic cannot drift. The window length is a
+        parameter, not a constant: the miss burst uses ``buffer.post_s`` while
+        a recording uses its own ``recording.post_s`` (``record_post_s``), so
+        raising the recording knob genuinely captures more trailing evidence
+        rather than silently staying pinned to the miss window. The rolling
+        buffer horizon is sized (``app.py``) to retain at least this far past
+        a close whenever recording is enabled.
+        """
+        have = {f.frame_index for f in frames}
         post = [
             f
-            for f in self._buffer.extract(
-                miss.close_ts, miss.close_ts + self._buffer_cfg.post_s
-            )
-            if f.ts > miss.close_ts and f.frame_index not in have
+            for f in self._buffer.extract(close_ts, close_ts + post_s)
+            if f.ts > close_ts and f.frame_index not in have
         ]
-        frames = miss.frames + post
+        return frames + post
+
+    def _queue_record(
+        self,
+        seg: _SegmentState,
+        close_frame: int,
+        close_ts: float,
+        outcome: str,
+        confirmed: dict[str, list[DecodeResult]],
+    ) -> None:
+        """Append this segment's _PendingRecord (recording mode only). The
+        payloads are the ground-truth label: the decoded payloads for a pass,
+        ``[]`` for a miss."""
+        payloads = list(confirmed.keys())
+        symbologies = [confirmed[p][0].symbology.value for p in payloads]
+        self._pending_records.append(
+            _PendingRecord(
+                candidate_id=seg.candidate_id,
+                source_id=self._source_id,
+                open_frame=seg.open_frame,
+                open_ts=seg.open_ts,
+                close_frame=close_frame,
+                close_ts=close_ts,
+                deadline_ts=close_ts + self._record_post_s,
+                frames=seg.evidence.frames,
+                outcome=outcome,
+                payloads=payloads,
+                symbologies=symbologies,
+                roi=seg.last_roi,
+            )
+        )
+
+    def _finalize_record(self, record: _PendingRecord) -> None:
+        """Write one recorded segment burst off the pipeline thread.
+
+        Non-fatal by construction: submit() never blocks and never raises,
+        and the recorder writer degrades on storage failure — recording must
+        never perturb pass/miss accounting.
+        """
+        assert self._recorder is not None  # only queued when recording
+        frames = self._harvest_post(
+            record.close_ts, record.frames, self._record_post_s
+        )
+        meta: dict[str, object] = {
+            "schema": "recording/v1",
+            "outcome": record.outcome,
+            "payloads": record.payloads,
+            "symbologies": record.symbologies,
+            "source_id": record.source_id,
+            "tracking": self._record_tracking,
+            "engine": self._record_engine,
+            "segment_frames": [record.open_frame, record.close_frame],
+            "segment_ts": [record.open_ts, record.close_ts],
+        }
+        if record.roi is not None:
+            r = record.roi
+            meta["roi"] = [r.x, r.y, r.w, r.h]
+        self._recorder.submit(record.candidate_id, frames, meta)
+
+    def _finalize_miss(self, miss: _PendingMiss) -> None:
+        frames = self._harvest_post(
+            miss.close_ts, miss.frames, self._buffer_cfg.post_s
+        )
         try:
             ref = self._evidence.write_burst(
                 miss.candidate_id,
