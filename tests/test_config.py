@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from palletscan.config import (
     AppConfig,
+    DecodeEngineKind,
     ExecutorKind,
     LogFileConfig,
     MotionAlgorithm,
@@ -52,6 +53,38 @@ def test_default_yaml_file_is_valid() -> None:
     repo_default = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
     cfg = load_config(repo_default)
     assert cfg == AppConfig(), "config/default.yaml must mirror code defaults"
+
+
+def test_station_yaml_matches_defaults_except_documented_deviations() -> None:
+    repo_station = Path(__file__).resolve().parents[1] / "config" / "station.yaml"
+    cfg = load_config(repo_station)
+    # The station.yaml header documents EXACTLY these deviations from code
+    # defaults; pin them so the file and its header stay honest.
+    assert cfg.watchdog.max_outage_s == 120.0
+    assert cfg.decode.engine is DecodeEngineKind.ZXING
+    assert len(cfg.cameras) == 2  # the two See3CAMs, station-specific
+    got = cfg.model_dump()
+    expected = AppConfig().model_dump()
+    expected["watchdog"]["max_outage_s"] = got["watchdog"]["max_outage_s"]
+    expected["decode"]["engine"] = got["decode"]["engine"]
+    expected["cameras"] = got["cameras"]
+    assert got == expected, (
+        "undocumented deviation from AppConfig() defaults — update the "
+        "config/station.yaml header comment AND this test"
+    )
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_frame_queue_size_zero_or_negative_rejected(bad: int) -> None:
+    # queue.Queue treats maxsize <= 0 as INFINITE, which would silently defeat
+    # DroppingQueue's bounded drop-oldest contract — reject at config load.
+    with pytest.raises(ValidationError):
+        AppConfig(frame_queue_size=bad)
+
+
+def test_frame_queue_size_default_and_minimum() -> None:
+    assert AppConfig().frame_queue_size == 64
+    assert AppConfig(frame_queue_size=1).frame_queue_size == 1
 
 
 def test_unknown_key_rejected(tmp_path: Path) -> None:

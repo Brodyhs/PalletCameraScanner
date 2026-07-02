@@ -14,6 +14,18 @@ certifies the DECODE + PIPELINE + motion-gate-vs-real-background under a *physic
 model* of the optics (motion blur from the live exposure, px/module from the
 simulated distance) — NOT the literal optical capture. Pair it with
 record-then-replay (VideoFileSource) to certify the real lens.
+
+TRUTH TIME-BASE: ``self.truth`` records ``first_frame``/``last_frame`` as
+``round(frame.ts * nominal_fps)`` — nominal-fps *ticks of the live source
+clock* — NOT live camera frame indices. ``reconcile_truth(truth, events,
+fps=source.nominal_fps)`` divides by fps to rebuild a time window, and live
+Pass/MissEvent timestamps are source-clock ``ts``; frame indices diverge from
+ts under stalls/outages/fps error, so index-based truth made every genuinely
+missed pass "unaccounted". For SyntheticSource ``ts == frame_index / fps``,
+so this tick contract collapses to the inherited frame-index one. Each
+record's ``params`` also carries the raw ``ts_first``/``ts_last`` and
+``truncated=True`` when a watchdog reconnect tore the pass mid-flight (its
+frames were already delivered, so it must still reconcile, never vanish).
 """
 
 from __future__ import annotations
@@ -22,6 +34,7 @@ import math
 from collections.abc import Iterator
 
 import numpy as np
+from pydantic import ValidationError
 
 from palletscan.config import AppConfig, SyntheticConfig, resolve_camera
 from palletscan.sources import render
@@ -42,7 +55,10 @@ _UNIT = {
 }
 
 
-def _trajectory(direction, w, h, pw, ph, step, rng):
+def _trajectory(
+    direction: str, w: int, h: int, pw: int, ph: int, step: float,
+    rng: np.random.Generator,
+) -> tuple[float, float, float, float, int]:
     """Top-left start (x0,y0), per-frame velocity (vx,vy) and frame count for a
     (pw x ph) patch crossing a w x h frame in ``direction`` at ``step`` px/frame:
     enters fully off the entry edge, exits fully off the far edge. Movement axes
@@ -61,11 +77,16 @@ def _trajectory(direction, w, h, pw, ph, step, rng):
                              0, max(0, extent - patch)))
 
     x0, y0 = _start(vx, w, pw), _start(vy, h, ph)
-    nf = 2
+    # The patch is fully gone as soon as EITHER moving axis has completely
+    # exited the frame (motion is monotonic), so the pass length is the MIN
+    # of the per-axis crossing times — max would keep a diagonal pass
+    # "active" for many frames while compositing nothing.
+    times: list[float] = []
     if vx != 0.0:
-        nf = max(nf, int(math.ceil((w + pw) / abs(vx))))
+        times.append((w + pw) / abs(vx))
     if vy != 0.0:
-        nf = max(nf, int(math.ceil((h + ph) / abs(vy))))
+        times.append((h + ph) / abs(vy))
+    nf = max(2, int(math.ceil(min(times)))) if times else 2
     return x0, y0, vx, vy, nf
 
 
@@ -82,14 +103,32 @@ class CameraInjectionSource(SyntheticSource):
         cam = resolve_camera(app_cfg)
         # Match the plan geometry to the live camera frame and tag injected
         # payloads distinctly from the operator's real codes (INJ-...).
-        cfg = cfg.model_copy(
-            update={
-                "width": cam.width,
-                "height": cam.height,
-                "fps": cam.fps,
-                "payload_prefix": "INJ-",
-            }
-        )
+        # model_validate, not model_copy: model_copy(update=...) skips
+        # validation, so a camera config that legitimately omits its locked
+        # mode would smuggle None into required plan fields and crash later
+        # with an opaque TypeError deep in rendering.
+        try:
+            cfg = SyntheticConfig.model_validate(
+                {
+                    **cfg.model_dump(),
+                    "width": cam.width,
+                    "height": cam.height,
+                    "fps": cam.fps,
+                    "payload_prefix": "INJ-",
+                }
+            )
+        except ValidationError as exc:
+            missing = [
+                f for f in ("width", "height", "fps") if getattr(cam, f) is None
+            ]
+            if not missing:
+                raise
+            raise ValueError(
+                f"cannot inject onto camera {cam.id!r}: cameras[]."
+                f"{'/'.join(missing)} not set — injection plans trajectories "
+                "in the locked mode's pixel/frame space; run `palletscan "
+                "calibrate --save` or set width/height/fps explicitly"
+            ) from exc
         super().__init__(cfg, source_id=source_id)
         self._exposure_s = float(exposure_s)
         # Discard the synthetic static background (never used); the live frame
@@ -204,27 +243,70 @@ class CameraInjectionSource(SyntheticSource):
             img[fy0:fy1, fx0:fx1] = (region * (1.0 - a) + p * a).astype(np.uint8)
         return img
 
+    def _retire(
+        self, entry: dict, *, last_ts: float, fps: float, truncated: bool = False
+    ) -> None:
+        """Finalize one in-flight pass into ``self.truth``.
+
+        Frame bounds are nominal-fps ticks of the live ts clock (module
+        docstring: TRUTH TIME-BASE) so ``reconcile_truth`` maps them back
+        onto the same axis Pass/MissEvent timestamps use."""
+        plan: _PassPlan = entry["plan"]
+        params = dict(plan.params)
+        params["ts_first"] = entry["ts_first"]
+        params["ts_last"] = last_ts
+        if truncated:
+            params["truncated"] = True
+        self.truth.append(
+            GroundTruthRecord(
+                pass_id=plan.pass_id,
+                payload=plan.payload,
+                symbology=plan.symbology,
+                first_frame=round(entry["ts_first"] * fps),
+                last_frame=round(last_ts * fps),
+                params=params,
+            )
+        )
+
     def frames(self) -> Iterator[Frame]:
         # Maintain up to ``max_concurrent`` staggered passes at once and chain
         # their composites onto each live frame, so the demo shows MULTIPLE moving
         # codes simultaneously (decode + preview already render a box per code).
         # max_concurrent=1 reproduces the original one-at-a-time behavior.
         cfg = self._cfg
+        fps = self.nominal_fps
         max_active = max(1, getattr(cfg, "max_concurrent", 1))
-        active: list[dict] = []  # each: {"plan", "k", "first"}
+        active: list[dict] = []  # each: {"plan", "k", "ts_first"}
         next_j = 0
-        launch_in = self._plan(0).idle_frames_before  # frames until the next launch
+        # Cache pass 0's plan: planning renders the full degraded patch, so a
+        # throwaway _plan(0) just to read idle_frames_before would render
+        # pass 0 twice (once discarded).
+        plan0: _PassPlan | None = self._plan(0) if cfg.num_passes > 0 else None
+        launch_in = plan0.idle_frames_before if plan0 is not None else 0
         tail_remaining = int(round(self._tail_s * cfg.fps))
+        prev_ts: float | None = None
         for fr in self._inner.frames():
             base = fr.image
-            if fr.discontinuity:
-                active = []  # a reconnect tears every in-flight code
-            # Launch new staggered passes up to the concurrency cap.
-            if next_j < cfg.num_passes:
+            if fr.discontinuity and active:
+                # A reconnect tears every in-flight code — but its frames were
+                # already composited and delivered, so finalize it into truth
+                # (flagged truncated) instead of silently vanishing: the
+                # account-for-everything reconcile must still see it.
+                last = prev_ts if prev_ts is not None else fr.ts
+                for e in active:
+                    self._retire(e, last_ts=last, fps=fps, truncated=True)
+                active = []
+            # Launch new staggered passes up to the concurrency cap. The idle
+            # countdown runs ONLY while a launch slot is open: a pass that
+            # outlives its idle window must still be followed by a full idle
+            # gap (the idle_frames_before contract) — an always-running
+            # countdown goes deeply negative and launches back-to-back.
+            if next_j < cfg.num_passes and len(active) < max_active:
                 launch_in -= 1
-                if launch_in <= 0 and len(active) < max_active:
-                    plan = self._plan(next_j)
-                    active.append({"plan": plan, "k": 0, "first": fr.frame_index})
+                if launch_in <= 0:
+                    plan = plan0 if plan0 is not None else self._plan(next_j)
+                    plan0 = None  # release the cached patch after pass 0
+                    active.append({"plan": plan, "k": 0, "ts_first": fr.ts})
                     next_j += 1
                     launch_in = max(1, plan.idle_frames_before)
             # Composite every active code onto this frame (chained alpha blends).
@@ -236,19 +318,11 @@ class CameraInjectionSource(SyntheticSource):
             still: list[dict] = []
             for e in active:
                 if e["k"] >= e["plan"].num_frames:
-                    self.truth.append(
-                        GroundTruthRecord(
-                            pass_id=e["plan"].pass_id,
-                            payload=e["plan"].payload,
-                            symbology=e["plan"].symbology,
-                            first_frame=e["first"],
-                            last_frame=fr.frame_index,
-                            params=dict(e["plan"].params),
-                        )
-                    )
+                    self._retire(e, last_ts=fr.ts, fps=fps)
                 else:
                     still.append(e)
             active = still
+            prev_ts = fr.ts
             if next_j >= cfg.num_passes and not active:  # all launched + retired
                 tail_remaining -= 1
                 if tail_remaining <= 0:

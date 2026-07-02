@@ -42,6 +42,7 @@ from palletscan.events.dedup import (
     load_restart_seeds,
 )
 from palletscan.events.http_sink import HttpSink
+from palletscan.reliability.watchdog import WatchdogEscalation
 from palletscan.sources.base import FrameSource
 from palletscan.sources.factory import create_source
 from palletscan.sources.synthetic import SyntheticSource
@@ -271,7 +272,12 @@ class StationRunner:
             # time runner.run() returns (an undrained one fails its runner,
             # which lands in _errors below); now drain the business bus.
             business_drained = self.business_bus.shutdown()
-        if not business_drained and not self._errors:
+        if not business_drained:
+            # Recorded UNCONDITIONALLY: a business-bus drain failure is never
+            # tolerated, and arm errors must not mask it — the old
+            # `and not self._errors` guard hid it from the bus_errors check
+            # below, so continue_others returned a clean summary over a
+            # silent business-event loss (REVIEW bringup-4d95b67).
             self._errors.append(
                 (
                     "business-bus",
@@ -284,13 +290,26 @@ class StationRunner:
             )
         if self._errors:
             # continue_others tolerates ARM failures as long as a healthy arm
-            # produced a summary (one camera beats none); a business-bus drain
-            # failure is never tolerated. stop_all raises on any error as before.
+            # produced a summary (one camera beats none). Never tolerated:
+            #   * a business-bus drain failure (silent business-event loss);
+            #   * a WatchdogEscalation — the watchdog already escalated past
+            #     in-process recovery, and tolerating it would convert its
+            #     never-give-up semantics into permanent silent arm loss (no
+            #     respawn, no exit-3 supervisor restart) — REVIEW
+            #     bringup-4d95b67.
+            # stop_all raises on any error as before.
             bus_errors = [(s, e) for s, e in self._errors if s == "business-bus"]
+            escalations = [
+                (s, e)
+                for s, e in self._errors
+                if isinstance(e, WatchdogEscalation)
+                or isinstance(e.__cause__, WatchdogEscalation)
+            ]
             tolerate = (
                 self._cfg.station.on_arm_failure is StationPolicy.CONTINUE_OTHERS
                 and bool(self._summaries)
                 and not bus_errors
+                and not escalations
             )
             if tolerate:
                 for s, e in self._errors:
@@ -299,10 +318,12 @@ class StationRunner:
                         "arm(s) scanning: %r", s, e,
                     )
             else:
-                source_id, exc = self._errors[0]
-                # Chain from the runner error's cause so a WatchdogEscalation
-                # survives to the CLI's exit-code mapping (cli inspects
-                # exc.__cause__ -> exit 3).
+                # Prefer an escalation as the raised error so the supervisor
+                # restart path engages even when a plain arm error landed
+                # first. Chain from the runner error's cause so a
+                # WatchdogEscalation survives to the CLI's exit-code mapping
+                # (cli inspects exc.__cause__ -> exit 3).
+                source_id, exc = (escalations or self._errors)[0]
                 raise RuntimeError(
                     f"station runner {source_id!r} failed"
                 ) from (exc.__cause__ or exc)

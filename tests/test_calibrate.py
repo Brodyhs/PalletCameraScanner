@@ -276,12 +276,20 @@ def test_rejected_control_hard_fails_on_reliable_backend() -> None:
 
 
 def test_unverified_controls_warn_on_avfoundation() -> None:
+    """Readback-unreliable backend, exposure PHYSICALLY working: unverified
+    controls are an honest warning, not a hard failure. (The fixture used
+    to reject the exposure set too, which also killed the exposure-EFFECT
+    check — under the restored gate, REVIEW bringup-4d95b67, a dead effect
+    is hard on EVERY backend, so the exposure here must actually work for
+    this test to isolate the readback-warn contract.)"""
     from tests.camera_fakes import avfoundation_hooks
 
     clock = FakeClock()
+    hooks = avfoundation_hooks()
+    del hooks[cv2.CAP_PROP_EXPOSURE]  # exposure applies; readback still untrusted
     factory = FakeCaptureFactory(
         default=lambda i, b: FakeCapture(
-            hooks=avfoundation_hooks(),
+            hooks=hooks,
             clock=clock,
             real_fps=lambda cap: min(cap.get(cv2.CAP_PROP_FPS) or 30.0, 120.0),
         )
@@ -298,6 +306,35 @@ def test_unverified_controls_warn_on_avfoundation() -> None:
     )
     assert rc == 0, out  # honest warning, not a hard failure
     assert "controls unverified" in out
+    assert "exposure effect" in out and "NO EFFECT" not in out
+
+
+def test_dead_exposure_control_hard_fails_even_on_msmf() -> None:
+    """REVIEW bringup-4d95b67 (exposure-effect gate restoration): flipping
+    MSMF to readback-unreliable also demoted the exposure-EFFECT gate, so a
+    physically dead exposure control exited calibrate rc=0 with a warning
+    claiming to trust 'the exposure-effect check' — the very check that had
+    just reported NO EFFECT. The effect check measures pixels, not
+    readback: hard on every backend."""
+    clock = FakeClock()
+
+    def make(i: int, b: int) -> FakeCapture:
+        return FakeCapture(
+            hooks={cv2.CAP_PROP_EXPOSURE: lambda v: None},  # physically dead
+            clock=clock,
+            real_fps=lambda cap: min(cap.get(cv2.CAP_PROP_FPS) or 30.0, 120.0),
+        )
+
+    rc, out = _run(
+        _cfg(),  # backend msmf: readback-unreliable, effect gate still hard
+        CalibrateOptions(seconds=0, exposure=-6.0),
+        FakeCaptureFactory(default=make),
+        _lister(),
+        clock,
+    )
+    assert rc == 1, out
+    assert "NO EFFECT" in out
+    assert "hard on every backend" in out
 
 
 def test_exit_codes_for_failure_paths() -> None:
@@ -386,6 +423,59 @@ def test_explicit_backend_with_fallback_uses_pinned_index() -> None:
     assert "fallback_index 1" in out
     assert all(call[0] == 1 for call in factory.calls)
     assert all(call[1] == MSMF for call in factory.calls)
+
+
+def test_pygrabber_backend_dispatches_pygrabber_capture_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REVIEW bringup-4d95b67: run_calibration built cv2.VideoCapture for
+    EVERY backend, so the Y8-only mono cam (which this commit documents
+    OpenCV cannot open) could never be calibrated — and calibrate is the
+    step that stamps the identity fingerprint. The capture factory must
+    dispatch by backend exactly like CameraSource. A stub module stands in
+    for pygrabber_capture so no COM/hardware is touched."""
+    import sys
+    import types
+
+    clock = FakeClock()
+    created: list[tuple] = []
+
+    class StubPyGrabberCapture(FakeCapture):
+        def __init__(
+            self,
+            index: int,
+            *,
+            width: int | None = None,
+            height: int | None = None,
+            fps: float | None = None,
+        ) -> None:
+            super().__init__(
+                clock=clock,
+                real_fps=lambda cap: min(cap.get(cv2.CAP_PROP_FPS) or 30.0, 120.0),
+            )
+            created.append((index, width, height, fps))
+
+    stub_mod = types.ModuleType("palletscan.sources.pygrabber_capture")
+    stub_mod.PyGrabberCapture = StubPyGrabberCapture  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        sys.modules, "palletscan.sources.pygrabber_capture", stub_mod
+    )
+
+    from palletscan.sources.camera import default_capture_factory
+
+    rc, out = _run(
+        _cfg(backend="pygrabber", width=640, height=480),
+        CalibrateOptions(fourcc="GREY", width=640, height=480, fps=30.0,
+                         seconds=0, exposure=-6.0),
+        default_capture_factory,  # the production default — must NOT be used
+        _lister(backend=int(cv2.CAP_DSHOW)),  # pygrabber enumerates as DSHOW
+        clock,
+    )
+    assert created, "the pygrabber capture factory was never dispatched"
+    assert rc == 0, out
+    # The cfg-closed factory hands the graph the entry's target geometry
+    # (fps is None here: _cfg does not set one on the camera entry).
+    assert all(c == (0, 640, 480, None) for c in created)
 
 
 def test_metrics_loop_reads_negotiated_luma_plane() -> None:

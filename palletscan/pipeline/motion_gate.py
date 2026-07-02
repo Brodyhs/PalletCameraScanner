@@ -52,9 +52,9 @@ class _Track:
     open_id: str | None = None
     open_backdate: tuple[int, float] | None = None  # first active frame
     last_active: tuple[int, float] | None = None
-    # Split/merge hysteresis: how many consecutive frames this track has been
-    # observed in an ambiguous (merge) state, keyed by the partner blob it is
-    # contending with. Reset whenever the ambiguity clears.
+    # Merge hysteresis: consecutive frames this track's focus blob (assigned,
+    # or best gate-eligible when unmatched) has been contended by another
+    # track. Reset whenever the ambiguity clears.
     merge_streak: int = 0
 
 
@@ -127,18 +127,17 @@ class MotionGate:
         return cv2.dilate(mask, self._kernel)
 
     def _downscale(self, image: np.ndarray) -> np.ndarray:
-        """Cheap full-frame downscale: a strided pre-slice (nearly free) gets
-        us close to target, then one small INTER_AREA pass anti-aliases to the
-        exact (sw, sh). diff_threshold / min_area_frac semantics are unchanged
-        — INTER_AREA still does the final averaging that crushes sensor noise.
+        """Full-frame INTER_AREA downscale to exactly (sw, sh).
+
+        Must be a single averaging resize: a strided pre-slice DECIMATES
+        instead of averaging, and at common resolutions the follow-up resize
+        becomes a no-op, so raw per-pixel sensor noise floods the frame diff
+        (phantom whole-frame motion; REVIEW_bringup_4d95b67 finding 1).
         """
         h, w = image.shape
         sw = self._cfg.downscale_width
         sh = max(1, round(h * sw / w))
-        sx = max(1, w // sw)
-        sy = max(1, h // sh)
-        pre = image[::sy, ::sx]
-        return cv2.resize(pre, (sw, sh), interpolation=cv2.INTER_AREA)
+        return cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA)
 
     def update(self, frame: Frame) -> tuple[MotionResult, list[SegmentEvent]]:
         """Classify one frame; emit 0..N segment open/close events.
@@ -279,7 +278,12 @@ class MotionGate:
 
         # Primary track = largest-area OPEN track this frame (mirror single
         # mode's roi/candidate_id onto it for preview + back-compat). Only
-        # OPEN tracks surface as MotionTracks; their ``track_id`` IS the
+        # OPEN tracks UPDATED this frame (missed == 0) surface as
+        # MotionTracks: app.py decodes every surfaced ROI, and an unmatched
+        # track's ROI is stale — single mode likewise gates decode on THIS
+        # frame's motion. Unmatched open tracks stay alive inside the gate
+        # for miss accounting and close on the ordinary quiet path
+        # (REVIEW_bringup_4d95b67 finding 15). A track's ``track_id`` IS the
         # segment candidate_id (``open_id``), so app.py routes decodes to the
         # right PassTracker segment with no extra lookup.
         result_tracks = tuple(
@@ -292,10 +296,14 @@ class MotionGate:
                 missed=t.missed,
             )
             for t in self._tracks.values()
-            if t.open_id is not None
+            if t.open_id is not None and t.missed == 0
         )
         primary = max(
-            (t for t in self._tracks.values() if t.open_id is not None),
+            (
+                t
+                for t in self._tracks.values()
+                if t.open_id is not None and t.missed == 0
+            ),
             key=lambda t: t.area_px,
             default=None,
         )
@@ -346,67 +354,86 @@ class MotionGate:
             matched_tracks[ti] = bi
             matched_blobs[bi] = ti
 
-        # SPLIT/MERGE detection (hysteresis). A blob claimed by multiple
-        # gate-eligible tracks (merge) or a track eligible for multiple blobs
-        # (split). We detect on the FULL candidate set (not the greedy
-        # one-to-one result) so the contention is visible.
-        blob_claims: dict[int, set[int]] = {}
-        track_options: dict[int, set[int]] = {}
-        for _iou, _ndist, ti, bi in pairs:
-            blob_claims.setdefault(bi, set()).add(ti)
-            track_options.setdefault(ti, set()).add(bi)
+        # MERGE detection (hysteresis). Each track FOCUSES on exactly one blob
+        # per frame: its greedy-assigned blob, or — when left unmatched — its
+        # best gate-eligible blob. A blob focused by >= 2 live tracks is a
+        # genuine merge candidate: two objects' masks fused into one component
+        # that greedy could hand to only one of them. A track matched 1:1 to
+        # its own distinct blob is NEVER a merge candidate — the old detection
+        # on the FULL gate-eligible pair set force-closed side-by-side tracks
+        # that were each riding a real object, and could increment a streak
+        # twice per frame (REVIEW_bringup_4d95b67 finding 9).
+        focus: dict[int, int] = dict(matched_tracks)
+        for _iou, _ndist, ti, bi in pairs:  # sorted best-first: first wins
+            focus.setdefault(ti, bi)
+        contenders_by_blob: dict[int, list[int]] = {}
+        for ti, bi in focus.items():
+            contenders_by_blob.setdefault(bi, []).append(ti)
 
         events: list[SegmentEvent] = []
 
-        # MERGE: a single blob contended by >= 2 live tracks. Persist the
-        # ambiguity track_merge_hysteresis_frames before committing; on commit,
-        # CLOSE the smaller / undecoded absorbed track so its miss finalizes
-        # (never silently fold one track's frames into another's segment).
+        # Persist the ambiguity track_merge_hysteresis_frames before
+        # committing; on commit, CLOSE the smaller / undecoded absorbed track
+        # so its miss finalizes (never silently fold one track's frames into
+        # another's segment).
         absorbed: set[int] = set()
-        for bi, claimers in blob_claims.items():
-            # A track absorbed (and removed) while resolving an earlier blob
-            # can still appear in this blob's claim set; drop it so we never
-            # index a popped track.
-            live = [ti for ti in claimers if ti not in absorbed]
-            if len(live) < 2:
+        contending: set[int] = set()
+        for bi, contenders in contenders_by_blob.items():
+            if len(contenders) < 2:
                 continue
-            contenders = sorted(
-                live,
+            contenders.sort(
                 key=lambda ti: self._tracks[track_ids[ti]].area_px,
                 reverse=True,
             )
             keeper = contenders[0]
             for ti in contenders[1:]:
                 t = self._tracks[track_ids[ti]]
+                contending.add(ti)
+                # One focus blob per track -> exactly one increment per frame.
                 t.merge_streak += 1
-                if t.merge_streak >= cfg.track_merge_hysteresis_frames:
-                    # Commit the merge: the keeper takes the blob; the absorbed
-                    # track is closed so its (undecoded) frames still finalize.
+                if t.merge_streak < cfg.track_merge_hysteresis_frames:
+                    continue
+                # Commit the merge: the keeper takes the fused blob; the
+                # absorbed track is closed so its (undecoded) frames still
+                # finalize.
+                if matched_blobs.get(bi) == ti:
+                    # The fused blob was greedy-assigned to the absorbed
+                    # track: hand it to the keeper so it still updates a
+                    # track THIS frame.
+                    matched_tracks.pop(ti, None)
+                    prev = matched_tracks.get(keeper)
+                    if prev is not None and prev != bi:
+                        # The keeper abandons its old blob: clear its
+                        # matched_blobs entry so the blob can still
+                        # update/spawn a track this frame. (Unreachable
+                        # under the focus rule — a matched keeper's focus
+                        # IS bi — kept as a local invariant.)
+                        matched_blobs.pop(prev, None)
                     matched_tracks[keeper] = bi
                     matched_blobs[bi] = keeper
+                else:
                     matched_tracks.pop(ti, None)
-                    ev = self._close_track(track_ids[ti])
-                    if ev is not None:
-                        events.append(ev)
-                    absorbed.add(ti)
+                ev = self._close_track(track_ids[ti])
+                if ev is not None:
+                    events.append(ev)
+                absorbed.add(ti)
 
         # Apply per-track lifecycle to matched + unmatched tracks.
         for ti, tid in enumerate(track_ids):
             if ti in absorbed:
                 continue
-            t = self._tracks.get(tid)
-            if t is None:  # closed+removed during merge commit
+            live = self._tracks.get(tid)
+            if live is None:  # closed+removed during merge commit
                 continue
+            if ti not in contending:
+                # Ambiguity cleared (or never present): reset the hysteresis.
+                live.merge_streak = 0
             if ti in matched_tracks:
-                b = blobs[matched_tracks[ti]]
-                # Reset merge hysteresis when no longer contended.
-                if len(blob_claims.get(matched_tracks[ti], ())) < 2:
-                    t.merge_streak = 0
-                ev = self._track_active(frame, t, b)
+                ev = self._track_active(frame, live, blobs[matched_tracks[ti]])
                 if ev is not None:
                     events.append(ev)
             else:
-                ev = self._track_inactive(frame, tid, t)
+                ev = self._track_inactive(frame, tid, live)
                 if ev is not None:
                     events.append(ev)
 
@@ -417,14 +444,15 @@ class MotionGate:
         for bi, b in enumerate(blobs):
             if bi in matched_blobs:
                 continue
-            self._spawn_track(frame, b)
+            ev = self._spawn_track(frame, b)
+            if ev is not None:
+                events.append(ev)
 
         return events
 
     def _track_active(
         self, frame: Frame, t: _Track, b: _Blob
     ) -> SegmentEvent | None:
-        cfg = self._cfg
         t.roi = b.roi
         t.centroid = b.centroid
         t.area_px = b.area_px
@@ -435,27 +463,39 @@ class MotionGate:
         if t.active_streak == 1:
             t.open_backdate = (frame.frame_index, frame.ts)
         t.last_active = (frame.frame_index, frame.ts)
-        if t.open_id is None and t.active_streak >= cfg.open_frames:
-            self._segment_count += 1
-            t.open_id = (
-                f"{self._source_id}-{self._run_token}"
-                f"-{self._segment_count:06d}"
-            )
-            backdate = t.open_backdate or (frame.frame_index, frame.ts)
-            return SegmentEvent(
-                kind=SegmentKind.OPEN,
-                candidate_id=t.open_id,
-                frame_index=backdate[0],
-                ts=backdate[1],
-            )
-        return None
+        return self._maybe_open(t, frame)
+
+    def _maybe_open(self, t: _Track, frame: Frame) -> SegmentEvent | None:
+        """Mint the segment id + OPEN event once the debounce is satisfied.
+
+        The ONE open-condition evaluation, shared by update and spawn: a
+        freshly spawned track (active_streak == 1) must open on its spawn
+        frame when open_frames == 1, matching single mode's debounce
+        (REVIEW_bringup_4d95b67 finding 9)."""
+        if t.open_id is not None or t.active_streak < self._cfg.open_frames:
+            return None
+        self._segment_count += 1
+        t.open_id = (
+            f"{self._source_id}-{self._run_token}"
+            f"-{self._segment_count:06d}"
+        )
+        backdate = t.open_backdate or (frame.frame_index, frame.ts)
+        return SegmentEvent(
+            kind=SegmentKind.OPEN,
+            candidate_id=t.open_id,
+            frame_index=backdate[0],
+            ts=backdate[1],
+        )
 
     def _track_inactive(
         self, frame: Frame, tid: str, t: _Track
     ) -> SegmentEvent | None:
         cfg = self._cfg
         t.missed += 1
-        t.merge_streak = 0
+        # merge_streak is NOT reset here: an unmatched track contending for
+        # the fused blob (a genuine merge leaves the loser unmatched) must
+        # keep accruing its hysteresis; _associate resets the streak for
+        # every track whose ambiguity cleared.
         t.active_streak = 0
         if t.open_id is not None:
             t.quiet_streak += 1
@@ -469,7 +509,7 @@ class MotionGate:
                 self._tracks.pop(tid, None)
         return None
 
-    def _spawn_track(self, frame: Frame, b: _Blob) -> None:
+    def _spawn_track(self, frame: Frame, b: _Blob) -> SegmentEvent | None:
         self._track_count += 1
         tid = f"track-{self._track_count:06d}"
         t = _Track(
@@ -482,6 +522,9 @@ class MotionGate:
             last_active=(frame.frame_index, frame.ts),
         )
         self._tracks[tid] = t
+        # active_streak == 1 can already satisfy open_frames == 1: evaluate
+        # the open condition instead of silently deferring to the next match.
+        return self._maybe_open(t, frame)
 
     def _close_track(self, tid: str) -> SegmentEvent | None:
         t = self._tracks.pop(tid, None)

@@ -131,6 +131,86 @@ def test_matching_identity_strict_connects() -> None:
     src.close()
 
 
+def test_pid_absent_is_unverifiable_never_a_mismatch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """REVIEW bringup-4d95b67: composite devices can expose VID without PID
+    (parse_vid_pid('usb#vid_2560&mi_00') == ('2560', None) is a pinned
+    contract), and the guard formatted '2560:None' — which can never match
+    a valid fingerprint — declaring MISMATCH for the documented pid-absent
+    case. 'Absence is unverifiable, never mismatch': strict must NOT raise,
+    warn must NOT count a mismatch."""
+    pid_absent = IdentityInfo(
+        friendly_name="See3CAM_24CUG",
+        device_path=r"usb#vid_2560&mi_00#composite",
+        vid="2560",
+        pid=None,
+    )
+    cfg = _cfg(CameraIdentity(policy="strict", expected_vid_pid="2560:c128"))
+    with caplog.at_level(logging.INFO, logger="palletscan.sources.camera"):
+        src = _build(cfg, _lister(pid_absent))  # must not raise under strict
+    assert src.connect_mismatches == 0
+    assert any("identity unverifiable" in r.message for r in caplog.records)
+    src.close()
+
+
+def test_vid_pid_still_compares_when_both_present() -> None:
+    """The other side of the pid-absent contract: with BOTH halves present
+    the vid:pid dimension still gates — a matching VID with a different PID
+    is a real mismatch, not 'close enough'."""
+    wrong_pid = IdentityInfo(
+        friendly_name="See3CAM_24CUG",
+        device_path=None,  # forces the ladder onto the vid:pid rung
+        vid="2560",
+        pid="beef",
+    )
+    cfg = _cfg(CameraIdentity(policy="strict", expected_vid_pid="2560:c128"))
+    with pytest.raises(CameraConnectError, match="identity MISMATCH"):
+        _build(cfg, _lister(wrong_pid))
+
+
+def test_strict_identity_raise_releases_the_published_capture() -> None:
+    """REVIEW bringup-4d95b67: the strict identity raise fired AFTER
+    self._cap was published, and the construction path never released it —
+    the open device (for pygrabber: the whole streaming graph + owner
+    thread) leaked on every strict refusal. The capture must be released
+    before the raise propagates."""
+    clock = FakeClock()
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(clock=clock, real_fps=30.0)
+    )
+    cfg = _cfg(CameraIdentity(policy="strict", expected_vid_pid="2560:c128"))
+    with pytest.raises(CameraConnectError, match="identity MISMATCH"):
+        CameraSource(
+            cfg,
+            capture_factory=factory,
+            device_lister=_lister(_IMPOSTOR),
+            clock=clock,
+        )
+    assert len(factory.created) == 1
+    assert factory.created[0].release_calls == 1, (
+        "the strict identity raise leaked the open capture"
+    )
+
+
+def test_strict_msmf_no_identity_raise_releases_the_published_capture() -> None:
+    """Same leak, the guard's other raise path: strict + MSMF pinned
+    fingerprint but NO identity obtainable."""
+    clock = FakeClock()
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(clock=clock, real_fps=30.0)
+    )
+    cfg = _cfg(CameraIdentity(policy="strict", expected_vid_pid="2560:c128"))
+    with pytest.raises(CameraConnectError, match="no identity could be obtained"):
+        CameraSource(
+            cfg,
+            capture_factory=factory,
+            device_lister=_lister(None),
+            clock=clock,
+        )
+    assert factory.created[0].release_calls == 1
+
+
 # -- identity unavailable (macOS, unreadable DevicePath) -----------------------
 
 

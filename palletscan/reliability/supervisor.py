@@ -265,6 +265,64 @@ class ParentWatch:
                     return
 
 
+class StopFileWatch:
+    """Daemon thread that fires ``on_stop`` once when the watched stop-file
+    appears — the writer-level half of the stop-latch channel.
+
+    The supervisor watches ``supervisor.stop``; an unsupervised writer
+    (``run``/``synth``/``replay``) watches ``palletscan.stop`` next to its
+    instance lock, so scripts (and tools/demo.py's smoke stop) can request
+    a graceful drain without a console: CTRL_BREAK needs a shared console,
+    which services and captured-output CI shells often lack. Like the
+    supervisor's, the latch is sticky — this class never deletes the file;
+    whoever created it clears it.
+
+    ``stop()`` must run when the writer command finishes (the
+    ``_WriterLease`` convention: main() runs in-process under pytest and
+    must not leak threads). A file already present at start fires
+    immediately, matching the supervisor's startup-latch honoring.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        on_stop: Callable[[], None],
+        *,
+        poll_s: float = 0.25,
+    ) -> None:
+        self._path = path
+        self._on_stop = on_stop
+        self._poll_s = poll_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="stop-file-watch", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        while True:
+            try:
+                present = self._path.exists()
+            except OSError:  # pragma: no cover - defensive
+                present = False
+            if present:
+                log.info(
+                    "stop-file %s present: draining this writer", self._path
+                )
+                try:
+                    self._on_stop()
+                finally:
+                    return
+            if self._stop.wait(self._poll_s):
+                return
+
+
 def _default_spawn(command: list[str]) -> ChildProcess:
     """Spawn the child with inherited stdio (no pipes — a full pipe would
     deadlock a chatty child) and, on Windows, its own process group so

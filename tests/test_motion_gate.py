@@ -48,6 +48,28 @@ def test_static_stream_produces_no_candidates() -> None:
     assert all(not r.active for r in results)
 
 
+def test_sensor_noise_on_static_scene_is_not_motion() -> None:
+    """REVIEW_bringup_4d95b67 finding 1: _downscale must AVERAGE (one
+    INTER_AREA resize), not decimate. The strided pre-slice made the resize a
+    no-op at 1920x1200 (and 1280x720/960x540), so raw per-pixel sensor noise
+    flooded the frame diff: static scenes read as whole-frame phantom motion
+    (motion_frac 0.14-0.74 observed) and segments never closed."""
+    rng = np.random.default_rng(7)
+    base = np.full((1200, 1920), 120.0, np.float64)
+    cfg = MotionConfig()
+    gate = MotionGate(cfg, "cam0")
+    fracs: list[float] = []
+    for i in range(4):
+        # Static scene + fresh sigma-6 gaussian sensor noise each frame.
+        noisy = np.clip(base + rng.normal(0.0, 6.0, base.shape), 0, 255)
+        res, evs = gate.update(_frame(noisy.astype(np.uint8), i))
+        assert evs == []
+        assert not res.active
+        fracs.append(res.motion_frac)
+    # Frame 0 is warm-up; every diffed frame must sit below the area floor.
+    assert max(fracs[1:]) < cfg.min_area_frac, fracs
+
+
 def test_single_pass_yields_one_segment_with_sane_bounds() -> None:
     cfg = MotionConfig()
     # run_token injected: candidate ids carry a per-run token so a restart

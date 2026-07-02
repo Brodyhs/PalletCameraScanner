@@ -6,9 +6,10 @@ soft ones print WARN and continue):
 1. **Cameras** — runs iff ``cameras:`` is configured (skipped with a
    notice when empty so a pre-hardware station still selftests; or via
    ``--skip-camera``): every entry must enumerate by name, open, take its
-   mode and settings (readback hard-fails on ``controls_reliable``
-   backends, warns on AVFoundation), and deliver ≥ 0.85× the configured
-   fps measured over ~2 s.
+   mode and settings (readback hard-fails on ``readback_reliable``
+   backends, warns where readback is untrustworthy; the exposure-EFFECT
+   check is hard on EVERY backend — it measures pixels, not readback),
+   and deliver ≥ 0.85× the configured fps measured over ~2 s.
 2. **Decode through the full pipeline** — the bundled assets (generated
    by ``tools/make_selftest_assets.py`` and committed; no runtime
    generation) are swept across a synthetic frame by an in-module
@@ -33,13 +34,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from palletscan.config import AppConfig, Backend, apply_overrides
+from palletscan.config import AppConfig, apply_overrides
 from palletscan.sources.base import FrameSource
 from palletscan.sources.camera import (
     CaptureFactory,
     DeviceLister,
-    _pygrabber_capture_factory,
     default_capture_factory,
+    select_capture_factory,
 )
 from palletscan.sources.controls import (
     apply_mode,
@@ -204,12 +205,10 @@ def _check_cameras(
         except ValueError as exc:
             checks.append(CheckResult(f"{name}/resolve", False, str(exc)))
             continue
-        # Per-backend capture dispatch (mirrors CameraSource.__init__): the
-        # pygrabber mono cannot be opened by cv2, so it needs its own factory.
-        if cam.backend is Backend.PYGRABBER and capture_factory is default_capture_factory:
-            cap = _pygrabber_capture_factory(cam)(index, flag)
-        else:
-            cap = capture_factory(index, flag)
+        # Per-backend capture dispatch (shared with CameraSource/calibrate):
+        # the pygrabber mono cannot be opened by cv2, so it needs its own
+        # factory; an injected test factory always wins.
+        cap = select_capture_factory(cam, capture_factory)(index, flag)
         try:
             if not cap.isOpened():
                 checks.append(
@@ -241,12 +240,15 @@ def _check_cameras(
                     f"{name}/controls",
                     not bad,
                     "all controls verified" if not bad else f"unverified: {bad}",
-                    hard=quirks.controls_reliable,
+                    hard=quirks.readback_reliable,
                 )
             )
             if not cam.settings.exposure_auto and cam.settings.exposure is not None:
                 # Perturbs (then restores) the camera — allowed here, never
-                # on the run path. Hard only where controls are reliable.
+                # on the run path. Measures the IMAGE, not readback, so it is
+                # hard on EVERY backend: a physically dead exposure control
+                # must never pass selftest just because readback is
+                # untrusted (REVIEW bringup-4d95b67: gate restoration).
                 effect = verify_exposure_effect(cap, cam.settings.exposure)
                 checks.append(
                     CheckResult(
@@ -255,7 +257,6 @@ def _check_cameras(
                         f"brightness {effect.baseline_mean:.1f} -> "
                         f"{effect.stepped_mean:.1f} (delta {effect.delta:+.1f})"
                         + ("" if effect.ok else f"; {effect.note}"),
-                        hard=quirks.controls_reliable,
                     )
                 )
             m = measure_achieved_fps(cap, sample_s=_FPS_SAMPLE_S, clock=clock)

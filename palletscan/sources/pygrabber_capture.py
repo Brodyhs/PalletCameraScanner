@@ -28,6 +28,24 @@ Delivery model: the graph runs continuously. pygrabber's BufferCB is one-shot
 giving a steady stream. ``read()`` blocks for the NEXT frame (a sequence counter
 under a Condition), matching ``cv2.VideoCapture`` semantics — no stale frames, and
 ``measure_achieved_fps`` reads the real rate (~72 fps at Y8 2064x1552).
+
+Known constraint — RGB24 SampleGrabber: pygrabber hardcodes the grabber media
+type to RGB24 and its ``SampleGrabberCallback.BufferCB`` reshapes the buffer as
+``(h, w, 3)``, so a mono Y8 stream is colour-converted by an inserted DirectShow
+filter and full-copied once inside pygrabber (~9.6 MB/frame at 2064x1552) before
+``_on_frame`` slices one luma channel (one further ~3.2 MB copy — the only
+Python-side copy; cv2 needs a contiguous array). Grabbing Y800/GREY directly
+would require replacing BufferCB (pygrabber's is 3-channel-only), i.e. forking
+pygrabber internals; the measured ~63-72 fps at full res does not justify that
+fork today.
+
+Frame-rate honesty: pygrabber's ``set_format`` programs the capability's OWN
+media type and exposes no ``AvgTimePerFrame`` hook, so this backend can only
+*select* a capability — it cannot program an arbitrary rate. ``set(CAP_PROP_FPS)``
+therefore succeeds only when the negotiated capability is fixed-rate at the
+request; otherwise it returns False so the control report files fps as rejected
+instead of fabricated-verified. ``get(CAP_PROP_FPS)`` returns the known
+device-programmed rate, or 0.0 when the capability's default interval is unknown.
 """
 
 from __future__ import annotations
@@ -72,6 +90,32 @@ _Y8_NAMES = frozenset({"Y8  ", "Y800", "GREY", "Y8", "L8"})
 #: format *preference*); this gates the single-channel *delivery* path.
 _MONO_NAMES = frozenset({"Y8", "Y800", "Y12", "Y16", "GREY", "L8"})
 
+#: Extra wait the constructor grants the owner thread on top of open_timeout_s
+#: (graph build + liveness gate both happen there). Module-level so tests can
+#: shrink it when exercising the constructor-timeout path.
+_READY_GRACE_S = 8.0
+
+#: A capability whose (normalized) framerate range spans no more than this is
+#: fixed-rate: set_format programs its media type, so that rate IS the stream.
+_FPS_FIXED_TOL = 0.01
+
+#: Tolerance when matching a requested fps against a capability rate — covers
+#: the 100 ns frame-interval rounding (e.g. 1e7/138889 = 71.99994 for "72").
+_FPS_MATCH_TOL = 0.5
+
+
+def _framerate_range(f: dict) -> tuple[float, float] | None:
+    """Normalized (lo, hi) fps range of a get_formats() entry, or None.
+
+    pygrabber computes ``min_framerate = 1e7 / MinFrameInterval`` — the SMALLEST
+    interval, i.e. the HIGHEST fps — so its min/max keys arrive swapped; sort.
+    """
+    lo_hi = (f.get("min_framerate"), f.get("max_framerate"))
+    if not all(isinstance(v, (int, float)) for v in lo_hi):
+        return None
+    lo, hi = sorted(float(v) for v in lo_hi)  # type: ignore[arg-type]
+    return lo, hi
+
 
 def patch_pygrabber_subtypes() -> None:
     """Teach pygrabber the mono media-subtype GUIDs (idempotent, in place).
@@ -93,25 +137,49 @@ def choose_format(
     height: int | None,
     *,
     prefer_y8: bool = True,
+    fps: float | None = None,
 ) -> int | None:
-    """Pick a get_formats() entry index: Y8 at the target res, then any Y8,
-    then any entry at the target res. Pure (no cv2) so it is unit-testable."""
+    """Pick a get_formats() entry index. Pure (no cv2) so it is unit-testable.
+
+    Ranking: the EXACT configured resolution outranks pixel-format preference
+    (a wrong-geometry frame trips CameraSource's shape gate -> infinite
+    reconnect loop, so geometry is the hard constraint): Y8 at the target res,
+    then any mono format at the target res (e.g. a Y12-only resolution), then
+    anything at the target res, and only when the target res is absent
+    entirely, any Y8. Within each tier a capability whose framerate range
+    contains ``fps`` is preferred (falling back to tier order if none does).
+    """
 
     def is_y8(f: dict) -> bool:
         return str(f.get("media_type_str", "")).strip() in _Y8_NAMES
 
+    def is_mono(f: dict) -> bool:
+        return str(f.get("media_type_str", "")).strip() in _MONO_NAMES
+
     def is_res(f: dict) -> bool:
         return f.get("width") == width and f.get("height") == height
 
-    order = []
-    if prefer_y8 and width and height:
-        order.append(lambda f: is_y8(f) and is_res(f))
-    if prefer_y8:
-        order.append(is_y8)
+    def fps_ok(f: dict) -> bool:
+        if fps is None:
+            return True
+        rng = _framerate_range(f)
+        if rng is None:
+            return False  # rate unknown: never *preferred*, still reachable
+        lo, hi = rng
+        return lo - _FPS_MATCH_TOL <= fps <= hi + _FPS_MATCH_TOL
+
+    order: list = []
     if width and height:
+        if prefer_y8:
+            order.append(lambda f: is_y8(f) and is_res(f))
+            order.append(lambda f: is_mono(f) and is_res(f))
         order.append(is_res)
+    if prefer_y8:
+        order.append(is_y8)  # geometry fallback: target res offered by nothing
     for pred in order:
-        hit = next((f for f in formats if pred(f)), None)
+        hit = next((f for f in formats if pred(f) and fps_ok(f)), None)
+        if hit is None:
+            hit = next((f for f in formats if pred(f)), None)
         if hit is not None:
             return hit.get("index")
     return None
@@ -119,6 +187,10 @@ def choose_format(
 
 class PyGrabberCaptureError(RuntimeError):
     """Graph build/format selection failed; the capture reports not-opened."""
+
+
+class _StopRequested(Exception):
+    """release() (or a timed-out constructor) set _stop mid-build; bail out."""
 
 
 class PyGrabberCapture:
@@ -131,6 +203,7 @@ class PyGrabberCapture:
         *,
         width: int | None = None,
         height: int | None = None,
+        fps: float | None = None,
         prefer_y8: bool = True,
         open_timeout_s: float = 4.0,
         read_timeout_s: float = 0.5,
@@ -138,6 +211,7 @@ class PyGrabberCapture:
         self._index = index
         self._req_w = width
         self._req_h = height
+        self._req_fps = fps
         self._prefer_y8 = prefer_y8
         self._open_timeout = open_timeout_s
         self._read_timeout = read_timeout_s
@@ -147,7 +221,10 @@ class PyGrabberCapture:
         self._h = height
         self._fourcc_name = "Y8  "
         self._mono = True  # mono backend by purpose; refined from the negotiated fourcc
-        self._fps_echo = float(0)
+        # fps honesty: the capability's advertised range and, when the range is
+        # fixed-rate, the rate set_format actually programmed. None == unknown.
+        self._fps_range: tuple[float, float] | None = None
+        self._fps_actual: float | None = None
 
         # cross-thread state (plain Python, no COM): latest frame + sequence
         self._cond = threading.Condition()
@@ -174,16 +251,26 @@ class PyGrabberCapture:
         )
         self._thread.start()
         # Block construction until the graph is up + first frame proven, or failed.
-        if not self._ready.wait(self._open_timeout + 8.0):
+        if not self._ready.wait(self._open_timeout + _READY_GRACE_S):
             log.error("PyGrabberCapture[%d]: open timed out waiting for owner thread", index)
-            self._stop.set()
-            self._opened = False
+            # Under _cond so the abandoned owner thread's _opened transition
+            # (also under _cond, gated on _stop) can never resurrect this
+            # capture; it bails at its next _check_stop and tears down.
+            with self._cond:
+                self._stop.set()
+                self._opened = False
+                self._cond.notify_all()
 
     # -- owner thread: ALL DirectShow/COM lives here ----------------------
+    def _check_stop(self) -> None:
+        if self._stop.is_set():
+            raise _StopRequested()
+
     def _run(self) -> None:
         patch_pygrabber_subtypes()
         com_init = False
         graph = None
+        dev = None
         try:
             try:
                 comtypes.CoInitialize()
@@ -192,25 +279,45 @@ class PyGrabberCapture:
                 pass  # already initialized on this thread (tolerable)
             from pygrabber.dshow_graph import FilterGraph, FilterType
 
+            # A timed-out constructor (or an early release()) sets _stop while
+            # we are still building: re-check between every COM step so an
+            # abandoned thread bails out and NEVER calls graph.run() — that
+            # would stream the EXCLUSIVE UVC device against later opens.
+            self._check_stop()
             graph = FilterGraph()
+            self._check_stop()
             graph.add_video_input_device(self._index)
+            self._check_stop()
             dev = graph.get_input_device()
             self._select_format(dev)  # raises PyGrabberCaptureError on no match
+            self._check_stop()
             self._cam_ctrl, self._proc_amp = dshow_controls.acquire(dev.instance)
             self._has_controls = bool(self._cam_ctrl or self._proc_amp)
+            self._check_stop()
             graph.add_sample_grabber(self._on_frame)
             graph.add_null_render()
+            self._check_stop()
             graph.prepare_preview_graph()
+            self._check_stop()
             graph.run()
             self._grab_cb = graph.filters[FilterType.sample_grabber].callback
             self._grab_cb.keep_photo = True  # arm the first frame (callback re-arms)
 
-            # Liveness gate: only "open" if a real frame actually arrives.
+            # Liveness gate: only "open" if a real frame actually arrives. The
+            # transition is made under _cond and gated on _stop so it can never
+            # overwrite a concurrent release()'s _opened=False (release() flips
+            # both under the same lock).
             with self._cond:
-                got = self._cond.wait_for(lambda: self._seq > 0, self._open_timeout)
-            self._opened = bool(got)
+                self._cond.wait_for(
+                    lambda: self._seq > 0 or self._stop.is_set(), self._open_timeout
+                )
+                got = self._seq > 0 and not self._stop.is_set()
+                self._opened = got
             if not got:
-                self._build_error = "no frame within open timeout (dead graph)"
+                self._build_error = (
+                    "released during open" if self._stop.is_set()
+                    else "no frame within open timeout (dead graph)"
+                )
                 log.error("PyGrabberCapture[%d]: %s", self._index, self._build_error)
             else:
                 log.info("PyGrabberCapture[%d]: streaming %s %sx%s via DirectShow",
@@ -218,6 +325,10 @@ class PyGrabberCapture:
             self._ready.set()
             if got:
                 self._command_loop()  # serve control set()s on this COM thread; frames flow via callback
+        except _StopRequested:
+            self._build_error = "released during graph build"
+            self._opened = False
+            self._ready.set()
         except Exception as exc:  # build/run failure
             self._build_error = repr(exc)
             self._opened = False
@@ -225,6 +336,12 @@ class PyGrabberCapture:
             self._ready.set()
         finally:
             self._teardown(graph)
+            # Drop the frame's COM interface refs (FilterGraph internals, the
+            # device IBaseFilter) BEFORE CoUninitialize: comtypes Release()s
+            # from __del__, and releasing an interface after its apartment is
+            # uninitialized is undefined per COM rules.
+            graph = None
+            dev = None
             if com_init:
                 try:
                     comtypes.CoUninitialize()
@@ -233,7 +350,10 @@ class PyGrabberCapture:
 
     def _select_format(self, dev) -> None:
         formats = dev.get_formats()  # may raise -> caught as build failure
-        idx = choose_format(formats, self._req_w, self._req_h, prefer_y8=self._prefer_y8)
+        idx = choose_format(
+            formats, self._req_w, self._req_h,
+            prefer_y8=self._prefer_y8, fps=self._req_fps,
+        )
         if idx is None:
             raise PyGrabberCaptureError(
                 f"no Y8/target-res format among {len(formats)} for index {self._index}"
@@ -244,6 +364,15 @@ class PyGrabberCapture:
         self._h = chosen.get("height", self._req_h)
         self._fourcc_name = (str(chosen.get("media_type_str", "Y8  ")).strip() or "Y8") + ""
         self._mono = self._fourcc_name in _MONO_NAMES
+        # set_format programs the capability's OWN media type: only a
+        # fixed-rate capability tells us the streamed rate. A ranged
+        # capability's default AvgTimePerFrame is not exposed by pygrabber,
+        # so the actual rate stays unknown (get() reports 0.0 honestly).
+        self._fps_range = _framerate_range(chosen)
+        if self._fps_range is not None:
+            lo, hi = self._fps_range
+            if hi - lo <= _FPS_FIXED_TOL:
+                self._fps_actual = hi
 
     def _teardown(self, graph) -> None:
         if graph is None:
@@ -283,13 +412,24 @@ class PyGrabberCapture:
         if prop == cv2.CAP_PROP_AUTO_EXPOSURE:
             # DSHOW-style sentinel: >=0.5 == auto. Re-assert exposure under the
             # new flag (using the current value) so manual/auto actually flips.
-            self._ae_auto = value >= 0.5
-            if self._cam_ctrl is not None:
-                try:
-                    cur, _f = self._cam_ctrl.Get(dshow_controls.CameraControl_Exposure)
-                    dshow_controls.set_exposure(self._cam_ctrl, cur, auto=self._ae_auto)
-                except Exception:
-                    pass
+            # Honest failure: without a camera control, or when the driver
+            # write fails, the flag never reached hardware — report None so
+            # set() returns False (no fabricated sentinel readback).
+            auto = value >= 0.5
+            if self._cam_ctrl is None:
+                return None
+            try:
+                cur, _f = self._cam_ctrl.Get(dshow_controls.CameraControl_Exposure)
+            except Exception:
+                log.warning(
+                    "PyGrabberCapture[%d]: auto-exposure flag readback failed",
+                    self._index, exc_info=True,
+                )
+                return None
+            rb = dshow_controls.set_exposure(self._cam_ctrl, cur, auto=auto)
+            if rb is None:
+                return None
+            self._ae_auto = auto  # only track a flag the driver confirmed
             return value  # echo the sentinel so apply_settings verifies the flag
         if prop == cv2.CAP_PROP_EXPOSURE:
             rb = dshow_controls.set_exposure(self._cam_ctrl, value, auto=self._ae_auto)
@@ -354,7 +494,10 @@ class PyGrabberCapture:
         if prop == cv2.CAP_PROP_FRAME_HEIGHT:
             return float(self._h or 0)
         if prop == cv2.CAP_PROP_FPS:
-            return float(self._fps_echo)
+            # Honest: the rate we KNOW the device was programmed to (a
+            # fixed-rate capability), else 0.0 (cv2 "unknown") — never a
+            # mirror of the caller's request.
+            return float(self._fps_actual) if self._fps_actual is not None else 0.0
         if prop == cv2.CAP_PROP_FOURCC:
             # Honest: the real negotiated mono fourcc. We publish a single luma
             # channel in _on_frame for mono formats, so to_gray no-ops (2-D
@@ -384,18 +527,38 @@ class PyGrabberCapture:
         # Mode/format is fixed when the graph is built; accept the props the
         # connect path replays (so apply_mode stays warn-free) and ignore the rest.
         if prop == cv2.CAP_PROP_FPS:
-            self._fps_echo = value
-            return True
+            # The frame interval is NOT programmable through pygrabber's
+            # set_format (no AvgTimePerFrame hook), so the request is honored
+            # only when the negotiated capability is fixed-rate at (tolerably)
+            # this value; otherwise reject so apply_mode files fps as rejected
+            # instead of fabricated-verified (see module docstring).
+            return (
+                self._fps_actual is not None
+                and abs(self._fps_actual - value) <= _FPS_MATCH_TOL
+            )
         if prop in (cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT,
                     cv2.CAP_PROP_FOURCC, cv2.CAP_PROP_CONVERT_RGB):
             return True
         return False
 
     def release(self) -> None:
-        self._opened = False
-        self._stop.set()
+        # _stop and _opened flip together under _cond: the owner thread's
+        # _opened transition takes the same lock and re-checks _stop, so a
+        # release() can never be overwritten by a late "graph is live".
         with self._cond:
+            self._stop.set()
+            self._opened = False
             self._cond.notify_all()
         t = self._thread
         if t is not None and t.is_alive() and t is not threading.current_thread():
             t.join(timeout=3.0)
+            if t.is_alive():
+                # Unavoidable wedged-COM case: the owner thread is blocked
+                # INSIDE a single COM/driver call (_check_stop only runs
+                # between build steps). Abandon the daemon thread rather than
+                # hang the caller; its graph is reclaimed only at process exit.
+                log.warning(
+                    "PyGrabberCapture[%d]: owner thread still alive 3s after "
+                    "release (wedged COM call); abandoning daemon thread",
+                    self._index,
+                )

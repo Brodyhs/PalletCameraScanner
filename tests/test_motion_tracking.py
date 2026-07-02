@@ -195,22 +195,13 @@ def test_brief_merge_does_not_churn_ids() -> None:
 
 
 def _contended_stream(n: int, conv: int, glide: int, gap: int = 24) -> list[np.ndarray]:
-    """Drive the merge-COMMIT branch: two ALREADY-OPEN tracks contend over the
-    SAME blob for >= the hysteresis window.
-
-    ``_banded`` does NOT exercise that branch — it fuses the pair into one blob
-    so the loser simply goes unmatched and AGES OUT via the quiet path; the
-    merge-commit ``_close_track`` on an absorbed contender is never reached.
-
-    Here a big square (A) and a small square (B) open as two separate tracks,
-    then B glides up beside A so the pair sits as TWO distinct-but-tightly-
-    -overlapping blobs (a thin BG gap survives the dilation, so they stay two
-    components). With overlapping ROIs and near centroids, BOTH live tracks
-    gate-claim BOTH blobs every frame; the smaller absorbed track stays MATCHED
-    (so it does not reset its merge streak via the inactive path) while its
-    matched blob is contended. After ``hysteresis`` such frames the merge
-    COMMITS: the absorbed track is closed from ``_associate`` (not quiet-aged)
-    and its orphan blob re-spawns a fresh track."""
+    """Two persistent DISTINCT blobs in tight contention range (side-by-side
+    pallets): a big square (A) and a small square (B) open as two separate
+    tracks, then B glides up beside A so the pair rides on as TWO distinct-
+    but-tightly-overlapping blobs (a thin BG gap survives the dilation, so
+    they stay two components). With overlapping padded ROIs and near
+    centroids, every cross blob<->track pair stays gate-ELIGIBLE, yet each
+    track keeps matching 1:1 to its own real blob every frame."""
     frames = []
     for i in range(n):
         img = _blank()
@@ -225,41 +216,117 @@ def _contended_stream(n: int, conv: int, glide: int, gap: int = 24) -> list[np.n
             ay = 120 + 25 + 45 + gap  # A settles a thin gap below B
             cay = int(260 + (ay - 260) * k)
             _square(img, bx, 120, v, size=50)  # B
-            _square(img, ax, cay, v, size=90)  # A (larger == the keeper)
+            _square(img, ax, cay, v, size=90)  # A (larger)
         frames.append(img)
     return frames
 
 
-def test_sustained_merge_commits_and_reemits() -> None:
-    """Sustained contention between two OPEN tracks commits the merge: the
-    absorbed (smaller) track gets its own CLOSE from the merge-commit path —
-    so its miss still finalizes (never silently folded into the survivor's
-    segment) — and its orphan blob re-opens a fresh track. The tell is that
-    MORE than two segments open over the run; with merge-commit disabled the
-    pair simply rides to flush as exactly two."""
-    # Disable the de-fragment CLOSE here so it doesn't fuse the two tightly-
-    # contending blobs into one component before they can contend — this test
-    # isolates the merge-commit path (the CLOSE has its own regression test,
-    # test_close_coalesces_fragmented_object_into_one_blob; the two mechanisms
-    # are orthogonal).
+def test_side_by_side_distinct_blobs_never_merge() -> None:
+    """REVIEW_bringup_4d95b67 finding 9 (a)+(c): two tracks each matched 1:1
+    to their OWN persistent distinct blob must never be treated as a merge,
+    however long the cross pairs stay gate-eligible. The old detection ran on
+    the FULL gate-eligible pair set, so side-by-side pallets accrued
+    merge_streak (twice per frame with two mutually-contended blobs — halving
+    the hysteresis window) until the smaller, correctly-tracked segment was
+    force-closed mid-zone as "absorbed" (premature MissEvent) and its real
+    blob was orphaned for that frame.
+
+    JUSTIFICATION for replacing test_sustained_merge_commits_and_reemits: that
+    test PINNED the buggy behavior — it drove the commit path with two
+    persistent DISTINCT blobs (each track matched to its own real object) and
+    required >2 opens, i.e. exactly the premature force-close finding 9
+    condemns. The genuine merge-commit path (the blobs actually FUSING into
+    one component) is pinned by
+    test_genuine_merge_commit_closes_absorbed_track_after_hysteresis below."""
+    # De-fragment CLOSE disabled so the two tightly-adjacent blobs stay two
+    # distinct components (with it on, they would genuinely fuse).
     cfg = _multi_cfg(
         track_merge_hysteresis_frames=3, quiet_frames=6, track_close_kernel_frac=0.0
     )
     gate = MotionGate(cfg, "cam0", run_token="t0")
-    _, events = _run(gate, _contended_stream(26, 8, 6))
-    opens = [e for e in events if e.kind is SegmentKind.OPEN]
-    closes = [e for e in events if e.kind is SegmentKind.CLOSE]
-    # The merge commit closes the absorbed track mid-run and re-spawns it, so
-    # strictly MORE than the two original segments exist. (With merge-commit
-    # disabled the two tracks never churn -> exactly two opens.)
-    assert len(opens) >= 3, [e.candidate_id for e in events]
-    opened_ids = {e.candidate_id for e in opens}
-    closed_ids = {e.candidate_id for e in closes}
-    # Every opened segment is accounted for by a CLOSE: the absorbed track's
-    # miss can finalize because the merge-commit emitted its CLOSE rather than
-    # letting it be silently swallowed by the survivor's segment.
-    assert opened_ids <= closed_ids, (
-        f"an opened track was never closed: opened={opened_ids} closed={closed_ids}"
+    frames = _contended_stream(30, 8, 6)
+    results = []
+    mid_events = []
+    for i, img in enumerate(frames):
+        res, evs = gate.update(_frame(img, i))
+        results.append(res)
+        mid_events.extend(evs)
+    opens = [e for e in mid_events if e.kind is SegmentKind.OPEN]
+    closes = [e for e in mid_events if e.kind is SegmentKind.CLOSE]
+    assert len(opens) == 2, [e.candidate_id for e in mid_events]
+    assert closes == [], "a track matched to its own distinct blob was merged away"
+    # A track matched 1:1 to its own blob is never a merge candidate, so no
+    # hysteresis ever accrues.
+    assert all(t.merge_streak == 0 for t in gate._tracks.values())
+    # Both objects keep updating through the whole contended tail...
+    assert all(len(r.tracks) == 2 for r in results[-8:])
+    # ...and both ride to the flush, where each gets its own CLOSE.
+    tail = gate.flush()
+    assert {e.candidate_id for e in tail} == {e.candidate_id for e in opens}
+
+
+def _fusing_stream(n: int, fuse_at: int) -> list[np.ndarray]:
+    """Two objects ride separate bands, then genuinely FUSE: from ``fuse_at``
+    on, ONE blob replaces both (their masks merge into a single component —
+    an actual merge, not mere side-by-side proximity)."""
+    frames = []
+    for i in range(n):
+        img = _blank()
+        x = 50 + i * 8
+        v = _val(i)
+        if i < fuse_at:
+            _square(img, x, 110, v, size=90)  # A: larger -> the keeper
+            _square(img, x, 250, v, size=56)  # B: smaller -> absorbed
+        else:
+            _square(img, x, 180, v, size=90)  # the fused single blob
+        frames.append(img)
+    return frames
+
+
+def test_genuine_merge_commit_closes_absorbed_track_after_hysteresis() -> None:
+    """REVIEW_bringup_4d95b67 finding 9 (b) + hysteresis timing: when the
+    blobs ACTUALLY fuse, the losing track goes unmatched while its best
+    gate-eligible blob is the fused (contended) one; after exactly
+    track_merge_hysteresis_frames such frames the merge commits — the
+    absorbed track gets its own CLOSE (its miss still finalizes, never
+    silently folded into the survivor's segment) and the fused blob still
+    updates the keeper THAT same frame. Pre-fix, the unmatched loser's
+    merge_streak was reset every frame by the inactive path, so a genuine
+    merge never committed and the loser lingered to the much-later quiet
+    close."""
+    hyst, quiet, fuse_at = 3, 8, 10
+    cfg = _multi_cfg(track_merge_hysteresis_frames=hyst, quiet_frames=quiet)
+    gate = MotionGate(cfg, "cam0", run_token="t0")
+    results = []
+    timed: list[tuple[int, object]] = []
+    for i, img in enumerate(_fusing_stream(24, fuse_at)):
+        res, evs = gate.update(_frame(img, i))
+        results.append(res)
+        timed.extend((i, ev) for ev in evs)
+    tail = gate.flush()
+
+    opens = [(i, e) for i, e in timed if e.kind is SegmentKind.OPEN]
+    closes = [(i, e) for i, e in timed if e.kind is SegmentKind.CLOSE]
+    assert len(opens) == 2, [e.candidate_id for _, e in timed]
+    # Exactly one mid-run CLOSE: the absorbed (smaller, second-opened) track,
+    # emitted on the commit frame — exactly `hyst` contended frames after the
+    # fusion — NOT quiet_frames later via quiet aging.
+    assert len(closes) == 1, closes
+    commit_frame, close_ev = closes[0]
+    assert close_ev.candidate_id == opens[1][1].candidate_id
+    assert commit_frame == fuse_at + hyst - 1, (
+        f"absorbed CLOSE emitted at frame {commit_frame}; expected "
+        f"{fuse_at + hyst - 1} (merge hysteresis), not "
+        f"~{fuse_at + quiet - 1} (quiet aging)"
+    )
+    # The fused blob still updates the keeper on the commit frame: exactly
+    # the keeper surfaces, freshly matched.
+    surviving = results[commit_frame].tracks
+    assert [t.track_id for t in surviving] == [opens[0][1].candidate_id]
+    assert surviving[0].missed == 0
+    # Every opened segment is accounted for by a CLOSE (commit or flush).
+    assert {e.candidate_id for _, e in opens} == (
+        {close_ev.candidate_id} | {e.candidate_id for e in tail}
     )
 
 
@@ -300,6 +367,65 @@ def test_max_objects_cap() -> None:
         frames.append(img)
     results, _ = _run(gate, frames)
     assert max(len(r.tracks) for r in results) <= 2
+
+
+def test_open_frames_one_spawn_parity_with_single_mode() -> None:
+    """REVIEW_bringup_4d95b67 finding 9 tail: _spawn_track hardcoded
+    active_streak=1 WITHOUT evaluating the open condition, so with
+    open_frames=1 an object that appears and then stops moving (one active
+    diff, then quiet) never opened in multi mode — single mode opens on that
+    very frame and later emits a proper CLOSE. The spawn must run the same
+    debounce evaluation as a matched update."""
+    frames = []
+    for i in range(20):
+        img = _blank()
+        if i >= 5:
+            _square(img, 320, 180, 220, size=100)  # appears at 5, then static
+        frames.append(img)
+
+    single = MotionGate(
+        MotionConfig(open_frames=1, quiet_frames=5), "cam0", run_token="t0"
+    )
+    _, single_events = _run(single, frames)
+    assert [e.kind for e in single_events] == [SegmentKind.OPEN, SegmentKind.CLOSE]
+
+    multi = MotionGate(
+        _multi_cfg(open_frames=1, quiet_frames=5), "cam0", run_token="t0"
+    )
+    _, multi_events = _run(multi, frames)
+    # Parity: same OPEN/CLOSE shape, anchored on the same appearance frame.
+    assert [e.kind for e in multi_events] == [SegmentKind.OPEN, SegmentKind.CLOSE]
+    assert multi_events[0].frame_index == single_events[0].frame_index
+
+
+def test_quiet_frames_do_not_surface_stale_tracks() -> None:
+    """REVIEW_bringup_4d95b67 finding 15 (gate half): an OPEN track that went
+    UNMATCHED this frame must not surface in MotionResult.tracks — app.py
+    decodes every surfaced ROI, so a stale ROI would be re-decoded on every
+    quiet frame until the close (single mode gates decode on THIS frame's
+    motion). The track still stays alive inside the gate and closes through
+    the ordinary quiet path."""
+    cfg = _multi_cfg(quiet_frames=6)
+    gate = MotionGate(cfg, "cam0", run_token="t0")
+    frames = []
+    for i in range(20):
+        img = _blank()
+        if i < 10:
+            _square(img, 60 + i * 10, 180, _val(i), size=90)
+        frames.append(img)
+    results = []
+    events = []
+    for i, img in enumerate(frames):
+        res, evs = gate.update(_frame(img, i))
+        results.append(res)
+        events.extend(evs)
+    # Frame 10 carries the disappearance diff (last real motion); the quiet
+    # tail before the close must surface NO tracks and read inactive.
+    for r in results[11:16]:
+        assert r.tracks == (), "stale unmatched track surfaced for decode"
+        assert not r.active
+    # Eviction is unchanged: the quiet path still closes the segment.
+    assert [e.kind for e in events] == [SegmentKind.OPEN, SegmentKind.CLOSE]
 
 
 def test_break_segment_closes_all_open_tracks() -> None:

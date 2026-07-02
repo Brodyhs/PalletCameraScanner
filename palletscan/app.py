@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+import time
+from concurrent.futures import (
+    Executor,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+)
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -227,6 +233,16 @@ class PipelineRunner:
         self._idle_scan_s = cfg.motion.idle_scan_s
         self._last_idle_scan = 0.0
         self._idle_reads = 0
+        # ONE decode context persists across idle scans (reset on a successful
+        # read) so frames_attempted accrues and the step-3 variant fan-out can
+        # engage for a stubborn static code — a fresh context per scan pinned
+        # it at 0 forever (REVIEW_bringup_4d95b67).
+        self._idle_ctx = PassDecodeContext()
+        # At most one idle scan in flight; it runs on the decode executor,
+        # never inline on the pipeline thread (the legacy pyzbar step has no
+        # timeout on a full frame). Idle results feed only _idle_reads and the
+        # preview — never tracker accounting — so async delivery is safe.
+        self._idle_future: Future[list[DecodeResult]] | None = None
         self._engine = DecodeEngine(
             cfg.decode, self._executor, observe_wall_ms=self.metrics.record_decode_wall_ms
         )
@@ -403,7 +419,18 @@ class PipelineRunner:
             # route its decodes to that track's segment, so a decoded pallet
             # never swallows a co-located undecoded one's MissEvent. A track's
             # ``track_id`` IS its segment candidate_id (set by the gate).
-            for track in result.tracks:
+            # The per-track calls SHARE one frame budget — a fresh budget per
+            # track burned budget x track_max_objects on the pipeline thread —
+            # and the starting track rotates by frame_index so one slow ROI
+            # cannot permanently starve the rest (REVIEW_bringup_4d95b67
+            # finding 15).
+            deadline = (
+                time.perf_counter() + self._cfg.decode.frame_budget_ms / 1000.0
+            )
+            n = len(result.tracks)
+            start = frame.frame_index % n
+            for k in range(n):
+                track = result.tracks[(start + k) % n]
                 ctx = self._tracker.ctx_for(track.track_id)
                 if ctx is None:
                     continue
@@ -411,30 +438,65 @@ class PipelineRunner:
                 self._tracker.on_decode(track.track_id, td)
                 if td:
                     decodes = decodes + td
+                if time.perf_counter() >= deadline:
+                    break  # budget exhausted; the rotation resumes next frame
         elif result.active and result.roi is not None:
             ctx = self._tracker.open_ctx
             if ctx is not None:
                 decodes = self._engine.decode_frame(frame, result.roi, ctx)
                 self._tracker.on_decode(result.candidate_id, decodes)
+        idle = self._harvest_idle_scan()
+        if idle:
+            self._idle_reads += len(idle)
+            decodes = decodes + idle
         if (
-            not self._tracker.has_open
+            self._idle_future is None
+            and not self._tracker.has_open
             and self._idle_scan_s > 0.0
             and frame.ts - self._last_idle_scan >= self._idle_scan_s
         ):
             # No motion segment open: periodically full-frame-decode so a STOPPED
             # pallet / static code is still read + shown. Additive to the preview
-            # + idle_reads counter ONLY — never the segment pass/miss accounting.
+            # + idle_reads counter ONLY — never the segment pass/miss accounting
+            # (which is what makes the executor hand-off safe; results are
+            # harvested on a later frame).
             self._last_idle_scan = frame.ts
             h, w = frame.image.shape[:2]
-            idle = self._engine.decode_frame(frame, Roi(0, 0, w, h), PassDecodeContext())
-            if idle:
-                self._idle_reads += len(idle)
-                decodes = decodes + idle
+            full = Roi(0, 0, w, h)
+            if isinstance(self._executor, ThreadPoolExecutor):
+                self._idle_future = self._executor.submit(
+                    self._engine.decode_frame, frame, full, self._idle_ctx
+                )
+            else:
+                # A process pool cannot pickle the engine; keep the scan
+                # inline there (legacy behavior) but harvest it uniformly.
+                fut: Future[list[DecodeResult]] = Future()
+                fut.set_result(
+                    self._engine.decode_frame(frame, full, self._idle_ctx)
+                )
+                self._idle_future = fut
         for ev in seg_events:
             if ev.kind is SegmentKind.CLOSE:
                 self._tracker.on_segment_close(ev)
         if self.preview is not None:
             self.preview.update(frame, result, decodes)
+
+    def _harvest_idle_scan(self) -> list[DecodeResult]:
+        """Non-blocking pickup of a finished async idle scan, if any."""
+        fut = self._idle_future
+        if fut is None or not fut.done():
+            return []
+        self._idle_future = None
+        try:
+            idle = fut.result()
+        except Exception:
+            log.exception("idle scan failed")
+            return []
+        if idle:
+            # A successful read re-arms the fan-out gate: the next static
+            # code starts from a fresh, unconfirmed context.
+            self._idle_ctx = PassDecodeContext()
+        return idle
 
     def _pipeline_loop(self) -> None:
         try:

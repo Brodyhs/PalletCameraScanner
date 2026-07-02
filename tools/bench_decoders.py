@@ -28,6 +28,16 @@ TASKS_PER_RUN = 60
 WORKER_COUNTS = (1, 2, 4)
 
 
+def _p95(latencies_ms: list[float]) -> float:
+    """Interpolated 95th percentile for any n >= 1.
+
+    ``statistics.quantiles(n=20)`` requires >= 20 samples, and the hard
+    workload has only 18 — the old ``len >= 20`` guard silently printed
+    max() under a column headed "p95 ms". numpy's linear interpolation is
+    defined for any sample count (callers still label small n honestly)."""
+    return float(np.percentile(latencies_ms, 95))
+
+
 def _make_hard_workload() -> list[tuple[str, np.ndarray, Symbology, str]]:
     """Harder QR+DM crops (low pitch x heavier motion blur) to separate a
     robust decoder from a fragile one. Each item carries its true payload."""
@@ -78,11 +88,12 @@ def _compare_read_rate() -> None:
             got = fn(img, sym)
             lat.append((time.perf_counter() - t) * 1000)
             reads += payload in got
-        p95 = statistics.quantiles(lat, n=20)[18] if len(lat) >= 20 else max(lat)
         print(
             f"{label:<10} {reads:>5}/{len(work):<2} {reads / len(work):>6.0%} "
-            f"{statistics.median(lat):>8.1f} {p95:>8.1f}"
+            f"{statistics.median(lat):>8.1f} {_p95(lat):>8.1f}"
         )
+    if len(work) < 20:
+        print(f"(p95 linearly interpolated from n={len(work)} samples per engine)")
     print()
 
 
@@ -129,7 +140,7 @@ def _bench(executor_cls, workers: int, tasks) -> tuple[float, float, float]:
     return (
         wall,
         statistics.median(latencies),
-        statistics.quantiles(latencies, n=20)[18],  # p95
+        _p95(latencies),
     )
 
 

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import threading
+import traceback
 from types import SimpleNamespace
 
 import cv2
@@ -131,13 +134,97 @@ def test_windows_enumeration_reads_friendly_name_and_identity(
 def test_windows_enumeration_failure_returns_empty_loudly(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    import sys
+    """A COM enumeration failure on the win32 branch degrades to [] LOUDLY,
+    naming the actual exception in the WARNING. The failure is injected at
+    the enumeration seam — the previous version deleted pygrabber from
+    sys.modules, which on any Windows box with pygrabber installed silently
+    re-imported it and ran REAL COM enumeration inside a unit test."""
+    import palletscan.sources.devices as dev_mod
 
-    monkeypatch.delitem(sys.modules, "pygrabber", raising=False)
-    monkeypatch.delitem(sys.modules, "pygrabber.dshow_graph", raising=False)
+    def boom() -> list:
+        raise RuntimeError("COMError: CreateClassEnumerator failed")
+
+    monkeypatch.setattr(dev_mod, "_enumerate_windows_monikers", boom)
+    # Skip real COM init so the test is deterministic on every platform
+    # (comtypes may not even be installed off-Windows).
+    monkeypatch.setattr(dev_mod, "_co_initialize_thread", lambda: False)
     with caplog.at_level("WARNING"):
-        assert list_devices(platform="win32") == []  # import fails on macOS
-    assert any("fallback_index" in r.message for r in caplog.records)
+        assert list_devices(platform="win32") == []
+    record = next(r for r in caplog.records if "fallback_index" in r.message)
+    # Finding: the outer except must log the ACTUAL exception loudly.
+    assert "CreateClassEnumerator" in record.getMessage()
+
+
+def test_broken_moniker_is_skipped_not_fatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One moniker whose FriendlyName property read raises must be skipped
+    (logged), never abort the WHOLE enumeration to []. The surviving device
+    keeps its enumeration POSITION as index — skipping never compacts the
+    CAP_DSHOW pairing."""
+
+    def read_str(m, prop):
+        if m.get("broken"):
+            raise OSError("property bag read failed (COMError)")
+        return m[prop]
+
+    monikers = [
+        {"broken": True},
+        {
+            "FriendlyName": "See3CAM_24CUG",
+            "DevicePath": r"usb#vid_2560&pid_c128&mi_00#x",
+        },
+    ]
+    with caplog.at_level("WARNING"):
+        devs = devices_from_monikers(
+            monikers, int(cv2.CAP_DSHOW), read_str=read_str
+        )
+    assert [(d.name, d.index) for d in devs] == [("See3CAM_24CUG", 1)]
+    assert devs[0].identity is not None
+    assert (devs[0].identity.vid, devs[0].identity.pid) == ("2560", "c128")
+    assert any(
+        "skipping" in r.message and "FriendlyName" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="real COM enumeration is win32-only"
+)
+def test_list_devices_initializes_com_on_a_fresh_thread(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """comtypes auto-initializes COM only on its importing thread, so
+    list_devices() from any OTHER thread (the watchdog consumer thread that
+    runs every reopen) raised CO_E_NOTINITIALIZED — swallowed to []. The
+    enumeration path must CoInitialize its calling thread (balanced).
+
+    Runs the REAL enumeration on a fresh thread. No devices are required
+    (an empty box is legal); a COM-init-driven failure is not."""
+    results: list[list] = []
+
+    def worker() -> None:
+        results.append(list_devices(platform="win32"))
+
+    with caplog.at_level("WARNING", logger="palletscan.sources.devices"):
+        t = threading.Thread(target=worker, name="fresh-com-thread")
+        t.start()
+        t.join(timeout=30.0)
+    assert not t.is_alive()
+    assert results, "list_devices never returned"
+    assert isinstance(results[0], list)
+    failures = [
+        r for r in caplog.records if "device enumeration failed" in r.message
+    ]
+    texts = [
+        r.getMessage()
+        + ("".join(traceback.format_exception(*r.exc_info)) if r.exc_info else "")
+        for r in failures
+    ]
+    assert not any(
+        "CoInitialize has not been called" in t or "-2147221008" in t
+        for t in texts
+    ), f"enumeration swallowed a COM-init failure: {texts}"
 
 
 # -- find_device ---------------------------------------------------------------

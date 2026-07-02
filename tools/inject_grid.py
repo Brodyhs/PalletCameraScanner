@@ -40,12 +40,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np  # noqa: E402
 
-from palletscan.app import PipelineRunner  # noqa: E402
-from palletscan.config import AppConfig, SyntheticConfig, apply_overrides, load_config  # noqa: E402
+from palletscan.app import PipelineRunner, reconcile_truth  # noqa: E402
+from palletscan.config import (  # noqa: E402
+    AppConfig,
+    SyntheticConfig,
+    apply_overrides,
+    load_config,
+    resolve_camera,
+)
 from palletscan.sources.base import FrameSource  # noqa: E402
-from palletscan.sources.camera import build_camera_source  # noqa: E402
+from palletscan.sources.camera import CameraSource  # noqa: E402
 from palletscan.sources.inject import CameraInjectionSource  # noqa: E402
-from palletscan.types import Frame, Symbology  # noqa: E402
+from palletscan.types import Symbology  # noqa: E402
 
 # --- DECODABLE BASELINE ------------------------------------------------------
 # Every SyntheticConfig range collapsed to a degenerate (v, v) single value at a
@@ -164,13 +170,27 @@ class _SharedLiveInner(FrameSource):
         self._wrapped.close()
 
 
-def _reconcile(runner: PipelineRunner, src: CameraInjectionSource) -> tuple[int, int, int, list[float]]:
-    """Join truth -> events EXACTLY as tools/inject_run.py does.
+def _build_shared_inner(app_cfg: AppConfig, **camera_kwargs) -> _SharedLiveInner:
+    """Open the BARE CameraSource once and wrap it in the close-guarded adapter.
 
-    Returns (decoded, missed, unaccounted, ttfd_ms_list). Accounting is by FRAME
-    overlap, not time: a live camera's event ts is monotonic capture time (not
-    frame_index/fps), so reconcile_truth's time-window match misaligns. This
-    mirrors inject_run.py's _ov frame-overlap accounting verbatim."""
+    Deliberately NOT ``build_camera_source()``: that returns the
+    WatchdogSource, whose ``frames()`` is strictly single-use (it raises on a
+    second call) — wrapping it makes every grid point after the first fail.
+    The bare CameraSource is re-iterable while the device stays open, which is
+    exactly the contract the adapter's docstring promises. ``camera_kwargs``
+    passes the CameraSource test seams (capture_factory/device_lister/clock)
+    through unchanged."""
+    return _SharedLiveInner(CameraSource(resolve_camera(app_cfg), **camera_kwargs))
+
+
+def _reconcile(runner: PipelineRunner, src: CameraInjectionSource) -> tuple[int, int, int, list[float]]:
+    """Join truth -> events with the app's own :func:`reconcile_truth`.
+
+    Returns (decoded, missed, unaccounted, ttfd_ms_list). The injection source
+    records truth as nominal-fps ticks of the live ts clock (TRUTH TIME-BASE
+    in palletscan/sources/inject.py), so ``first_frame / nominal_fps`` lands
+    on the same ts axis live Pass/MissEvent timestamps use — the old
+    frame-index overlap workaround is no longer the truth's unit."""
     events = getattr(runner, "collected_events", [])
     passes = {ev.payload: ev for ev in events if getattr(ev, "kind", None) == "pass"}
     ttfds = [
@@ -178,24 +198,8 @@ def _reconcile(runner: PipelineRunner, src: CameraInjectionSource) -> tuple[int,
         for rec in src.truth
         if rec.payload in passes and passes[rec.payload].first_decode_ts is not None
     ]
-    miss_spans = [
-        (ev.first_frame, ev.last_frame)
-        for ev in events
-        if getattr(ev, "kind", None) == "miss"
-    ]
-
-    def _ov(a0, a1, b0, b1):
-        return a0 <= b1 and b0 <= a1
-
-    decoded = missed = unacc = 0
-    for r in src.truth:
-        if r.payload in passes:
-            decoded += 1
-        elif any(_ov(r.first_frame, r.last_frame, m0, m1) for m0, m1 in miss_spans):
-            missed += 1
-        else:
-            unacc += 1
-    return decoded, missed, unacc, ttfds
+    rec = reconcile_truth(src.truth, events, src.nominal_fps)
+    return rec.decoded, rec.missed, len(rec.unaccounted), ttfds
 
 
 def run_point(
@@ -282,7 +286,7 @@ def main() -> int:
     # camera source (re-iterable while open) is wrapped in a close-guarded
     # adapter so each per-point CameraInjectionSource.close() can't tear down the
     # shared device — only shutdown() at the end does.
-    shared = _SharedLiveInner(build_camera_source(app_cfg))
+    shared = _build_shared_inner(app_cfg)
     rows: list[dict] = []
     try:
         for i, value in enumerate(values):

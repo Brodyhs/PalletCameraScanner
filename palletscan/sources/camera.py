@@ -103,9 +103,34 @@ def _pygrabber_capture_factory(cfg: CameraConfig) -> CaptureFactory:
     def factory(index: int, backend: int) -> Capture:
         from palletscan.sources.pygrabber_capture import PyGrabberCapture
 
-        return PyGrabberCapture(index, width=cfg.width, height=cfg.height)
+        # fps must be forwarded for the capability selection to prefer a
+        # format whose framerate range contains the configured rate — without
+        # it the graph negotiates the driver default and apply_mode files the
+        # configured fps as rejected (honest, but avoidably so).
+        return PyGrabberCapture(
+            index, width=cfg.width, height=cfg.height, fps=cfg.fps
+        )
 
     return factory
+
+
+def select_capture_factory(
+    cfg: CameraConfig, override: CaptureFactory | None = None
+) -> CaptureFactory:
+    """Per-backend capture dispatch, shared by CameraSource, calibrate and
+    selftest (REVIEW bringup-4d95b67: calibrate built ``cv2.VideoCapture``
+    for EVERY backend, so the Y8-only mono cam could never be calibrated).
+
+    An injected ``override`` (tests) wins; passing the module-level
+    ``default_capture_factory`` counts as "no override" so callers whose
+    default parameter IS that factory dispatch correctly. The pygrabber
+    backend needs a cfg-closed factory (the DirectShow format is fixed
+    before the graph runs); everything else opens through cv2."""
+    if override is not None and override is not default_capture_factory:
+        return override
+    if cfg.backend is Backend.PYGRABBER:
+        return _pygrabber_capture_factory(cfg)
+    return default_capture_factory
 
 
 class CameraSource(FrameSource):
@@ -127,13 +152,9 @@ class CameraSource(FrameSource):
         # module-level defaults for end-to-end CLI coverage. The pygrabber
         # backend needs the camera's target geometry at construction (the
         # DirectShow format is fixed before the graph runs), so it gets a
-        # cfg-closed factory instead of the cv2 default.
-        if capture_factory is not None:
-            self._capture_factory = capture_factory
-        elif cfg.backend is Backend.PYGRABBER:
-            self._capture_factory = _pygrabber_capture_factory(cfg)
-        else:
-            self._capture_factory = default_capture_factory
+        # cfg-closed factory instead of the cv2 default — dispatch shared
+        # with calibrate/selftest via select_capture_factory.
+        self._capture_factory = select_capture_factory(cfg, capture_factory)
         self._device_lister = device_lister or list_devices
         self._clock = clock
         # ``epoch`` lets StationRunner anchor every camera's ts=0 at ONE
@@ -291,19 +312,37 @@ class CameraSource(FrameSource):
         # Identity guard: dormant under the default policy='warn'. Runs after
         # the OPENED line (so the operator sees what we opened) and BEFORE
         # connect-verify (a wrong-camera swap should be caught before we
-        # spend a second sampling its frame rate). May raise under 'strict'.
-        self._guard_identity()
+        # spend a second sampling its frame rate). May raise under 'strict':
+        # that raise must release the capture published above — construction
+        # has no other release path, and a leaked pygrabber capture keeps
+        # its whole streaming graph + owner thread alive (REVIEW
+        # bringup-4d95b67).
+        try:
+            self._guard_identity()
+        except BaseException:
+            with self._lock:
+                doomed, self._cap = self._cap, None
+            if doomed is not None:
+                doomed.release()
+            raise
         self._shape_checked = False
         # Split the post-connect control accounting into two honest buckets:
-        #   (a) genuinely unverifiable-by-backend (verifiable=False) — the
-        #       write was asserted but readback can't confirm it on this
-        #       backend; INFO, never a mismatch, never logged as 'verified';
-        #   (b) actually failed — accepted=False, or a reliable-backend
-        #       readback mismatch; WARNING + connect_mismatches (the old path).
+        #   (a) genuinely unverifiable-by-backend — ACCEPTED but
+        #       verifiable=False: the write was asserted and readback can't
+        #       confirm it on this backend; INFO, never a mismatch, never
+        #       logged as 'verified';
+        #   (b) actually failed — accepted=False on ANY backend (the backend
+        #       itself refused the write; on pygrabber that is
+        #       device-confirmed failure — REVIEW bringup-4d95b67), or a
+        #       readback-reliable mismatch; WARNING + connect_mismatches.
         gate_relevant = [r for r in reports if not r.informational]
-        unverifiable = [r for r in gate_relevant if not r.verifiable]
+        unverifiable = [
+            r for r in gate_relevant if not r.verifiable and r.accepted
+        ]
         failed = [
-            r for r in gate_relevant if r.verifiable and not r.verified
+            r
+            for r in gate_relevant
+            if not r.accepted or (r.verifiable and not r.verified)
         ]
         if unverifiable:
             log.info(
@@ -321,7 +360,7 @@ class CameraSource(FrameSource):
                 "camera %s: %d control(s) unverified after connect: %s",
                 cfg.id,
                 len(failed),
-                [r.prop for r in failed],
+                [f"{r.prop} ({r.note})" if r.note else r.prop for r in failed],
             )
         if cfg.connect_verify_s > 0:
             m = measure_achieved_fps(
@@ -438,7 +477,11 @@ class CameraSource(FrameSource):
                     f"expected device_path {expected_path!r}, "
                     f"got {actual.device_path!r}"
                 )
-        elif expected_vp and actual.vid:
+        elif expected_vp and actual.vid and actual.pid:
+            # BOTH halves must be present to compare: PID may be absent on
+            # composite devices even when VID parses (a pinned parse_vid_pid
+            # contract), and formatting "vid:None" can never match — absence
+            # is unverifiable, never a mismatch (REVIEW bringup-4d95b67).
             actual_vp = f"{actual.vid}:{actual.pid}"
             if expected_vp != actual_vp:
                 mismatch_detail = (
@@ -447,7 +490,8 @@ class CameraSource(FrameSource):
         else:
             # An expectation is pinned but the actual device carries no
             # comparable field (e.g. expected a path, device only exposes
-            # vid:pid, or vice-versa): cannot confirm OR deny — unverifiable.
+            # vid:pid or a PID-less composite VID, or vice-versa): cannot
+            # confirm OR deny — unverifiable.
             log.info(
                 "camera %s: identity unverifiable — pinned fingerprint has no "
                 "comparable field on the live device (expected path=%r vid:pid=%s; "

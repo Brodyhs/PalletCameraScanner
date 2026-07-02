@@ -7,10 +7,12 @@ focus/fps/decode line per second, and ``--save`` upserts the locked entry
 into the YAML config (spec §8). ``--preview`` adds an optional cv2 window
 (main-thread only on macOS); it is the one path pytest does not cover.
 
-Hard-fail policy mirrors the control layer's: unverified controls or a
-dead exposure control fail calibration on ``controls_reliable`` backends
-(DSHOW) and print an honest warning where readback is unreliable (MSMF,
-AVFoundation).
+Hard-fail policy mirrors the control layer's: readback-unverified
+controls fail calibration on ``readback_reliable`` backends (DSHOW) and
+print an honest warning where readback is untrustworthy (MSMF,
+AVFoundation, pygrabber). The exposure-EFFECT check measures the image,
+not readback, so a dead exposure control fails calibration on EVERY
+backend.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from palletscan.sources.camera import (
     CaptureFactory,
     DeviceLister,
     default_capture_factory,
+    select_capture_factory,
 )
 from palletscan.sources.controls import (
     all_verified,
@@ -197,7 +200,15 @@ def run_calibration(
         else _FLAG_TO_BACKEND.get(flag, Backend.AUTO)
     )
     quirks = quirks_for(backend)
-    make_cap = lambda: capture_factory(index, flag)  # noqa: E731
+    # Per-backend capture dispatch (shared with CameraSource/selftest): the
+    # pygrabber mono cam cannot be opened by cv2.VideoCapture, and calibrate
+    # is the step that stamps the fingerprint the identity guard consumes —
+    # it must be able to open every backend the run path can (REVIEW
+    # bringup-4d95b67). The entry is resolved to the chosen backend first so
+    # a backend:auto config still dispatches correctly.
+    entry = entry.model_copy(update={"backend": backend})
+    chosen_factory = select_capture_factory(entry, capture_factory)
+    make_cap = lambda: chosen_factory(index, flag)  # noqa: E731
 
     # Capture the chosen device's stable hardware fingerprint so --save can
     # stamp it for the identity guard. The POLICY is left at its default
@@ -302,6 +313,10 @@ def run_calibration(
                 mark = "ok"
             elif r.informational:
                 mark = "info"
+            elif not r.accepted:
+                # The backend refused the write: a failure on EVERY backend
+                # (readback trustworthiness is irrelevant to a rejected set).
+                mark = "REJECTED"
             elif not r.verifiable:
                 # Applied, but readback can't confirm it on this backend:
                 # honest 'asserted', NOT a failure (would read as MISMATCH).
@@ -312,7 +327,12 @@ def run_calibration(
                 f"  {r.prop:<14} requested {r.requested:<12g} readback "
                 f"{r.readback:<12g} {mark} {r.note}"
             )
-        controls_ok = all_verified(reports)  # informational props never gate
+        # Informational props never gate; a REJECTED write fails the
+        # controls verdict even where readback can't (REVIEW bringup-4d95b67).
+        rejected = [
+            r for r in reports if not r.accepted and not r.informational
+        ]
+        controls_ok = all_verified(reports) and not rejected
         effect_ok = True
         if not settings.exposure_auto and settings.exposure is not None:
             effect = verify_exposure_effect(cap, settings.exposure)
@@ -322,8 +342,18 @@ def run_calibration(
                 f"{'ok' if effect.ok else 'NO EFFECT'}"
             )
             effect_ok = effect.ok
-        if not (controls_ok and effect_ok):
-            if quirks.controls_reliable:
+        if not effect_ok:
+            # The exposure-effect check measures the IMAGE, not readback: a
+            # physically dead exposure control fails calibration on EVERY
+            # backend — untrustworthy readback must never demote it (REVIEW
+            # bringup-4d95b67: exposure-effect gate restoration).
+            say(
+                "calibrate: exposure has NO measurable effect on the image "
+                "(hard on every backend)"
+            )
+            rc = 1
+        if not controls_ok:
+            if quirks.readback_reliable:
                 say("calibrate: control verification failed (hard on this backend)")
                 rc = 1
             else:

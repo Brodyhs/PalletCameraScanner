@@ -52,6 +52,12 @@ HOST, PORT = "127.0.0.1", 8009
 _AE_MANUAL = 0.25  # MSMF manual-exposure magic value
 _LINGER_S = 1.2
 _FOCUS_W, _FOCUS_H = 800, 600
+_CAM_LABEL = f"See3CAM @ MSMF[{INDEX}] · UYVY 1920×1200"
+
+# --- capture read-failure handling (disconnect is a state, not a busy-loop) ---
+_READ_FAIL_LIMIT = 25      # consecutive failed reads -> declare disconnect
+_READ_FAIL_SLEEP_S = 0.05  # per-failure backoff (never spin the dead driver)
+_RECONNECT_WAIT_S = 1.0    # pause between reopen attempts
 
 # --- motion params (mask is _MOTION_W x _MOTION_H) ---
 _MOTION_W, _MOTION_H = 240, 150
@@ -185,6 +191,7 @@ class Bench:
         self.frame_q: queue.Queue = queue.Queue(maxsize=6)  # (gray, roi, t, seg_id)
         self.fps = 0.0
         self.attempts_per_sec = 0.0
+        self.decodes_per_sec = 0.0
         self.brightness = 0.0
         self.focus = 0.0
         self.focus_peak = 0.0
@@ -214,7 +221,8 @@ class Bench:
         self.recent_misses: deque = deque(maxlen=12)
         self._to_save: list = []
         self._cmds: deque = deque()  # (cmd, value)
-        self._att = 0
+        self._att = 0  # decode attempts (work items consumed)
+        self._dec = 0  # successful decodes (symbols found)
         self._gain_t = 0.0
         self._stop = threading.Event()
 
@@ -321,14 +329,36 @@ class Bench:
                 self.camera = f"camera[{INDEX}] FAILED to open (MSMF)"
             return
         with self.lock:
-            self.camera = f"See3CAM @ MSMF[{INDEX}] · UYVY 1920×1200"
+            self.camera = _CAM_LABEL
         prev_small = None
         last_t = att_t = last_static = time.monotonic()
-        count, fps, att0, frame_idx = 0, 0.0, 0, 0
+        count, fps, att0, dec0, frame_idx = 0, 0.0, 0, 0, 0
+        read_fails = 0
         while not self._stop.is_set():
             ok, img = cap.read()
             if not ok or img is None:
+                read_fails += 1
+                if read_fails < _READ_FAIL_LIMIT:
+                    # transient hiccup: back off instead of busy-spinning
+                    time.sleep(_READ_FAIL_SLEEP_S)
+                    continue
+                # Sustained failure = disconnect. Say so (a green LIVE dot
+                # over stale fps would lie), release, and keep trying to
+                # reopen until the device comes back or we are stopped.
+                with self.lock:
+                    self.camera = f"camera[{INDEX}] disconnected — reconnecting…"
+                    self.fps = fps = 0.0
+                cap.release()
+                time.sleep(_RECONNECT_WAIT_S)
+                cap = self._open()
+                if cap.isOpened():
+                    read_fails = 0
+                    prev_small = None  # motion continuity across the gap is unknowable
+                    count, last_t = 0, time.monotonic()
+                    with self.lock:
+                        self.camera = _CAM_LABEL
                 continue
+            read_fails = 0
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             h, w = gray.shape
             fx0, fy0 = (w - _FOCUS_W) // 2, (h - _FOCUS_H) // 2
@@ -362,8 +392,10 @@ class Bench:
                 fps, count, last_t = count / (now - last_t), 0, now
             if now - att_t >= 0.5:
                 with self.lock:
-                    att = self._att
-                self.attempts_per_sec, att0, att_t = (att - att0) / (now - att_t), att, now
+                    att, dec = self._att, self._dec
+                self.attempts_per_sec = (att - att0) / (now - att_t)
+                self.decodes_per_sec = (dec - dec0) / (now - att_t)
+                att0, dec0, att_t = att, dec, now
 
             # ---- pass/miss bookkeeping (OPT-IN; capture thread owns it) ----
             with self.lock:
@@ -496,6 +528,7 @@ class Bench:
             now = time.monotonic()
             with self.lock:
                 self._att += 1
+                self._dec += len(found)
                 if found and seg_id is not None and seg_id in self._live_segs:
                     self._live_segs[seg_id]["decodes"] += 1
                 for pts, payload, sym in found:
@@ -580,6 +613,7 @@ class Bench:
                 "camera": self.camera,
                 "fps": round(self.fps, 1),
                 "attempts_per_sec": round(self.attempts_per_sec),
+                "decodes_per_sec": round(self.decodes_per_sec, 1),
                 "focus": round(self.focus),
                 "focus_peak": round(self.focus_peak),
                 "brightness": round(self.brightness),
@@ -656,7 +690,8 @@ code{color:var(--text);word-break:break-all}
       <h2>Status <span class="hint">— fully automatic</span></h2>
       <div class="tiles">
         <div class="tile"><div class="v" id="fps">–</div><div class="l">fps</div></div>
-        <div class="tile"><div class="v" id="att">–</div><div class="l">decodes/s</div></div>
+        <div class="tile"><div class="v" id="dec">–</div><div class="l">decodes/s</div></div>
+        <div class="tile"><div class="v" id="att">–</div><div class="l">attempts/s</div></div>
         <div class="tile"><div class="v" id="bright">–</div><div class="l">bright</div></div>
       </div>
       <div class="tiles" style="margin-top:8px">
@@ -694,7 +729,7 @@ async function poll(){
   focusbar.style.width=pct+'%'; const near=pct>92;
   focusbar.style.background=near?'var(--accent)':'var(--warn)';
   focushint.textContent=near?'sharp — lock the lens here':'turn the focus ring to push the bar right';
-  fps.textContent=s.fps; att.textContent=s.attempts_per_sec; bright.textContent=s.brightness;
+  fps.textContent=s.fps; dec.textContent=s.decodes_per_sec; att.textContent=s.attempts_per_sec; bright.textContent=s.brightness;
   expo.textContent=s.exposure_mode; gain.textContent=s.gain;
   now.innerHTML=s.reading_now.length?s.reading_now.map(d=>`<span class="sym ${d.sym}">${d.sym.toUpperCase()}</span> <code>${esc(d.payload)}</code>${spd(d)}`).join('<br>'):'—';
   log.innerHTML=s.log.map(e=>`<tr><td>${e.t}</td><td><span class="sym ${e.sym}">${e.sym.toUpperCase()}</span></td><td><code>${esc(e.payload)}</code></td></tr>`).join('');
@@ -718,7 +753,10 @@ def build_app(bench: Bench) -> FastAPI:
 
     @app.post("/control")
     def control(action: str, value: float = 0.0) -> JSONResponse:
-        bench._cmds.append((action, value))
+        # The capture thread snapshots-and-clears _cmds under bench.lock; an
+        # unlocked append can land between its list() and clear() and vanish.
+        with bench.lock:
+            bench._cmds.append((action, value))
         return JSONResponse({"ok": True})
 
     @app.get("/miss/{name}")

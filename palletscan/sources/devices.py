@@ -129,13 +129,27 @@ def devices_from_monikers(
     the real bag. ``DevicePath`` is absent on some virtual/composite
     devices, so its read is wrapped and degrades to ``None`` — a device
     with a friendly name but no path is enumerable, just not VID/PID-
-    fingerprintable.
+    fingerprintable. A moniker whose ``FriendlyName`` read itself raises is
+    SKIPPED (logged), never allowed to abort the whole enumeration: one
+    broken property bag must not disable name resolution and the identity
+    guard for every healthy device. Skipping never compacts the indexes —
+    the index is the enumeration POSITION, which is what pairs with the
+    ``cv2.CAP_DSHOW`` open order.
     """
     if read_str is None:
         read_str = _read_moniker_prop
     out: list[DeviceInfo] = []
     for i, moniker in enumerate(monikers):
-        friendly = read_str(moniker, "FriendlyName")
+        try:
+            friendly = read_str(moniker, "FriendlyName")
+        except Exception as exc:
+            log.warning(
+                "skipping device at enumeration index %d: FriendlyName "
+                "read failed: %r",
+                i,
+                exc,
+            )
+            continue
         try:
             device_path = read_str(moniker, "DevicePath")
         except Exception:
@@ -211,13 +225,63 @@ def client_create_object(clsid, interface):
     return client.CreateObject(clsid, interface=interface)
 
 
+#: HRESULT: the calling thread is already CoInitialized under a DIFFERENT
+#: apartment model. COM is usable on it as-is, but the call took no
+#: reference, so it must NOT be paired with a CoUninitialize.
+_RPC_E_CHANGED_MODE = -2147417850  # 0x80010106
+
+
+def _co_initialize_thread() -> bool:
+    """Initialize COM on the calling thread for the DirectShow enumeration.
+
+    comtypes auto-initializes only the thread that first imports it, so
+    ``list_devices()`` from any other thread — the watchdog consumer thread
+    that runs every ``CameraSource.reopen()`` — raised CO_E_NOTINITIALIZED,
+    swallowed to ``[]``: name resolution and the identity guard silently
+    disabled on exactly the reconnect path they were built for.
+
+    Returns True when this call owes a paired ``CoUninitialize``: S_OK and
+    S_FALSE (already initialized in this mode) both add a reference.
+    RPC_E_CHANGED_MODE returns False — the thread already runs a different
+    apartment model, usable as-is, and uninitializing would release a
+    reference this call never took.
+    """
+    import comtypes
+
+    try:
+        comtypes.CoInitializeEx()  # honors sys.coinit_flags like comtypes
+        return True
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == _RPC_E_CHANGED_MODE:
+            return False
+        raise
+
+
+def _co_uninitialize_thread() -> None:
+    import comtypes
+
+    comtypes.CoUninitialize()
+
+
 def _list_windows() -> list[DeviceInfo]:
     """DirectShow filter names + identities via the property bag (win32-only
     dependency). Enumeration order is paired with ``cv2.CAP_DSHOW`` indexes,
     the documented arrival-day assumption; FriendlyName backs name
-    resolution, DevicePath (VID/PID) backs the identity guard."""
-    monikers = _enumerate_windows_monikers()
-    return devices_from_monikers(monikers, int(cv2.CAP_DSHOW))
+    resolution, DevicePath (VID/PID) backs the identity guard.
+
+    The calling thread is CoInitialized for the duration (balanced), and
+    the moniker refs are dropped BEFORE the paired CoUninitialize so their
+    COM Release() runs inside the initialized window."""
+    owes_uninit = _co_initialize_thread()
+    try:
+        monikers = _enumerate_windows_monikers()
+        try:
+            return devices_from_monikers(monikers, int(cv2.CAP_DSHOW))
+        finally:
+            del monikers
+    finally:
+        if owes_uninit:
+            _co_uninitialize_thread()
 
 
 def _list_macos(run=None) -> list[DeviceInfo]:
@@ -243,11 +307,16 @@ def list_devices(platform: str = sys.platform) -> list[DeviceInfo]:
             return _list_macos()
         log.warning("no device-name enumeration on platform %r", platform)
         return []
-    except Exception:
+    except Exception as exc:
+        # Name the actual exception IN the message (not just exc_info,
+        # which structured/console formatters may drop): a swallowed
+        # enumeration failure disables name resolution and the identity
+        # guard, and must be diagnosable from a single log line.
         log.warning(
-            "device enumeration failed on %r; falling back to bare indices "
-            "(set cameras[].fallback_index)",
+            "device enumeration failed on %r: %r — falling back to bare "
+            "indices (set cameras[].fallback_index)",
             platform,
+            exc,
             exc_info=True,
         )
         return []

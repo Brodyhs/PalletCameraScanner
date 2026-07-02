@@ -62,8 +62,10 @@ UNBOUNDED_PASSES = 10_000_000
 
 RSS_RATIO_MAX = 1.3
 
-#: Where the inject-soak snapshot series is appended (one JSON line each).
-SNAPSHOTS_PATH = Path("data/soak/snapshots.jsonl")
+#: File name of the inject-soak snapshot series (one JSON line each). The
+#: full path is derived from the resolved --data-dir in run_soak, like every
+#: other soak artifact — a hardcoded path would ignore the override.
+SNAPSHOTS_FILENAME = "snapshots.jsonl"
 
 #: Minimum number of snapshots WITH a real read_rate_1h (the metric is None
 #: until the rolling 1h window fills) before the drift gate is meaningful; a
@@ -102,7 +104,8 @@ class RssSampler(threading.Thread):
 
 class SnapshotSampler(threading.Thread):
     """Periodically snapshots the LIVE runner's metrics and appends one JSON
-    line per sample to ``data/soak/snapshots.jsonl`` for drift analysis.
+    line per sample to ``path`` (``<data-dir>/snapshots.jsonl``) for drift
+    analysis.
 
     The runner is recreated per soak segment, so the sampler is handed a
     *getter* (not a runner ref) and reads ``get_runner()`` each tick to
@@ -115,7 +118,8 @@ class SnapshotSampler(threading.Thread):
         interval_s: float,
         get_runner: Callable[[], PipelineRunner | None],
         rss_sampler: RssSampler | None = None,
-        path: Path = SNAPSHOTS_PATH,
+        *,
+        path: Path,
     ) -> None:
         super().__init__(name="snapshot-sampler", daemon=True)
         self._interval_s = interval_s
@@ -123,7 +127,9 @@ class SnapshotSampler(threading.Thread):
         self._rss_sampler = rss_sampler
         self._path = path
         self._stop = threading.Event()
-        self._started = time.monotonic()
+        # NOT "_started": threading.Thread owns that attribute (an Event its
+        # start() checks); shadowing it with a float breaks Thread.start().
+        self._t0 = time.monotonic()
         #: In-memory mirror of the lines written, for post-run drift analysis
         #: (so the gate never has to re-read/parse the file).
         self.snapshots: list[dict[str, Any]] = []
@@ -140,7 +146,7 @@ class SnapshotSampler(threading.Thread):
         snap = runner.metrics.snapshot()
         row = {
             "wall": time.time(),
-            "uptime_s": round(time.monotonic() - self._started, 3),
+            "uptime_s": round(time.monotonic() - self._t0, 3),
             "fps": snap["fps"],
             "read_rate_1h": snap["read_rate_1h"],
             "passes_per_hour": snap["passes"]["per_hour"],
@@ -442,7 +448,7 @@ class SoakReport:
             )
         if self.drift is not None:
             d = self.drift
-            path = self.snapshots_path or SNAPSHOTS_PATH
+            path = self.snapshots_path
             lines.append("── drift ──")
             if not d.enough_snapshots:
                 lines.append(f"  {d.note}")
@@ -580,11 +586,18 @@ def run_soak(args: argparse.Namespace) -> SoakReport:
     live_runner: dict[str, PipelineRunner | None] = {"runner": None}
     snap_sampler: SnapshotSampler | None = None
     if args.mode == "inject":
-        report.snapshots_path = SNAPSHOTS_PATH
+        snapshots_path = Path(args.data_dir) / SNAPSHOTS_FILENAME
+        report.snapshots_path = snapshots_path
+        # Fresh file per run: cross-run appends interleave two series and
+        # corrupt offline drift analysis (in-run writes still append
+        # line-by-line for crash robustness).
+        snapshots_path.parent.mkdir(parents=True, exist_ok=True)
+        snapshots_path.write_text("", encoding="utf-8")
         snap_sampler = SnapshotSampler(
             args.snapshot_interval_s,
             get_runner=lambda: live_runner["runner"],
             rss_sampler=sampler,
+            path=snapshots_path,
         )
         snap_sampler.start()
     deadline = time.monotonic() + duration_s

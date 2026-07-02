@@ -14,15 +14,21 @@ MissEvent.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
+from palletscan.app import PipelineRunner
 from palletscan.config import (
+    AppConfig,
     BufferConfig,
+    DecodeConfig,
     DedupConfig,
     EvidenceConfig,
     MotionConfig,
+    apply_overrides,
 )
 from palletscan.events.evidence import EvidenceWriter
 from palletscan.pipeline.motion_gate import MotionGate
@@ -32,6 +38,8 @@ from palletscan.types import (
     DecodeResult,
     Frame,
     MissEvent,
+    MotionResult,
+    MotionTrack,
     PassEvent,
     Roi,
     SegmentEvent,
@@ -178,3 +186,234 @@ def test_one_decodes_one_misses_end_to_end(tmp_path: Path) -> None:
     assert m.evidence_error is None
     assert tracker.passes_emitted == 1
     assert tracker.misses_emitted == 1
+
+
+# -- app.py _process_frame seam: per-track decode budget + async idle scan -----
+#
+# These drive PipelineRunner._process_frame directly (the test_pipeline_smoke
+# manual-drive pattern) with a scripted gate / recording engine, so the budget
+# and idle-scan scheduling can be observed deterministically without threads
+# racing a live source.
+
+
+class _ManualSource:
+    """Minimal FrameSource stand-in for driving _process_frame directly."""
+
+    def __init__(self) -> None:
+        self.live = False
+        self.source_id = "cam0"
+        self.nominal_fps = FPS
+
+    def frames(self):  # pragma: no cover - not used when driven manually
+        return iter(())
+
+    def close(self) -> None:
+        pass
+
+
+def _manual_runner(tmp_path: Path, **cfg_updates) -> PipelineRunner:
+    cfg = apply_overrides(AppConfig(), data_dir=tmp_path).model_copy(
+        update=cfg_updates
+    )
+    return PipelineRunner(cfg, _ManualSource(), sinks=[])
+
+
+class _ScriptedGate:
+    """MotionGate stand-in: the same open multi-mode tracks every frame."""
+
+    def __init__(self, rois: dict[str, Roi]) -> None:
+        self._rois = rois
+        self._opened = False
+
+    def update(self, frame: Frame):
+        events = []
+        if not self._opened:
+            self._opened = True
+            events = [
+                SegmentEvent(
+                    kind=SegmentKind.OPEN,
+                    candidate_id=tid,
+                    frame_index=frame.frame_index,
+                    ts=frame.ts,
+                )
+                for tid in self._rois
+            ]
+        tracks = tuple(
+            MotionTrack(
+                track_id=tid,
+                roi=roi,
+                centroid=(0.0, 0.0),
+                area_px=100,
+                age=2,
+                missed=0,
+            )
+            for tid, roi in self._rois.items()
+        )
+        first = next(iter(self._rois))
+        return (
+            MotionResult(
+                active=True,
+                candidate_id=first,
+                roi=self._rois[first],
+                motion_frac=0.5,
+                tracks=tracks,
+            ),
+            events,
+        )
+
+    def flush(self):
+        return []
+
+    def break_segment(self):
+        return []
+
+
+class _RecordingEngine:
+    """DecodeEngine stand-in: records (frame_index, roi.x), can burn time."""
+
+    def __init__(self, sleep_s: float = 0.0) -> None:
+        self.sleep_s = sleep_s
+        self.calls: list[tuple[int, int]] = []
+
+    def decode_frame(self, frame: Frame, roi: Roi, ctx) -> list[DecodeResult]:
+        self.calls.append((frame.frame_index, roi.x))
+        if self.sleep_s:
+            time.sleep(self.sleep_s)
+        ctx.frames_attempted += 1  # what the real engine's finally block does
+        return []
+
+
+def test_track_decodes_share_one_frame_budget_and_rotate(tmp_path: Path) -> None:
+    """REVIEW_bringup_4d95b67 finding 15: each open track used to get a FULL
+    fresh frame_budget_ms decode_frame call (budget x up to track_max_objects
+    on the single pipeline thread). The per-track calls must share ONE
+    per-frame budget — no further track decodes once it is exhausted — and the
+    starting track must rotate by frame_index so a budget-burning ROI cannot
+    permanently starve the other tracks."""
+    runner = _manual_runner(tmp_path, decode=DecodeConfig(frame_budget_ms=20.0))
+    rois = {f"trk{i}": Roi(i * 10, 0, 10, 10) for i in range(3)}
+    runner._gate = _ScriptedGate(rois)  # type: ignore[assignment]
+    engine = _RecordingEngine(sleep_s=0.05)  # every call overruns the budget
+    runner._engine = engine  # type: ignore[assignment]
+    img = np.full((H, W), BG, np.uint8)
+    for i in range(3):
+        runner._process_frame(_frame(img, i))
+    per_frame: dict[int, list[int]] = {}
+    for fi, x in engine.calls:
+        per_frame.setdefault(fi, []).append(x)
+    # A 50 ms call exhausts the 20 ms budget: exactly ONE decode per frame
+    # (pre-fix: all three tracks each got a fresh budget, every frame).
+    assert {fi: len(xs) for fi, xs in per_frame.items()} == {0: 1, 1: 1, 2: 1}
+    # The starting track rotates with frame_index: every track gets its turn.
+    assert [per_frame[i][0] for i in range(3)] == [0, 10, 20]
+    runner._executor.shutdown(wait=True)
+
+
+def test_all_open_tracks_decode_when_budget_allows(tmp_path: Path) -> None:
+    """Budget sharing must not starve anyone when there is time: with a fast
+    engine, every open track still decodes every frame."""
+    runner = _manual_runner(tmp_path, decode=DecodeConfig(frame_budget_ms=5000.0))
+    rois = {f"trk{i}": Roi(i * 10, 0, 10, 10) for i in range(3)}
+    runner._gate = _ScriptedGate(rois)  # type: ignore[assignment]
+    engine = _RecordingEngine()
+    runner._engine = engine  # type: ignore[assignment]
+    img = np.full((H, W), BG, np.uint8)
+    for i in range(2):
+        runner._process_frame(_frame(img, i))
+    per_frame: dict[int, set[int]] = {}
+    for fi, x in engine.calls:
+        per_frame.setdefault(fi, set()).add(x)
+    assert per_frame == {0: {0, 10, 20}, 1: {0, 10, 20}}
+    runner._executor.shutdown(wait=True)
+
+
+class _IdleEngine:
+    """Records the ctx + thread of each idle decode; queues canned results."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, int, threading.Thread]] = []
+        self.results: list[list[DecodeResult]] = []
+
+    def decode_frame(self, frame: Frame, roi: Roi, ctx) -> list[DecodeResult]:
+        self.calls.append((ctx, ctx.frames_attempted, threading.current_thread()))
+        ctx.frames_attempted += 1  # mirrors the real engine's finally block
+        return self.results.pop(0) if self.results else []
+
+
+def test_idle_scan_persists_context_and_runs_off_thread(tmp_path: Path) -> None:
+    """REVIEW_bringup_4d95b67 idle-scan finding: (a) a FRESH PassDecodeContext
+    per scan pinned frames_attempted at 0, so the step-3 variant fan-out could
+    never engage for a stubborn static code — one context must persist across
+    failed scans and reset only when an idle decode succeeds; (b) the scan ran
+    synchronously on the pipeline consumer thread, where the legacy pyzbar
+    full-frame step has no timeout — it must run on the decode executor."""
+    runner = _manual_runner(tmp_path, motion=MotionConfig(idle_scan_s=0.5))
+    engine = _IdleEngine()
+    runner._engine = engine  # type: ignore[assignment]
+    img = np.full((H, W), BG, np.uint8)
+
+    def drive(i: int, ts: float) -> None:
+        runner._process_frame(Frame(image=img, ts=ts, frame_index=i, source_id="cam0"))
+        fut = runner._idle_future
+        if fut is not None:
+            fut.result(timeout=5.0)  # let any submitted scan finish
+
+    drive(0, 1.0)
+    drive(1, 2.0)
+    drive(2, 3.0)
+    assert len(engine.calls) == 3
+    ctxs = [c for c, _, _ in engine.calls]
+    # (a) ONE persistent context accrues attempts across failed scans.
+    assert ctxs[0] is ctxs[1] is ctxs[2]
+    assert [n for _, n, _ in engine.calls] == [0, 1, 2]
+    # (b) every scan ran off the calling (pipeline) thread.
+    assert all(t is not threading.current_thread() for _, _, t in engine.calls)
+
+    # A successful idle read is harvested on a later frame, counts in
+    # idle_reads, and resets the persistent context.
+    frame3 = Frame(image=img, ts=4.0, frame_index=3, source_id="cam0")
+    engine.results.append(_decode_for(Roi(0, 0, W, H), frame3, "STATIC-1"))
+    drive(3, 4.0)
+    runner._process_frame(
+        Frame(image=img, ts=4.2, frame_index=4, source_id="cam0")
+    )  # harvest only: 4.2 - 4.0 < idle_scan_s, no new submit
+    assert runner._idle_reads == 1
+    assert runner._idle_ctx is not ctxs[0]
+    assert runner._idle_ctx.frames_attempted == 0
+    runner._executor.shutdown(wait=True)
+
+
+def test_only_one_idle_scan_in_flight(tmp_path: Path) -> None:
+    """A slow idle scan must neither stall the pipeline thread nor stack up:
+    while one scan is in flight no second scan launches, and the next scan
+    goes out only after the first completes."""
+    runner = _manual_runner(tmp_path, motion=MotionConfig(idle_scan_s=0.5))
+    release = threading.Event()
+    calls: list[int] = []
+
+    class _BlockingEngine:
+        def decode_frame(self, frame: Frame, roi: Roi, ctx) -> list[DecodeResult]:
+            calls.append(frame.frame_index)
+            release.wait(2.0)
+            return []
+
+    runner._engine = _BlockingEngine()  # type: ignore[assignment]
+    img = np.full((H, W), BG, np.uint8)
+    started = time.perf_counter()
+    runner._process_frame(Frame(image=img, ts=1.0, frame_index=0, source_id="cam0"))
+    # The pipeline thread is not blocked by the in-flight scan...
+    assert time.perf_counter() - started < 1.0
+    runner._process_frame(Frame(image=img, ts=2.0, frame_index=1, source_id="cam0"))
+    runner._process_frame(Frame(image=img, ts=3.0, frame_index=2, source_id="cam0"))
+    # ...and no second scan launched while the first was in flight.
+    assert calls == [0]
+    release.set()
+    fut = runner._idle_future
+    assert fut is not None
+    fut.result(timeout=5.0)
+    runner._process_frame(Frame(image=img, ts=4.0, frame_index=3, source_id="cam0"))
+    fut = runner._idle_future
+    assert fut is not None  # slot freed -> the next scan went out
+    fut.result(timeout=5.0)
+    assert calls == [0, 3]
+    runner._executor.shutdown(wait=True)

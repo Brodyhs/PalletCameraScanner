@@ -360,17 +360,26 @@ def test_close_unblocks_read_hung_inside_connect_verify() -> None:
 def test_connect_reports_backend_unverifiable_controls_as_info_not_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Run-path readback honesty: on a controls-unreliable backend
-    (AVFoundation) the controls were APPLIED but readback can't confirm
-    them — that is 'asserted but unverifiable' (INFO), NOT a 'control
+    """Run-path readback honesty: on a readback-unreliable backend
+    (AVFoundation) controls the device ACCEPTED but whose readback can't
+    confirm them are 'asserted but unverifiable' (INFO), NOT a 'control
     unverified after connect' failure (WARNING + mismatch). Frames still
-    flow either way."""
+    flow either way.
+
+    The fake ACCEPTS each set while its readback sticks at garbage (0.0) —
+    the MSMF/AVFoundation reality this bucket exists for. (It previously
+    REJECTED the sets, which is the genuine-failure bucket per REVIEW
+    bringup-4d95b67 — covered by the rejected-control test below.)"""
     from palletscan.config import Backend as B
-    from tests.camera_fakes import avfoundation_hooks
 
     clock = FakeClock()
-    hooks = avfoundation_hooks()
-    hooks[cv2.CAP_PROP_BUFFERSIZE] = lambda v: None  # backend ignores it too
+    hooks = {
+        # accepted=True (value 'stored' as garbage 0.0), readback untrusted
+        cv2.CAP_PROP_AUTO_EXPOSURE: lambda v: 0.0,
+        cv2.CAP_PROP_EXPOSURE: lambda v: 0.0,
+        cv2.CAP_PROP_GAIN: lambda v: 0.0,
+        cv2.CAP_PROP_BUFFERSIZE: lambda v: None,  # informational: ignored
+    }
     factory = FakeCaptureFactory(
         default=lambda i, b: FakeCapture(hooks=hooks, clock=clock, real_fps=30.0)
     )
@@ -399,6 +408,48 @@ def test_connect_reports_backend_unverifiable_controls_as_info_not_warning(
     assert "exposure" in info.message
     assert "buffersize" not in info.message  # informational: never reported here
     assert len(list(itertools.islice(src.frames(), 2))) == 2  # still streams
+    src.close()
+
+
+def test_connect_counts_rejected_control_as_failure_even_when_unverifiable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """REVIEW bringup-4d95b67: a control write the backend outright
+    REJECTED (accepted=False) filed into the INFO 'asserted but
+    unverifiable' bucket on readback-unreliable backends — never warned,
+    never bumped connect_mismatches. Rejection is a failure on EVERY
+    backend: WARNING + connect_mismatches, note says rejected."""
+    from palletscan.config import Backend as B
+
+    clock = FakeClock()
+    hooks = {
+        cv2.CAP_PROP_GAIN: lambda v: None,  # REJECTED by the backend
+    }
+    factory = FakeCaptureFactory(
+        default=lambda i, b: FakeCapture(hooks=hooks, clock=clock, real_fps=30.0)
+    )
+    cfg = _cfg(
+        backend=B.AVFOUNDATION,  # readback-unreliable
+        settings={"exposure_auto": False, "exposure": -6.0, "gain": 5.0},
+    )
+    with caplog.at_level(logging.INFO, logger="palletscan.sources.camera"):
+        src = CameraSource(
+            cfg,
+            capture_factory=factory,
+            device_lister=_lister(backend=int(cv2.CAP_AVFOUNDATION)),
+            clock=clock,
+        )
+    assert src.connect_mismatches >= 1
+    warning = next(
+        r for r in caplog.records if "unverified after connect" in r.message
+    )
+    assert "gain" in warning.getMessage()
+    assert "rejected" in warning.getMessage()
+    # The accepted-but-unconfirmable controls stay in the INFO bucket.
+    info = next(
+        r for r in caplog.records if "asserted but unverifiable" in r.message
+    )
+    assert "gain" not in info.getMessage()
     src.close()
 
 

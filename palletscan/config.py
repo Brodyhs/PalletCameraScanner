@@ -292,6 +292,12 @@ class DecodeConfig(_StrictModel):
     #: your label format, e.g. "^PLT-\\d{6}$". Non-matching decodes are dropped
     #: and counted as decode.spurious_rejected.
     payload_pattern: str | None = None
+    #: Minimum Data Matrix payload length accepted by the default gate (when
+    #: no payload_pattern is configured). pylibdmtx's characteristic
+    #: false-positive on noisy crops is a SHORT printable string (e.g. "F'm"),
+    #: which the control-byte check cannot catch; real placard payloads are
+    #: much longer. Applies to DATAMATRIX results only — QR is not affected.
+    dm_min_payload_len: int = Field(default=4, ge=1)
 
 
 class DedupConfig(_StrictModel):
@@ -734,7 +740,9 @@ class AppConfig(_StrictModel):
     #: 64 absorbs decode bursts for account-for-everything; a live-view/demo wants
     #: it SMALL — a FIFO backlog is queue_depth/fps of latency when the pipeline
     #: can't keep up (the heavy mono cam at 72fps shows ~1s lag at depth 64).
-    frame_queue_size: int = 64
+    #: ge=1 because queue.Queue treats maxsize <= 0 as INFINITE, which would
+    #: silently turn DroppingQueue's bounded drop-oldest into an unbounded FIFO.
+    frame_queue_size: int = Field(default=64, ge=1)
 
     @model_validator(mode="after")
     def _unique_camera_ids(self) -> "AppConfig":

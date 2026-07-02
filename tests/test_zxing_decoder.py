@@ -20,7 +20,7 @@ from palletscan.pipeline.decode_engine import (
     PassDecodeContext,
     _variant_task_zxing,
 )
-from palletscan.pipeline.decoders import ZxingDecoder
+from palletscan.pipeline.decoders import RawDecode, ZxingDecoder
 from palletscan.sources.render import motion_blur, render_datamatrix, render_qr
 from palletscan.types import Frame, Roi, Symbology
 
@@ -89,6 +89,49 @@ def test_engine_zxing_decodes_datamatrix(executor) -> None:
     assert [r.payload for r in results] == [PAYLOAD]
     assert results[0].decoder == "zxing"
     assert results[0].symbology is Symbology.DATAMATRIX
+
+
+class _PhantomZxing:
+    """Inline-step stand-in that only ever returns a gate-rejected payload."""
+
+    def decode(
+        self, gray: np.ndarray, symbologies: tuple[Symbology, ...] | None = None
+    ) -> list[RawDecode]:
+        return [
+            RawDecode(payload="F\x00m", symbology=Symbology.QR, roi=Roi(0, 0, 2, 2))
+        ]
+
+
+def test_zxing_gate_rejected_hits_do_not_stop_cascade(executor) -> None:
+    # When the inline zxing step's hits are ALL gate-rejected, decode_frame
+    # must not short-circuit: the step-3 variant fan-out (real zxing on the
+    # preprocessed crops) still gets its chance at the real symbol.
+    cfg = DecodeConfig(
+        engine=DecodeEngineKind.ZXING, fallback_after_frames=0, frame_budget_ms=500.0
+    )
+    engine = DecodeEngine(cfg, executor)
+    engine._zxing = _PhantomZxing()  # type: ignore[assignment]
+    frame, roi = _frame_with(render_qr(PAYLOAD, 5.0).image)
+    results = engine.decode_frame(frame, roi, PassDecodeContext())
+    assert [r.payload for r in results] == [PAYLOAD]
+    assert results[0].decoder.startswith("zxing+")  # decoded by the fan-out
+    assert engine.counters.fallback_calls == 1
+    assert engine.counters.spurious_rejected == 1
+
+
+def test_zxing_path_budget_gates_variant_fanout(executor) -> None:
+    # The zxing path honors the frame budget where it can be honored: with
+    # the deadline already spent after the inline call, the step-3 variant
+    # fan-out must not be entered even for a fallback-eligible pass.
+    cfg = DecodeConfig(
+        engine=DecodeEngineKind.ZXING, fallback_after_frames=0, frame_budget_ms=0.001
+    )
+    engine = DecodeEngine(cfg, executor)
+    noise = np.random.default_rng(0).integers(0, 255, (200, 200), np.uint8)
+    frame, roi = _frame_with(noise)
+    assert engine.decode_frame(frame, roi, PassDecodeContext()) == []
+    assert engine.counters.zxing_calls == 1
+    assert engine.counters.fallback_calls == 0
 
 
 def test_zxing_variant_task_decodes_clean_code() -> None:

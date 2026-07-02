@@ -18,6 +18,7 @@ from palletscan.config import (
     CameraConfig,
     ConsoleSinkConfig,
     SourceConfig,
+    StationPolicy,
     SyntheticConfig,
     apply_overrides,
 )
@@ -260,6 +261,117 @@ def test_plain_runner_error_maps_to_exit_1(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError) as excinfo:
         station.run()
     assert _exit_code_for(excinfo.value) == 1
+
+
+# -- continue_others limits (REVIEW bringup-4d95b67, station findings) ----------
+
+
+def _continue_others_cfg(base: Path) -> AppConfig:
+    cfg = _station_cfg(base)
+    return cfg.model_copy(
+        update={
+            "station": cfg.station.model_copy(
+                update={"on_arm_failure": StationPolicy.CONTINUE_OTHERS}
+            )
+        }
+    )
+
+
+def test_continue_others_tolerates_plain_arm_error_with_healthy_summary(
+    tmp_path: Path,
+) -> None:
+    """The sanctioned tolerance: a plain arm failure with a healthy arm's
+    summary present returns a StationSummary instead of raising (one camera
+    beats none)."""
+    station, _ = _build_station(_continue_others_cfg(tmp_path))
+
+    def fail_run(stats_interval_s=None):
+        raise RuntimeError("plain arm failure")
+
+    def quick_run(stats_interval_s=None):
+        return _fake_summary()
+
+    station.runners["synthA"].run = fail_run  # type: ignore[method-assign]
+    station.runners["synthB"].run = quick_run  # type: ignore[method-assign]
+    summary = station.run()
+    assert set(summary.per_camera) == {"synthB"}
+
+
+def test_continue_others_never_tolerates_business_drain_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """REVIEW bringup-4d95b67: the drain failure was recorded only `if not
+    self._errors`, so ANY arm error hid it from the bus_errors check and
+    continue_others returned a clean summary over a silent business-event
+    loss — contradicting the code's own 'a business-bus drain failure is
+    never tolerated'. Arm error + drain failure must fail the station."""
+    station, _ = _build_station(_continue_others_cfg(tmp_path))
+
+    def fail_run(stats_interval_s=None):
+        raise RuntimeError("arm failure")
+
+    def quick_run(stats_interval_s=None):
+        return _fake_summary()
+
+    station.runners["synthA"].run = fail_run  # type: ignore[method-assign]
+    station.runners["synthB"].run = quick_run  # type: ignore[method-assign]
+    real_shutdown = station.business_bus.shutdown
+    monkeypatch.setattr(station.business_bus, "shutdown", lambda: False)
+    try:
+        with pytest.raises(RuntimeError):
+            station.run()
+    finally:
+        real_shutdown()  # drain the real bus so its thread exits
+
+
+def test_continue_others_never_tolerates_watchdog_escalation(
+    tmp_path: Path,
+) -> None:
+    """REVIEW bringup-4d95b67: CONTINUE_OTHERS tolerated WatchdogEscalation,
+    converting the watchdog's never-give-up semantics into permanent silent
+    arm loss (no respawn, no exit-3 restart). An escalated arm must fail
+    the station through the escalation exit path so the supervisor
+    restarts it."""
+    station, _ = _build_station(_continue_others_cfg(tmp_path))
+
+    def fail_escalated(stats_interval_s=None):
+        raise WatchdogEscalation("camera offline longer than max_outage_s")
+
+    def quick_run(stats_interval_s=None):
+        return _fake_summary()
+
+    station.runners["synthA"].run = fail_escalated  # type: ignore[method-assign]
+    station.runners["synthB"].run = quick_run  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError) as excinfo:
+        station.run()
+    assert isinstance(excinfo.value.__cause__, WatchdogEscalation)
+    assert _exit_code_for(excinfo.value) == 3  # supervisor restart path
+
+
+def test_continue_others_prefers_escalation_over_earlier_plain_error(
+    tmp_path: Path,
+) -> None:
+    """When both a plain arm error and an escalation land, the raised error
+    chains from the ESCALATION so the exit-3 supervisor mapping engages
+    regardless of arrival order."""
+    station, _ = _build_station(_continue_others_cfg(tmp_path))
+    plain_failed = threading.Event()
+
+    def fail_plain(stats_interval_s=None):
+        try:
+            raise RuntimeError("plain arm failure (lands first)")
+        finally:
+            plain_failed.set()
+
+    def fail_escalated(stats_interval_s=None):
+        assert plain_failed.wait(timeout=10)
+        raise WatchdogEscalation("zombie reader limit")
+
+    station.runners["synthA"].run = fail_plain  # type: ignore[method-assign]
+    station.runners["synthB"].run = fail_escalated  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError) as excinfo:
+        station.run()
+    assert _exit_code_for(excinfo.value) == 3
 
 
 # -- construction: leaks, probes, deduper wiring (7e4c22c review) ---------------

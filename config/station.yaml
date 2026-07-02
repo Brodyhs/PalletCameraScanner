@@ -3,8 +3,12 @@
 # This is the file the station actually runs with: pass it everywhere as
 #   --config config\station.yaml   (RUNBOOK convention).
 # Unlike config/default.yaml (which a test pins to mirror code defaults
-# exactly), this file is yours to customize. The ONLY change from defaults
-# below is watchdog.max_outage_s (Finding 5 — pre-live hardening 5.1).
+# exactly), this file is yours to customize. Deviations from the code
+# defaults below — everything else matches them (pinned by
+# tests/test_config.py::test_station_yaml_matches_defaults_except_documented_deviations):
+#   - watchdog.max_outage_s: 120  (default null; Finding 5 — pre-live hardening 5.1)
+#   - decode.engine: zxing        (default legacy; needs the [zxing] extra — see decode:)
+#   - cameras[]: the two See3CAMs (default []; station-specific by design)
 #
 # Fill in the two cameras with:  palletscan calibrate --camera <id> --name
 # "<device-name substring>" --save --config config\station.yaml
@@ -89,7 +93,13 @@ cameras:
     fallback_index: 1           # last-resort DSHOW index if name enum ever yields nothing
     read_fail_limit: 5
     connect_verify_s: 1.0
-    settings: {exposure_auto: false, exposure: -8, gain: 10, brightness: null}  # -8 = 2^-8 s ≈ 3.9ms: freezes conveyor motion + restores ~72fps (−6 capped fps at ~62). exposure/gain now wired via IAMCameraControl; gain needs real-pallet + scan-zone-lighting tuning
+    # exposure -8 = 2^-8 s ≈ 3.9ms (37CUGM manual Table 3) — tuned for the current
+    # UNLIT bench: restores ~72fps (−6's 15.6ms capped fps at ~62) but does NOT
+    # freeze conveyor motion (OPTICS_SPEC §8 blur budget: 2mph needs ≤2.8ms,
+    # 5mph ≤1.12ms). Once scan-zone lighting per OPTICS_SPEC §8 is installed,
+    # -9/-10 (2ms/1ms) becomes the operating point. exposure/gain now wired via
+    # IAMCameraControl; gain needs real-pallet + scan-zone-lighting tuning.
+    settings: {exposure_auto: false, exposure: -8, gain: 10, brightness: null}
 
 # Stall detection + reconnect for live cameras (synthetic/video unaffected).
 watchdog:
@@ -119,7 +129,11 @@ decode:
   symbology_priority: [qr, datamatrix]
   engine: zxing          # zxing-cpp: 100% vs 78% read rate on hard codes & ~250x
                          #   faster than the legacy pyzbar+pylibdmtx cascade
-                         #   (tools/bench_decoders.py). `legacy` reverts.
+                         #   (tools/bench_decoders.py).
+                         #   NON-DEFAULT + optional dep: zxing-cpp ships only in the
+                         #   [zxing] extra — install with `pip install -e ".[dev,zxing]"`
+                         #   (plain `pip install .` does NOT pull it; without it the
+                         #   station fails at startup). Revert: engine: legacy.
   frame_budget_ms: 50.0
   dm_timeout_ms: 40
   executor: thread       # thread | process (see tools/bench_decoders.py)

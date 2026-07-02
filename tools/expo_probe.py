@@ -68,7 +68,10 @@ def main() -> int:
                 bright[e].append(float(gray.mean()))
                 frames[e] += 1
                 small = cv2.resize(gray, (_MOTION_W, _MOTION_H), interpolation=cv2.INTER_AREA)
-                roi = motion_box(prev_small, small, 1920, 1200)[0] if prev_small is not None else None
+                # scale the motion box by the NEGOTIATED geometry, not the
+                # requested 1920x1200 (the driver may deliver another mode)
+                fh, fw = gray.shape
+                roi = motion_box(prev_small, small, fw, fh)[0] if prev_small is not None else None
                 prev_small = small
                 region = gray if roi is None else gray[roi[1]:roi[1]+roi[3], roi[0]:roi[0]+roi[2]]
                 if decode_region(region, 0, 0, 1.0, 1.0):

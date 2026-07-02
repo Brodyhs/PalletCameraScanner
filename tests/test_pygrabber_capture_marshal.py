@@ -36,7 +36,9 @@ def _bare_capture() -> Any:
     cap._ae_auto = False
     cap._ctl_readback = {}
     cap._cmd_q = queue.Queue()
-    cap._fps_echo = 0.0
+    cap._req_fps = None
+    cap._fps_range = None
+    cap._fps_actual = None
     cap._w = 2064
     cap._h = 1552
     cap._fourcc_name = "Y8  "
@@ -109,6 +111,25 @@ def test_apply_control_exposure_returns_none_when_no_camera() -> None:
     assert cap._apply_control(cv2.CAP_PROP_EXPOSURE, -6.0) is None
 
 
+def test_apply_control_auto_exposure_returns_none_when_no_camera() -> None:
+    """No IAMCameraControl -> the flag never reaches hardware, so no sentinel
+    echo (REVIEW finding: the pre-fix code fabricated a successful readback)."""
+    cap = _bare_capture()  # _cam_ctrl is None
+    assert cap._apply_control(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0) is None
+    assert cap._ae_auto is False  # unconfirmed flag is not tracked either
+
+
+def test_apply_control_auto_exposure_returns_none_on_driver_error() -> None:
+    class Boom(FakeCamCtrl):
+        def Get(self, prop: int):  # noqa: N802 - COM naming
+            raise OSError("device fell off the bus")
+
+    cap = _bare_capture()
+    cap._cam_ctrl = Boom.with_exposure()
+    assert cap._apply_control(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0) is None
+    assert cap._ae_auto is False
+
+
 # -- set() control gate + command-queue marshaling ---------------------------
 
 
@@ -157,9 +178,15 @@ def test_set_returns_false_when_command_reports_not_ok() -> None:
 
 def test_set_format_props_accepted_without_controls() -> None:
     cap = _bare_capture()
-    # FPS echo is recorded; the other geometry props are accepted no-ops.
+    # fps honesty (REVIEW finding 8): the frame interval is never programmable
+    # after the graph is built, so set(FPS) succeeds ONLY when the negotiated
+    # capability is fixed-rate at the request — never an accepted mirror. (The
+    # old assertion here pinned the fabricated echo and was itself the bug.)
+    assert cap.set(cv2.CAP_PROP_FPS, 60.0) is False
+    cap._fps_actual = 60.0
     assert cap.set(cv2.CAP_PROP_FPS, 60.0) is True
-    assert cap._fps_echo == 60.0
+    assert cap.set(cv2.CAP_PROP_FPS, 30.0) is False
+    # Geometry props the connect path replays are accepted no-ops.
     assert cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2064.0) is True
     assert cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1552.0) is True
     assert cap.set(cv2.CAP_PROP_FOURCC, 0.0) is True
@@ -175,7 +202,10 @@ def test_get_geometry_and_fps() -> None:
     cap = _bare_capture()
     assert cap.get(cv2.CAP_PROP_FRAME_WIDTH) == 2064.0
     assert cap.get(cv2.CAP_PROP_FRAME_HEIGHT) == 1552.0
-    cap._fps_echo = 72.0
+    # fps: 0.0 (cv2 "unknown") until a device-programmed rate is known —
+    # never a mirror of a caller's request (REVIEW finding 8).
+    assert cap.get(cv2.CAP_PROP_FPS) == 0.0
+    cap._fps_actual = 72.0
     assert cap.get(cv2.CAP_PROP_FPS) == 72.0
 
 

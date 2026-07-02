@@ -28,9 +28,25 @@ def test_choose_format_prefers_y8_at_target_resolution() -> None:
     assert choose_format(_FORMATS, 2064, 1552) == 6
 
 
-def test_choose_format_falls_back_to_any_y8_when_target_res_has_none() -> None:
-    # No Y8 at 1920x1080 -> prefer Y8 over exact resolution (first Y8 = idx 6).
-    assert choose_format(_FORMATS, 1920, 1080) == 6
+def test_choose_format_exact_resolution_outranks_y8_preference() -> None:
+    # 1920x1080 is offered ONLY in Y12. Opening "any Y8" instead would stream
+    # a different geometry, and CameraSource's first-frame shape gate then
+    # rejects every frame -> infinite watchdog reconnect loop (REVIEW finding
+    # 13; this replaces the old assertion that pinned the any-Y8-first bug).
+    assert choose_format(_FORMATS, 1920, 1080) == 2
+
+
+def test_choose_format_mono_at_res_outranks_color_at_res() -> None:
+    formats = [
+        {"index": 1, "media_type_str": "YUY2", "width": 1920, "height": 1080},
+        {"index": 2, "media_type_str": "Y12 ", "width": 1920, "height": 1080},
+    ]
+    assert choose_format(formats, 1920, 1080) == 2
+
+
+def test_choose_format_any_y8_only_when_target_res_absent_entirely() -> None:
+    # 800x600 exists in no format at all -> the Y8 geometry fallback engages.
+    assert choose_format(_FORMATS, 800, 600) == 6
 
 
 def test_choose_format_uses_target_res_when_no_y8_exists() -> None:
@@ -49,6 +65,35 @@ def test_choose_format_no_dims_picks_first_y8() -> None:
     assert choose_format(_FORMATS, None, None) == 6
     # ...but with neither a Y8 preference nor dims there is nothing to go on.
     assert choose_format(_FORMATS, None, None, prefer_y8=False) is None
+
+
+# -- per-capability framerate preference (REVIEW finding 8: fps honesty) ------
+
+_FPS_FORMATS = [
+    # pygrabber swaps min/max (min_framerate = 1e7/MinFrameInterval = the
+    # HIGHEST fps); both orders must be tolerated.
+    {"index": 0, "media_type_str": "Y8  ", "width": 64, "height": 48,
+     "min_framerate": 72.0, "max_framerate": 72.0},
+    {"index": 1, "media_type_str": "Y8  ", "width": 64, "height": 48,
+     "min_framerate": 30.0, "max_framerate": 30.0},
+    {"index": 2, "media_type_str": "Y8  ", "width": 64, "height": 48,
+     "min_framerate": 120.0, "max_framerate": 90.0},
+]
+
+
+def test_choose_format_prefers_capability_containing_requested_fps() -> None:
+    assert choose_format(_FPS_FORMATS, 64, 48, fps=30.0) == 1
+    assert choose_format(_FPS_FORMATS, 64, 48, fps=72.0) == 0
+    # swapped min/max range 90..120 still matches a request inside it
+    assert choose_format(_FPS_FORMATS, 64, 48, fps=100.0) == 2
+
+
+def test_choose_format_fps_is_a_preference_not_a_filter() -> None:
+    # No capability offers 999 fps -> fall back to plain tier order.
+    assert choose_format(_FPS_FORMATS, 64, 48, fps=999.0) == 0
+    # No fps request -> plain tier order (arrival-day table has no rate keys).
+    assert choose_format(_FPS_FORMATS, 64, 48) == 0
+    assert choose_format(_FORMATS, 2064, 1552, fps=72.0) == 6
 
 
 def test_patch_adds_mono_guids_idempotently_without_clobbering() -> None:

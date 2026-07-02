@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from dataclasses import dataclass, field
@@ -57,6 +58,16 @@ class PassDecodeContext:
 #: pyzbar stays per-frame. A second pallet sharing the segment is still
 #: caught within ~N frames of becoming decodable.
 _CONFIRMED_DM_STRIDE = 5
+
+#: C0 control bytes that real, standards-conformant payloads contain and the
+#: default gate must therefore pass: tab/LF/CR (multi-line text labels),
+#: GS 0x1D (the GS1 FNC1 / AI separator embedded in GS1 QR and Data Matrix),
+#: and FS/RS/EOT 0x1C/0x1E/0x04 (the ISO 15434 envelope: "[)>" RS "06" GS
+#: ... RS EOT).
+_ALLOWED_CONTROL_CHARS = "\t\n\r\x04\x1c\x1d\x1e"
+
+#: Bound on the warn-once cache of distinct rejected payloads (FIFO evicted).
+_REJECT_WARN_MAX = 128
 
 
 @dataclass(slots=True)
@@ -148,7 +159,8 @@ def _variant_task(
 
 
 class DecodeEngine:
-    """Stateless apart from instrumentation counters; one per pipeline."""
+    """Stateless apart from instrumentation counters and the rejection
+    warn-once cache; one per pipeline."""
 
     def __init__(
         self,
@@ -172,19 +184,49 @@ class DecodeEngine:
         # Metrics hook: per-frame decode wall time, *including* frames that
         # decoded nothing (successful-only latency would flatter the p95).
         self._observe_wall_ms = observe_wall_ms
+        # Distinct payloads already WARNed about on rejection (see
+        # _log_rejection); insertion-ordered so eviction is FIFO.
+        self._rejected_seen: OrderedDict[str, None] = OrderedDict()
         self.counters = _Counters()
 
-    def _accept(self, payload: str) -> bool:
+    def _accept(self, payload: str, symbology: Symbology) -> bool:
         """Payload-shape gate (REVIEW DEC-01): a decode must look like a real
-        label payload, not a decoder false-positive (the 'F'm' phantom). A
-        configured ``decode.payload_pattern`` regex is the strong gate; with none
-        configured the default rejects only empty / C0-control-byte garbage that
-        a real printable label never contains, so normal text payloads (incl.
-        tab/newline/CR) are unaffected and there is no behavior change by default."""
+        label payload, not a decoder false-positive (the 'F\\x00m' phantom). A
+        configured ``decode.payload_pattern`` regex is the strong gate. With
+        none configured, the default is a deliberate behavior change vs the
+        original engine (which accepted every payload): the empty payload and
+        payloads containing C0 control bytes are rejected, EXCEPT the bytes in
+        :data:`_ALLOWED_CONTROL_CHARS` (tab/LF/CR plus the GS1 / ISO 15434
+        separators FS, GS, RS, EOT), which standard barcode payloads embed.
+        DATAMATRIX payloads must additionally reach ``dm_min_payload_len``:
+        pylibdmtx's characteristic misdecode of a noisy crop is a SHORT
+        printable string (e.g. "F'm") that the control-byte check passes."""
         if self._payload_re is not None:
             return self._payload_re.search(payload) is not None
+        if (
+            symbology is Symbology.DATAMATRIX
+            and len(payload) < self._cfg.dm_min_payload_len
+        ):
+            return False
         return payload != "" and not any(
-            ord(c) < 0x20 and c not in "\t\n\r" for c in payload
+            ord(c) < 0x20 and c not in _ALLOWED_CONTROL_CHARS for c in payload
+        )
+
+    def _log_rejection(self, payload: str, decoder: str) -> None:
+        """WARNING the first time each distinct payload is rejected, DEBUG
+        after: a recurring decoder false-positive must not become per-frame
+        logging I/O on the pipeline thread. The seen-cache is FIFO-bounded so
+        an adversarial payload stream cannot grow it without limit."""
+        first = payload not in self._rejected_seen
+        if first:
+            self._rejected_seen[payload] = None
+            if len(self._rejected_seen) > _REJECT_WARN_MAX:
+                self._rejected_seen.popitem(last=False)
+        log.log(
+            logging.WARNING if first else logging.DEBUG,
+            "decode: rejected non-conforming payload %r (decoder=%s) — not "
+            "emitting a pass; tune decode.payload_pattern if unexpected",
+            payload, decoder,
         )
 
     def _results(
@@ -199,13 +241,9 @@ class DecodeEngine:
         latency_ms = (time.perf_counter() - started) * 1000.0
         results: list[DecodeResult] = []
         for r in raw:
-            if not self._accept(r.payload):
+            if not self._accept(r.payload, r.symbology):
                 self.counters.spurious_rejected += 1
-                log.warning(
-                    "decode: rejected non-conforming payload %r (decoder=%s) — not "
-                    "emitting a pass; tune decode.payload_pattern if unexpected",
-                    r.payload, decoder,
-                )
+                self._log_rejection(r.payload, decoder)
                 continue
             results.append(
                 DecodeResult(
@@ -250,7 +288,11 @@ class DecodeEngine:
                 self.counters.zxing_calls += 1
                 hits = self._zxing.decode(crop, tuple(cfg.symbology_priority))
                 if hits:
-                    return self._results(hits, frame, origin, "zxing", started)
+                    # Short-circuit only on gate-ACCEPTED results: hits that
+                    # were all rejected must not stop the cascade.
+                    results = self._results(hits, frame, origin, "zxing", started)
+                    if results:
+                        return results
             else:
                 for sym in cfg.symbology_priority:
                     dm_ms = cfg.dm_timeout_ms
@@ -264,7 +306,11 @@ class DecodeEngine:
                     self._count_call(sym)
                     name, hits = _decode_sym(self._pyzbar, self._dmtx, sym, crop, dm_ms)
                     if hits:
-                        return self._results(hits, frame, origin, name, started)
+                        # Gate-rejected hits must not stop the cascade — keep
+                        # trying the remaining symbologies, then step 3.
+                        results = self._results(hits, frame, origin, name, started)
+                        if results:
+                            return results
 
             # Step 3: preprocessing variants, only for a stubborn and still
             # unconfirmed pass.
@@ -298,9 +344,13 @@ class DecodeEngine:
                     for fut in done:
                         _, decoder, hits = fut.result()
                         if hits:
-                            return self._results(
+                            # Same rule as steps 1+2: a variant whose hits
+                            # were all gate-rejected must not end the fan-out.
+                            results = self._results(
                                 hits, frame, origin, decoder, started
                             )
+                            if results:
+                                return results
                 return []
             finally:
                 for fut in futures:
