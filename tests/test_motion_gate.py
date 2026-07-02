@@ -34,13 +34,10 @@ def _moving_square_stream(
 def _run(gate: MotionGate, images: list[np.ndarray]):
     results, events = [], []
     for i, img in enumerate(images):
-        res, ev = gate.update(_frame(img, i))
+        res, evs = gate.update(_frame(img, i))
         results.append(res)
-        if ev:
-            events.append(ev)
-    tail = gate.flush()
-    if tail:
-        events.append(tail)
+        events.extend(evs)
+    events.extend(gate.flush())
     return results, events
 
 
@@ -49,6 +46,28 @@ def test_static_stream_produces_no_candidates() -> None:
     results, events = _run(gate, _moving_square_stream(30, start=99))
     assert events == []
     assert all(not r.active for r in results)
+
+
+def test_sensor_noise_on_static_scene_is_not_motion() -> None:
+    """REVIEW_bringup_4d95b67 finding 1: _downscale must AVERAGE (one
+    INTER_AREA resize), not decimate. The strided pre-slice made the resize a
+    no-op at 1920x1200 (and 1280x720/960x540), so raw per-pixel sensor noise
+    flooded the frame diff: static scenes read as whole-frame phantom motion
+    (motion_frac 0.14-0.74 observed) and segments never closed."""
+    rng = np.random.default_rng(7)
+    base = np.full((1200, 1920), 120.0, np.float64)
+    cfg = MotionConfig()
+    gate = MotionGate(cfg, "cam0")
+    fracs: list[float] = []
+    for i in range(4):
+        # Static scene + fresh sigma-6 gaussian sensor noise each frame.
+        noisy = np.clip(base + rng.normal(0.0, 6.0, base.shape), 0, 255)
+        res, evs = gate.update(_frame(noisy.astype(np.uint8), i))
+        assert evs == []
+        assert not res.active
+        fracs.append(res.motion_frac)
+    # Frame 0 is warm-up; every diffed frame must sit below the area floor.
+    assert max(fracs[1:]) < cfg.min_area_frac, fracs
 
 
 def test_single_pass_yields_one_segment_with_sane_bounds() -> None:
@@ -104,9 +123,10 @@ def test_quiet_frames_close_timing() -> None:
     images = _moving_square_stream(50, start=5, stop=20)
     closes = []
     for i, img in enumerate(images):
-        _, ev = gate.update(_frame(img, i))
-        if ev and ev.kind is SegmentKind.CLOSE:
-            closes.append((i, ev))
+        _, evs = gate.update(_frame(img, i))
+        for ev in evs:
+            if ev.kind is SegmentKind.CLOSE:
+                closes.append((i, ev))
     assert len(closes) == 1
     emitted_at, ev = closes[0]
     # close decision is made quiet_frames after the last active frame
@@ -147,12 +167,13 @@ def test_break_segment_closes_at_last_active_pre_gap_frame() -> None:
     images = _moving_square_stream(20, start=5)  # motion never goes quiet
     opens = []
     for i, img in enumerate(images):
-        _, ev = gate.update(_frame(img, i))
-        if ev:
-            opens.append(ev)
+        _, evs = gate.update(_frame(img, i))
+        opens.extend(evs)
     assert [e.kind for e in opens] == [SegmentKind.OPEN]
-    broke = gate.break_segment()
-    assert broke is not None and broke.kind is SegmentKind.CLOSE
+    broke_evs = gate.break_segment()
+    assert len(broke_evs) == 1
+    broke = broke_evs[0]
+    assert broke.kind is SegmentKind.CLOSE
     assert broke.candidate_id == opens[0].candidate_id
     # Last active frame of the stream, not anything from after the gap.
     assert broke.frame_index <= 19
@@ -174,9 +195,9 @@ def test_break_segment_resets_debounce_and_motion_model() -> None:
     bg = np.full((360, 640), 140, np.uint8)
     results = []
     for j in range(10):
-        res, ev = gate.update(_frame(bg.copy(), 100 + j))
+        res, evs = gate.update(_frame(bg.copy(), 100 + j))
         results.append(res)
-        assert ev is None or ev.kind is not SegmentKind.OPEN
+        assert all(ev.kind is not SegmentKind.OPEN for ev in evs)
     # Including the FIRST post-gap frame: with the model reset it is a
     # warm-up frame; without the reset it diffs against the pre-gap
     # reference and reads as whole-frame motion.
@@ -186,9 +207,8 @@ def test_break_segment_resets_debounce_and_motion_model() -> None:
     # Genuine post-gap motion opens a NEW candidate id.
     new_events = []
     for j, img in enumerate(_moving_square_stream(30, start=2, stop=20)):
-        _, ev = gate.update(_frame(img, 200 + j))
-        if ev:
-            new_events.append(ev)
+        _, evs = gate.update(_frame(img, 200 + j))
+        new_events.extend(evs)
     assert new_events and new_events[0].kind is SegmentKind.OPEN
     assert new_events[0].candidate_id.endswith("-000002")
 
@@ -208,8 +228,8 @@ def test_break_segment_recreates_mog2_background_model() -> None:
     # Post-gap stream is globally brighter, no moving object.
     bright = np.full((360, 640), 140, np.uint8)
     for j in range(30):
-        _, ev = gate.update(_frame(bright.copy(), 100 + j))
-        assert ev is None, (
+        _, evs = gate.update(_frame(bright.copy(), 100 + j))
+        assert evs == [], (
             "a global brightness step across the break opened a phantom "
             f"segment at post-gap frame {j}"
         )

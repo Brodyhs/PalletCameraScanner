@@ -8,6 +8,7 @@ import pytest
 from palletscan.config import Backend, CameraConfig, CameraSettings
 from palletscan.sources.controls import (
     QUIRKS,
+    ControlReport,
     all_verified,
     apply_mode,
     apply_settings,
@@ -43,7 +44,12 @@ def test_quirks_resolution_and_table_values() -> None:
     msmf = quirks_for(Backend.MSMF)
     assert (msmf.auto_exposure_off, msmf.auto_exposure_on) == (0.25, 0.75)
     assert QUIRKS[Backend.DSHOW].exposure_is_log2
-    assert not QUIRKS[Backend.AVFOUNDATION].controls_reliable
+    # readback_reliable covers READBACK trust only (the exposure-effect
+    # check is hard on every backend and has no quirk flag at all).
+    assert not QUIRKS[Backend.AVFOUNDATION].readback_reliable
+    assert not QUIRKS[Backend.MSMF].readback_reliable
+    assert not QUIRKS[Backend.PYGRABBER].readback_reliable
+    assert QUIRKS[Backend.DSHOW].readback_reliable
 
 
 def test_fourcc_round_trip() -> None:
@@ -135,11 +141,116 @@ def test_dshow_quantized_exposure_counts_as_verified() -> None:
 
 
 def test_avfoundation_ignored_sets_reported_unverified() -> None:
+    # AVFoundation is readback-unreliable AND this driver profile REJECTS
+    # the sets outright (set() returns False): each control reports
+    # verifiable=False AND accepted=False, backend named, and the note says
+    # REJECTED. (Contract updated per REVIEW bringup-4d95b67: the old note
+    # claimed 'applied request=...' for a write the backend refused —
+    # rejection is a failure everywhere, so it must never read as applied.)
+    # all_verified stays a READBACK-only verdict — rejection is accounted
+    # by its callers (CameraSource connect, calibrate) — so it still
+    # tolerates verifiable=False reports.
     cap = FakeCapture(hooks=avfoundation_hooks())
     settings = CameraSettings(exposure_auto=False, exposure=-6.0, gain=5.0)
-    reports = apply_settings(cap, settings, quirks_for(Backend.AVFOUNDATION))
+    reports = apply_settings(
+        cap, settings, quirks_for(Backend.AVFOUNDATION), backend_name="avfoundation"
+    )
     assert not any(r.verified for r in reports)
-    assert all("rejected" in r.note for r in reports)
+    assert all(not r.verifiable for r in reports)
+    assert all(not r.accepted for r in reports)
+    assert all("rejected" in r.note.lower() for r in reports)
+    assert all("applied" not in r.note.lower() for r in reports)
+    assert all("avfoundation" in r.note for r in reports)
+    # all_verified tolerates an unverifiable control (warn-not-gate).
+    assert all_verified(reports)
+
+
+# -- readback honesty: verifiable=False ----------------------------------------
+
+
+def test_control_report_verifiable_default_true() -> None:
+    r = ControlReport(
+        prop="exposure", requested=-6.0, accepted=True, readback=-6.0, verified=True
+    )
+    assert r.verifiable is True
+
+
+def test_unverifiable_report_renders_asserted_not_confirmed() -> None:
+    # MSMF: readback can't confirm the write -> verified False, verifiable
+    # False, and the note states intent (asserted), naming the backend.
+    cap = FakeCapture(hooks=msmf_hooks())
+    reports = apply_settings(
+        cap,
+        CameraSettings(exposure_auto=False, exposure=-6.0, gain=10.0),
+        quirks_for(Backend.MSMF),
+        backend_name="msmf",
+    )
+    exposure = next(r for r in reports if r.prop == "exposure")
+    assert exposure.verifiable is False
+    assert exposure.verified is False
+    assert "intent asserted, not confirmed" in exposure.note
+    assert "msmf" in exposure.note
+
+
+def test_unverifiable_report_does_not_fail_all_verified() -> None:
+    # A mixed bag: one reliable verified control + one backend-unverifiable
+    # control must still pass all_verified (the unverifiable one is tolerated).
+    good = ControlReport(
+        prop="width", requested=1920.0, accepted=True, readback=1920.0, verified=True
+    )
+    unverifiable = ControlReport(
+        prop="exposure",
+        requested=-6.0,
+        accepted=True,
+        readback=0.0,
+        verified=False,
+        note="applied request=-6; readback 0 NOT trustworthy on msmf — "
+        "intent asserted, not confirmed",
+        verifiable=False,
+    )
+    assert all_verified([good, unverifiable])
+    # A genuinely failed (verifiable) control still fails the gate.
+    failed = ControlReport(
+        prop="width", requested=1920.0, accepted=True, readback=640.0, verified=False
+    )
+    assert not all_verified([good, failed])
+
+
+def test_rejected_write_on_unverifiable_backend_says_rejected_not_applied() -> None:
+    """REVIEW bringup-4d95b67: a write the backend outright REJECTED
+    (accepted=False) on a readback-unreliable backend carried a note
+    claiming 'applied request=...'. Rejection is a failure on every backend
+    (on pygrabber a False set() is device-confirmed) and the note must say
+    so."""
+    cap = FakeCapture(hooks={cv2.CAP_PROP_EXPOSURE: lambda v: None})
+    reports = apply_settings(
+        cap,
+        CameraSettings(exposure_auto=False, exposure=-6.0),
+        quirks_for(Backend.PYGRABBER),
+        backend_name="pygrabber",
+    )
+    exposure = next(r for r in reports if r.prop == "exposure")
+    assert exposure.accepted is False
+    assert exposure.verified is False
+    assert exposure.verifiable is False
+    assert "rejected" in exposure.note
+    assert "applied" not in exposure.note
+    assert "pygrabber" in exposure.note
+
+
+def test_pygrabber_backend_named_in_unverifiable_note() -> None:
+    # The note must name the ACTUAL backend, not hardcode MSMF: the 37CUGM
+    # pygrabber path says 'pygrabber'.
+    cap = FakeCapture()
+    reports = apply_settings(
+        cap,
+        CameraSettings(exposure_auto=False, exposure=-6.0),
+        quirks_for(Backend.PYGRABBER),
+        backend_name="pygrabber",
+    )
+    exposure = next(r for r in reports if r.prop == "exposure")
+    assert exposure.verifiable is False
+    assert "pygrabber" in exposure.note
 
 
 # -- measure_achieved_fps --------------------------------------------------------

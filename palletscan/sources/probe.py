@@ -109,17 +109,24 @@ def current_mode(cap) -> ModeCandidate:
 
 
 def probe_modes(
-    make_cap: Callable[[], object],
+    make_cap: Callable[[ModeCandidate], object],
     candidates: list[ModeCandidate],
     *,
     sample_s: float = 1.0,
     warmup_frames: int = 5,
     clock: Callable[[], float] = time.monotonic,
 ) -> list[ProbeResult]:
-    """Try every candidate on a fresh capture and report what really happened."""
+    """Try every candidate on a fresh capture and report what really happened.
+
+    ``make_cap`` receives the candidate being probed: backends whose format
+    is fixed at capture construction (pygrabber's DirectShow graph — its
+    mode ``set()`` calls are accepted no-ops) must build each candidate
+    into its own capture, or every candidate is measured on the same
+    seed-negotiated format (re-review of REVIEW bringup-4d95b67). cv2
+    backends may ignore it; the ``set()`` calls below program them."""
     results: list[ProbeResult] = []
     for cand in candidates:
-        cap = make_cap()
+        cap = make_cap(cand)
         try:
             if not cap.isOpened():  # type: ignore[attr-defined]
                 results.append(

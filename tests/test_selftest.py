@@ -163,12 +163,19 @@ def test_ignored_buffersize_never_fails_selftest(tmp_path: Path) -> None:
 
 
 def test_controls_warn_not_fail_on_avfoundation(tmp_path: Path) -> None:
+    """Readback-untrusted controls WARN; the exposure-EFFECT check is a
+    separate, backend-independent gate (REVIEW bringup-4d95b67), so this
+    fixture's exposure must physically work to isolate the readback-warn
+    contract. (It used to be dead too, and the effect check was wrongly
+    demoted to WARN along with the readback.)"""
     from tests.camera_fakes import avfoundation_hooks
 
     clock = FakeClock()
+    hooks = avfoundation_hooks()
+    del hooks[cv2.CAP_PROP_EXPOSURE]  # exposure applies; readback untrusted
     factory = FakeCaptureFactory(
         default=lambda i, b: FakeCapture(
-            hooks=avfoundation_hooks(), clock=clock, real_fps=30.0
+            hooks=hooks, clock=clock, real_fps=30.0
         )
     )
     cfg = AppConfig.model_validate(
@@ -196,18 +203,27 @@ def test_controls_warn_not_fail_on_avfoundation(tmp_path: Path) -> None:
         clock=clock,
         data_dir=tmp_path / "scratch",
     )
-    # Controls and exposure-effect both unhappy, but AVFoundation is not
-    # controls_reliable: honest WARNs, selftest still passes overall.
+    # Rejected auto-exposure on a readback-unreliable backend: honest WARN,
+    # selftest still passes. The exposure-effect check PASSES because the
+    # control physically works — it gates hard everywhere, independent of
+    # readback trust (the split this test now pins).
     assert report.ok, report.format()
     controls = next(c for c in report.checks if c.name.endswith("/controls"))
     assert controls.status == "WARN"
     effect = next(c for c in report.checks if c.name.endswith("/exposure_effect"))
-    assert effect.status == "WARN"
+    assert effect.status == "PASS"
 
 
-def test_dead_exposure_control_hard_fails_on_reliable_backend(
+def test_dead_exposure_control_hard_fails_even_on_msmf(
     tmp_path: Path,
 ) -> None:
+    """REVIEW bringup-4d95b67 (exposure-effect gate restoration): this test
+    was repointed MSMF->DSHOW when MSMF readback trust was dropped, which
+    demoted the exposure-EFFECT gate along with it — production
+    mis-exposure had no hard failure. Repointed back: the effect check
+    measures pixels, not readback, so a physically dead exposure control
+    hard-fails selftest on EVERY backend, MSMF included; only the readback
+    verdict stays a WARN there."""
     clock = FakeClock()
     factory = FakeCaptureFactory(
         default=lambda i, b: FakeCapture(
@@ -222,7 +238,7 @@ def test_dead_exposure_control_hard_fails_on_reliable_backend(
                 {
                     "id": "cam",
                     "name": "See3CAM_24CUG",
-                    "backend": "msmf",
+                    "backend": "msmf",  # readback-unreliable; effect still hard
                     "fps": 30.0,
                     "settings": {"exposure_auto": False, "exposure": -6.0},
                 }
@@ -241,7 +257,10 @@ def test_dead_exposure_control_hard_fails_on_reliable_backend(
     )
     assert not report.ok
     effect = next(c for c in report.checks if c.name.endswith("/exposure_effect"))
-    assert effect.status == "FAIL"  # brightness never moved
+    assert effect.status == "FAIL" and effect.hard  # brightness never moved
+    # The readback verdict is independently soft on MSMF: WARN, not FAIL.
+    controls = next(c for c in report.checks if c.name.endswith("/controls"))
+    assert controls.status == "WARN"
 
 
 def test_disk_pressure_fails_hard_then_warns(tmp_path: Path) -> None:

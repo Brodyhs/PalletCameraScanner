@@ -28,6 +28,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# zxing-cpp decode backend (decode.engine: zxing) — pip-only, Apache-2.0, no
+# vendor SDK; prebuilt wheels (no compiler needed). More robust than the
+# pyzbar+pylibdmtx default on blurry/low-contrast/angled codes.
+zxing = [
+    "zxing-cpp>=2.2",
+]
 dev = [
     "pytest>=8.0",
     "mypy>=1.8",

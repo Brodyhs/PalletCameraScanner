@@ -467,3 +467,53 @@ def test_supervisor_crash_stops_live_child_before_propagating(
         sup.run()
     assert child.signals, "the child must be stopped before the crash escapes"
     assert child.poll() is not None, "the child must be dead"
+
+
+# -- StopFileWatch: the writer-level stop latch --------------------------------
+
+
+def test_stop_file_watch_fires_on_appearance(tmp_path: Path) -> None:
+    """The console-free stop channel: touching the latch drains the writer
+    (CTRL_BREAK needs a shared console, which CI capture often lacks)."""
+    from palletscan.reliability.supervisor import StopFileWatch
+
+    stopped = threading.Event()
+    latch = tmp_path / "palletscan.stop"
+    watch = StopFileWatch(latch, stopped.set, poll_s=0.02)
+    watch.start()
+    try:
+        assert not stopped.wait(0.1), "must not fire before the file exists"
+        latch.touch()
+        assert stopped.wait(2.0), "must fire once the latch appears"
+        assert latch.exists(), "the latch is sticky: the watch never deletes it"
+    finally:
+        watch.stop()
+
+
+def test_stop_file_watch_pre_existing_latch_fires_immediately(
+    tmp_path: Path,
+) -> None:
+    """Startup honoring, matching the supervisor latch semantics."""
+    from palletscan.reliability.supervisor import StopFileWatch
+
+    stopped = threading.Event()
+    latch = tmp_path / "palletscan.stop"
+    latch.touch()
+    watch = StopFileWatch(latch, stopped.set, poll_s=0.02)
+    watch.start()
+    try:
+        assert stopped.wait(2.0), "a latch present at start must fire"
+    finally:
+        watch.stop()
+
+
+def test_stop_file_watch_stop_joins_without_firing(tmp_path: Path) -> None:
+    """The _WriterLease convention: no leaked threads, no spurious drain."""
+    from palletscan.reliability.supervisor import StopFileWatch
+
+    fired = threading.Event()
+    watch = StopFileWatch(tmp_path / "absent.stop", fired.set, poll_s=0.02)
+    watch.start()
+    watch.stop()
+    assert not watch._thread.is_alive(), "stop() must join the thread"
+    assert not fired.is_set()

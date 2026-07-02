@@ -55,6 +55,8 @@ _KNOWN_GAUGES = frozenset(
         "dmtx_calls",
         "fallback_calls",
         "budget_overruns",
+        "spurious_rejected",
+        "idle_reads",
         "evidence_failures",
         "source_stalls",
         "source_reconnects",
@@ -214,7 +216,10 @@ class MetricsRegistry:
         """The stable stats contract (Phase 4 serves this as /stats.json)."""
         now = self._clock()
         uptime_s = now - self._started
-        lat = sorted(self._latency_ms)
+        # Copy-first: list() is a GIL-atomic snapshot of the deque, which the
+        # pipeline thread appends to concurrently. Sorting the live deque can
+        # raise "deque mutated during iteration" and 500 /stats.json under load.
+        lat = sorted(list(self._latency_ms))
 
         first, last = self._first_frame_ts, self._last_frame_ts
         per_hour = 0.0
@@ -249,6 +254,8 @@ class MetricsRegistry:
                 "dmtx_calls": self._gauge("dmtx_calls"),
                 "fallback_calls": self._gauge("fallback_calls"),
                 "budget_overruns": self._gauge("budget_overruns"),
+                "spurious_rejected": self._gauge("spurious_rejected"),
+                "idle_reads": self._gauge("idle_reads"),
             },
             "passes": {
                 "emitted": self._gauge("passes_emitted"),

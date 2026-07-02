@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
 
-from palletscan.config import DecodeConfig
+from palletscan.config import DecodeConfig, DecodeEngineKind
 from palletscan.pipeline.decode_engine import DecodeEngine, PassDecodeContext
+from palletscan.pipeline.decoders import RawDecode
 from palletscan.sources.render import motion_blur, render_datamatrix, render_qr
 from palletscan.types import Frame, Roi, Symbology
 
@@ -127,3 +130,113 @@ def test_dm_priority_order_runs_dmtx_first(executor) -> None:
     results = engine.decode_frame(frame, roi, PassDecodeContext())
     assert results and results[0].decoder == "pylibdmtx"
     assert engine.counters.pyzbar_calls == 0
+
+
+def test_payload_gate_default_drops_garbage_keeps_text(executor) -> None:
+    # REVIEW DEC-01: with no pattern the gate is permissive — it drops only
+    # empty / control-byte garbage, never normal printable text.
+    engine = DecodeEngine(DecodeConfig(), executor)
+    assert engine._accept("PLT-000001", Symbology.QR)
+    assert engine._accept("Test DM 4.5 inches", Symbology.DATAMATRIX)
+    assert engine._accept("a\tb\nc", Symbology.QR)  # tab/newline text is fine
+    assert not engine._accept("", Symbology.QR)  # empty
+    assert not engine._accept("F\x01m", Symbology.QR)  # C0 = false-positive
+
+
+def test_payload_gate_accepts_gs1_and_iso15434_separators(executor) -> None:
+    # Standard warehouse label content embeds C0 separator bytes: GS1 QR/DM
+    # use GS (0x1D) as the FNC1/AI separator; ISO 15434 envelopes use
+    # RS/GS/EOT (and FS). The default gate must pass these, while still
+    # rejecting empty payloads and other C0 garbage (the F\x00m phantom).
+    engine = DecodeEngine(DecodeConfig(), executor)
+    assert engine._accept(
+        "0100345312000023\x1d10ABC123\x1d21000042", Symbology.DATAMATRIX
+    )  # GS1
+    assert engine._accept(
+        "[)>\x1e06\x1d1JUN123456\x1d20L\x1e\x04", Symbology.DATAMATRIX
+    )  # ISO 15434
+    assert not engine._accept("F\x00m", Symbology.QR)  # NUL false-positive
+    assert not engine._accept("", Symbology.QR)  # empty
+
+
+def test_payload_gate_rejects_short_datamatrix_misdecodes(executor) -> None:
+    # pylibdmtx's characteristic false-positive on a noisy crop is a SHORT
+    # printable payload ("F'm" — all-printable, so the control-byte check
+    # passes it). The default gate requires dm_min_payload_len (4) for
+    # DATAMATRIX results only; QR is unaffected, and the knob is tunable.
+    engine = DecodeEngine(DecodeConfig(), executor)
+    assert not engine._accept("F'm", Symbology.DATAMATRIX)  # the phantom
+    assert engine._accept("F'm", Symbology.QR)  # QR path unaffected
+    assert engine._accept("PLT-000001", Symbology.DATAMATRIX)
+    permissive = DecodeEngine(DecodeConfig(dm_min_payload_len=1), executor)
+    assert permissive._accept("F'm", Symbology.DATAMATRIX)  # knob relaxes it
+    strict_re = DecodeEngine(
+        DecodeConfig(payload_pattern="^F'm$", dm_min_payload_len=4), executor
+    )
+    assert strict_re._accept("F'm", Symbology.DATAMATRIX)  # pattern overrides
+
+
+def test_gate_rejected_hits_do_not_stop_legacy_cascade(executor) -> None:
+    # A decoder step whose hits are ALL gate-rejected must not short-circuit
+    # decode_frame: the remaining symbology decoders still get their turn.
+    class _PhantomPyzbar:
+        def decode(self, gray: np.ndarray) -> list[RawDecode]:
+            return [
+                RawDecode(payload="F\x00m", symbology=Symbology.QR, roi=Roi(0, 0, 2, 2))
+            ]
+
+    engine = DecodeEngine(DecodeConfig(), executor)
+    engine._pyzbar = _PhantomPyzbar()  # type: ignore[assignment]
+    frame, roi = _frame_with(render_datamatrix(PAYLOAD, 4.0).image)
+    results = engine.decode_frame(frame, roi, PassDecodeContext())
+    assert [r.payload for r in results] == [PAYLOAD]
+    assert results[0].decoder == "pylibdmtx"
+    assert engine.counters.spurious_rejected == 1
+
+
+def test_rejection_warns_once_per_payload_then_debug(executor, caplog) -> None:
+    # A recurring rejected payload logs WARNING only on first sight (DEBUG
+    # after) so decoder false-positives can't spam per-frame logging I/O;
+    # the spurious_rejected counter stays exact, and each DISTINCT payload
+    # still gets its own first-sight WARNING.
+    engine = DecodeEngine(DecodeConfig(), executor)
+    frame, _roi = _frame_with(np.zeros((8, 8), np.uint8))
+    bad = RawDecode(payload="F\x00m", symbology=Symbology.QR, roi=Roi(0, 0, 2, 2))
+    other = RawDecode(payload="F\x01m", symbology=Symbology.QR, roi=Roi(0, 0, 2, 2))
+    with caplog.at_level(logging.DEBUG, logger="palletscan.pipeline.decode_engine"):
+        for _ in range(3):
+            engine._results([bad], frame, (0, 0), "test", time.perf_counter())
+        engine._results([other], frame, (0, 0), "test", time.perf_counter())
+    records = [r for r in caplog.records if "rejected non-conforming" in r.getMessage()]
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    debugs = [r for r in records if r.levelno == logging.DEBUG]
+    assert len(warnings) == 2  # one per distinct payload
+    assert len(debugs) == 2  # repeats of the first payload
+    assert engine.counters.spurious_rejected == 4
+
+
+def test_zxing_engine_import_failure_is_loud_and_actionable(
+    executor, monkeypatch
+) -> None:
+    # decode.engine: zxing with zxing-cpp missing must fail AT CONSTRUCTION
+    # with a message naming the config key and the install fix — never a
+    # silent fallback or a bare ImportError later.
+    monkeypatch.setitem(sys.modules, "zxingcpp", None)  # import -> ImportError
+    with pytest.raises(RuntimeError, match=r"decode\.engine") as exc_info:
+        DecodeEngine(DecodeConfig(engine=DecodeEngineKind.ZXING), executor)
+    assert '.[zxing]' in str(exc_info.value)
+
+
+def test_payload_pattern_rejects_phantom_and_counts(executor) -> None:
+    # A configured pattern drops a spurious-but-valid decode (the "F'm" phantom)
+    # BEFORE it can become a confirmed pass, and counts it as spurious_rejected.
+    from palletscan.pipeline.decoders import RawDecode
+
+    cfg = DecodeConfig(payload_pattern=r"^PLT-\d{6}$")
+    engine = DecodeEngine(cfg, executor)
+    frame, _roi = _frame_with(np.zeros((8, 8), np.uint8))
+    good = RawDecode(payload="PLT-000007", symbology=Symbology.QR, roi=Roi(0, 0, 2, 2))
+    phantom = RawDecode(payload="F'm", symbology=Symbology.QR, roi=Roi(0, 0, 2, 2))
+    out = engine._results([good, phantom], frame, (0, 0), "test", time.perf_counter())
+    assert [r.payload for r in out] == ["PLT-000007"]
+    assert engine.counters.spurious_rejected == 1

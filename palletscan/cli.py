@@ -427,6 +427,24 @@ def _stop_parent_watch(watch: "object | None") -> None:
         watch.stop()  # type: ignore[attr-defined]
 
 
+def _start_stop_file_watch(
+    runner: "PipelineRunner | StationRunner", cfg: AppConfig
+) -> "object | None":
+    """Writer-level stop latch: watch ``palletscan.stop`` next to the
+    instance lock and drain on appearance — the console-free stop channel
+    (CTRL_BREAK needs a shared console, which services and captured-output
+    CI shells often lack). Sticky like the supervisor latch: never deleted
+    here; whoever touches it clears it. Caller must ``stop()`` the watch in
+    its finally (same thread-leak convention as the parent watch)."""
+    from palletscan.reliability.supervisor import StopFileWatch
+
+    watch = StopFileWatch(
+        cfg.lock.path.with_name("palletscan.stop"), runner.stop
+    )
+    watch.start()
+    return watch
+
+
 def _load_config_checked(path: Path | None, command: str) -> AppConfig | None:
     """Load the YAML config; any load/validation failure becomes the
     documented exit-2 contract (clean message, no traceback) instead of an
@@ -475,6 +493,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if lease is None:
         return 4
     watch = None
+    stop_watch = None
     try:
         try:
             runner: PipelineRunner | StationRunner = (
@@ -489,6 +508,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 1
         _install_stop_signals(runner)
         watch = _start_parent_watch_if_supervised(runner)
+        stop_watch = _start_stop_file_watch(runner, cfg)
         dashboard = None
         if args.dashboard or cfg.web.enabled:
             if isinstance(runner, StationRunner):
@@ -512,6 +532,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 0
     finally:
         _stop_parent_watch(watch)
+        _stop_parent_watch(stop_watch)
         lease.release()
 
 
@@ -588,6 +609,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
     if lease is None:
         return 4
     watch = None
+    stop_watch = None
     try:
         if args.ab:
             from palletscan.sources.factory import synthetic_tail_s
@@ -604,6 +626,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
             station = StationRunner(cfg, sources=sources)
             _install_stop_signals(station)
             watch = _start_parent_watch_if_supervised(station)
+            stop_watch = _start_stop_file_watch(station, cfg)
             dashboard = None
             if args.dashboard or cfg.web.enabled:
                 try:
@@ -634,6 +657,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
         runner = PipelineRunner.from_config(cfg)
         _install_stop_signals(runner)
         watch = _start_parent_watch_if_supervised(runner)
+        stop_watch = _start_stop_file_watch(runner, cfg)
         dashboard = None
         if args.dashboard or cfg.web.enabled:
             try:
@@ -655,6 +679,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
         return 0 if summary.unaccounted == 0 else 1
     finally:
         _stop_parent_watch(watch)
+        _stop_parent_watch(stop_watch)
         lease.release()
 
 
@@ -859,10 +884,12 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     if lease is None:
         return 4
     watch = None
+    stop_watch = None
     try:
         runner = PipelineRunner.from_config(cfg)
         _install_stop_signals(runner)
         watch = _start_parent_watch_if_supervised(runner)
+        stop_watch = _start_stop_file_watch(runner, cfg)
         dashboard = None
         if args.dashboard or cfg.web.enabled:
             try:
@@ -886,10 +913,25 @@ def _cmd_replay(args: argparse.Namespace) -> int:
         return 0 if summary.unaccounted == 0 else 1
     finally:
         _stop_parent_watch(watch)
+        _stop_parent_watch(stop_watch)
         lease.release()
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to a legacy code page (cp1252) and so does the
+    # locale encoding used when stdout is piped; the formatted reports use
+    # non-ASCII glyphs (box rules etc.), which raises UnicodeEncodeError and
+    # crashes selftest/synth/run output on the factory PC. Force UTF-8 up front
+    # (no-op where stdout is already UTF-8, e.g. macOS/Linux; guarded so a
+    # replaced/captured stream without reconfigure() is simply skipped).
+    for _stream in (sys.stdout, sys.stderr):
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if _reconfigure is not None:
+            try:
+                _reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
     # No option abbreviations anywhere: an abbreviated --data-dir spelling
     # ("--data") used to slip past supervise's append gate and silently run
     # the child on the wrong data dir (REVIEW finding b1).

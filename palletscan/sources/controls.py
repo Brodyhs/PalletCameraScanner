@@ -9,11 +9,15 @@ so arrival-day findings correct a constant, not scattered logic.
 Every property write produces an honest :class:`ControlReport`
 (requested vs accepted vs read-back); callers decide severity. At
 run/(re)connect the policy is warn-and-continue (frames at slightly-wrong
-exposure beat no frames); calibrate/selftest hard-fail on
-``controls_reliable`` backends and warn honestly on AVFoundation.
+exposure beat no frames); calibrate/selftest hard-fail readback mismatches
+on ``readback_reliable`` backends (DSHOW) and warn honestly where readback
+is untrustworthy (MSMF, AVFoundation, pygrabber). A write the backend
+outright REJECTED (``accepted=False``) is a failure on EVERY backend —
+readback trustworthiness is irrelevant to a refused set().
 
 ``verify_exposure_effect`` perturbs the camera, so it runs in
-calibrate/selftest only — never on the live path.
+calibrate/selftest only — never on the live path. It measures the IMAGE,
+not readback, so its gate is hard on every backend.
 """
 
 from __future__ import annotations
@@ -35,43 +39,70 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class BackendQuirks:
     """Per-backend control semantics (corrected on arrival day if reality
-    disagrees — ARRIVAL_CHECKLIST step 3)."""
+    disagrees — ARRIVAL_CHECKLIST step 3).
+
+    ``readback_reliable`` covers READBACK trustworthiness ONLY: it decides
+    whether a readback mismatch is a hard verification failure or an honest
+    warning. It deliberately says nothing about the exposure-EFFECT check
+    (:func:`verify_exposure_effect`), which measures delivered pixels — not
+    readback — and therefore gates hard on EVERY backend (REVIEW
+    bringup-4d95b67: untrustworthy readback must never demote a physically
+    dead exposure control to a warning)."""
 
     auto_exposure_on: float
     auto_exposure_off: float
     exposure_is_log2: bool
-    controls_reliable: bool
+    readback_reliable: bool
 
 
 #: Backend quirk knowledge as data. DSHOW: log2 exposure stops, classic
-#: 1/0 auto toggle. MSMF: 0.25 manual / 0.75 auto. AVFoundation ignores
-#: most UVC control props (``controls_reliable=False`` keeps dev-machine
-#: calibration honest instead of hard-failing). AUTO covers CAP_ANY on
-#: platforms with no named entry.
+#: 1/0 auto toggle, truthful readback (``readback_reliable=True``). MSMF:
+#: 0.25 manual / 0.75 auto, but readback is unreliable on real hardware
+#: (garbage FOURCC + control readback) so ``readback_reliable=False``
+#: (arrival-day finding). AVFoundation ignores most UVC control props (also
+#: ``readback_reliable=False``, keeping dev-machine calibration honest
+#: about readback). AUTO covers CAP_ANY on platforms with no named entry.
 QUIRKS: dict[Backend, BackendQuirks] = {
     Backend.DSHOW: BackendQuirks(
         auto_exposure_on=1.0,
         auto_exposure_off=0.0,
         exposure_is_log2=True,
-        controls_reliable=True,
+        readback_reliable=True,
     ),
     Backend.MSMF: BackendQuirks(
         auto_exposure_on=0.75,
         auto_exposure_off=0.25,
         exposure_is_log2=False,
-        controls_reliable=True,
+        # Arrival-day (2026-06-19): OpenCV's MSMF backend returns GARBAGE
+        # CAP_PROP_FOURCC ("????") and unreliable exposure/gain/auto-exposure
+        # readback on the See3CAM_24CUG, even though the controls physically
+        # apply (the exposure-effect test passes). READBACK therefore cannot
+        # gate — warn and lean on the exposure-effect + achieved-fps checks,
+        # which stay hard. (DSHOW readback IS truthful here.)
+        readback_reliable=False,
     ),
     Backend.AVFOUNDATION: BackendQuirks(
         auto_exposure_on=1.0,
         auto_exposure_off=0.0,
         exposure_is_log2=False,
-        controls_reliable=False,
+        readback_reliable=False,
     ),
     Backend.AUTO: BackendQuirks(
         auto_exposure_on=0.75,
         auto_exposure_off=0.25,
         exposure_is_log2=False,
-        controls_reliable=True,
+        readback_reliable=True,
+    ),
+    # pygrabber drives a DirectShow SampleGrabber for mono cams OpenCV can't
+    # read. Exposure/gain ARE wired via raw IAMCameraControl/IAMVideoProcAmp
+    # (sources/dshow_controls.py), DSHOW-style: exposure in log2 seconds, auto
+    # sentinel 1.0/0.0. readback_reliable stays False until readback truthfulness
+    # is proven on the 37CUGM (then flip to True) — warn-only meanwhile, like MSMF.
+    Backend.PYGRABBER: BackendQuirks(
+        auto_exposure_on=1.0,
+        auto_exposure_off=0.0,
+        exposure_is_log2=True,
+        readback_reliable=False,
     ),
 }
 
@@ -116,12 +147,30 @@ class ControlReport:
     #: Best-effort property (e.g. BUFFERSIZE, which DSHOW/MSMF do not
     #: implement): reported honestly but never fed to a hard pass/fail gate.
     informational: bool = False
+    #: Whether readback on this backend can be TRUSTED to confirm the write.
+    #: False on readback-unreliable backends (MSMF returns garbage readback;
+    #: AVFoundation ignores the props; pygrabber until proven): an ACCEPTED
+    #: control there was *asserted*, not *confirmed*, so its unverified
+    #: readback is honesty about the backend, not a failed write. A REJECTED
+    #: write (``accepted=False``) is a failure regardless of this flag.
+    #: Default True keeps every existing reliable-backend report unchanged.
+    verifiable: bool = True
 
 
 def all_verified(reports: list[ControlReport]) -> bool:
     """True when every gate-relevant report verified (informational
-    best-effort properties report honestly but never fail a gate)."""
-    return all(r.verified or r.informational for r in reports)
+    best-effort properties report honestly but never fail a gate).
+
+    Backend-unverifiable controls (``verifiable=False``) are tolerated the
+    same way: their readback cannot confirm the write, so gating on it
+    would hard-fail every MSMF/AVFoundation connect — they are surfaced
+    as warnings, not gate failures (run-path policy, spec §2). NOTE: this
+    is a READBACK verdict only — a REJECTED write (``accepted=False``) is
+    a failure on every backend, accounted separately by the callers
+    (CameraSource connect, calibrate)."""
+    return all(
+        r.verified or r.informational or not r.verifiable for r in reports
+    )
 
 
 def log_reports(label: str, reports: list[ControlReport]) -> None:
@@ -145,6 +194,8 @@ def _set(
     quantize_tol: float | None = None,
     note: str = "",
     informational: bool = False,
+    verifiable: bool = True,
+    backend_name: str = "",
 ) -> ControlReport:
     accepted = bool(cap.set(prop, requested))
     readback = float(cap.get(prop))
@@ -153,6 +204,38 @@ def _set(
         if abs(readback - requested) <= quantize_tol:
             verified = True
             note = (note + " " if note else "") + f"quantized to {readback:g}"
+    if not verifiable:
+        # Readback-unreliable backend: readback cannot be trusted to confirm
+        # the write. Two honest cases (REVIEW bringup-4d95b67):
+        #   * accepted — the INTENT was asserted, not confirmed; never let it
+        #     masquerade as 'verified';
+        #   * REJECTED (accepted=False) — the backend itself refused the
+        #     write (on pygrabber a False set() is device-confirmed failure):
+        #     a real failure everywhere, and the note must never claim
+        #     'applied'.
+        # The backend is named (not hardcoded) so the 37CUGM pygrabber path
+        # says 'pygrabber', MSMF says 'msmf', etc.
+        be = backend_name or "this backend"
+        if accepted:
+            unverifiable_note = (
+                f"applied request={requested:g}; readback {readback:g} NOT "
+                f"trustworthy on {be} — intent asserted, not confirmed"
+            )
+        else:
+            unverifiable_note = (
+                f"set() rejected request={requested:g} on {be} "
+                f"(readback {readback:g} untrustworthy)"
+            )
+        return ControlReport(
+            prop=name,
+            requested=float(requested),
+            accepted=accepted,
+            readback=readback,
+            verified=False,
+            note=unverifiable_note,
+            informational=informational,
+            verifiable=False,
+        )
     if not accepted:
         verified = False
         note = (note + " " if note else "") + "set() rejected"
@@ -213,17 +296,41 @@ def apply_mode(cap, cam: CameraConfig) -> list[ControlReport]:
 
 
 def apply_settings(
-    cap, settings: CameraSettings, quirks: BackendQuirks
+    cap,
+    settings: CameraSettings,
+    quirks: BackendQuirks,
+    *,
+    backend_name: str = "",
 ) -> list[ControlReport]:
     """Apply persisted controls: auto-exposure first (manual exposure set
-    under active AE gets clobbered), then exposure, gain, brightness."""
+    under active AE gets clobbered), then exposure, gain, brightness.
+
+    On a readback-unreliable backend (``quirks.readback_reliable=False`` —
+    MSMF/AVFoundation/pygrabber-until-proven) the readback cannot confirm
+    the write, so each control is reported ``verifiable=False`` (asserted,
+    not confirmed) instead of as a verification *failure*. A REJECTED write
+    (``accepted=False``) stays a failure everywhere. ``backend_name``
+    names that backend in the honest note ('msmf', 'pygrabber', ...).
+    """
     reports: list[ControlReport] = []
+    # Readback only confirms a write on a readback-reliable backend; elsewhere
+    # the control is asserted, not confirmed (REVIEW: MSMF readback honesty).
+    verifiable = quirks.readback_reliable
     ae = (
         quirks.auto_exposure_on
         if settings.exposure_auto
         else quirks.auto_exposure_off
     )
-    reports.append(_set(cap, "auto_exposure", cv2.CAP_PROP_AUTO_EXPOSURE, ae))
+    reports.append(
+        _set(
+            cap,
+            "auto_exposure",
+            cv2.CAP_PROP_AUTO_EXPOSURE,
+            ae,
+            verifiable=verifiable,
+            backend_name=backend_name,
+        )
+    )
     if settings.exposure is not None:
         reports.append(
             _set(
@@ -232,10 +339,21 @@ def apply_settings(
                 cv2.CAP_PROP_EXPOSURE,
                 float(settings.exposure),
                 quantize_tol=0.5 if quirks.exposure_is_log2 else None,
+                verifiable=verifiable,
+                backend_name=backend_name,
             )
         )
     if settings.gain is not None:
-        reports.append(_set(cap, "gain", cv2.CAP_PROP_GAIN, float(settings.gain)))
+        reports.append(
+            _set(
+                cap,
+                "gain",
+                cv2.CAP_PROP_GAIN,
+                float(settings.gain),
+                verifiable=verifiable,
+                backend_name=backend_name,
+            )
+        )
     if settings.brightness is not None:
         reports.append(
             _set(
@@ -243,6 +361,8 @@ def apply_settings(
                 "brightness",
                 cv2.CAP_PROP_BRIGHTNESS,
                 float(settings.brightness),
+                verifiable=verifiable,
+                backend_name=backend_name,
             )
         )
     return reports
@@ -264,24 +384,41 @@ def measure_achieved_fps(
     sample_s: float,
     warmup_frames: int = 5,
     clock: Callable[[], float] = time.monotonic,
+    max_consecutive_failures: int = 50,
 ) -> FpsMeasurement:
     """Read frames for ``sample_s`` (after a warmup the camera spends
     settling into the new mode) and report what the device actually
-    delivers."""
+    delivers.
+
+    Hardened for live bring-up (Finding 1/5.2): a hard wall-clock deadline
+    bounds the warmup loop too, and a consecutive-read-failure cap makes a
+    glitching device return ``frames=0`` fast (a failed verify the watchdog
+    can act on) instead of looping. This still cannot interrupt a *single*
+    ``cap.read()`` that blocks forever — only ``cap.release()`` from another
+    thread can; ``watchdog.max_outage_s`` + the supervisor cover that case.
+    """
+    deadline = clock() + sample_s + 2.0  # hard cap, warmup included
     for _ in range(warmup_frames):
+        if clock() >= deadline:
+            break
         cap.read()
     t0 = clock()
     frames = 0
     failures = 0
+    consecutive = 0
     while True:
-        elapsed = clock() - t0
-        if elapsed >= sample_s:
+        now = clock()
+        if now - t0 >= sample_s or now >= deadline:
             break
         ok, _ = cap.read()
         if ok:
             frames += 1
+            consecutive = 0
         else:
             failures += 1
+            consecutive += 1
+            if consecutive >= max_consecutive_failures:
+                break
             time.sleep(0.005)  # no hot-spin on a wedged device
     elapsed = max(clock() - t0, 1e-9)
     return FpsMeasurement(

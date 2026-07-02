@@ -20,7 +20,10 @@ share the motion segment — but the expensive variant fan-out stays off.
 
 from __future__ import annotations
 
+import logging
+import re
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from dataclasses import dataclass, field
@@ -28,14 +31,17 @@ from functools import lru_cache
 
 import numpy as np
 
-from palletscan.config import DecodeConfig
+from palletscan.config import DecodeConfig, DecodeEngineKind
 from palletscan.pipeline import preprocess
 from palletscan.pipeline.decoders import (
     PylibdmtxDecoder,
     PyzbarDecoder,
     RawDecode,
+    ZxingDecoder,
 )
 from palletscan.types import DecodeResult, Frame, Roi, Symbology
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -53,13 +59,25 @@ class PassDecodeContext:
 #: caught within ~N frames of becoming decodable.
 _CONFIRMED_DM_STRIDE = 5
 
+#: C0 control bytes that real, standards-conformant payloads contain and the
+#: default gate must therefore pass: tab/LF/CR (multi-line text labels),
+#: GS 0x1D (the GS1 FNC1 / AI separator embedded in GS1 QR and Data Matrix),
+#: and FS/RS/EOT 0x1C/0x1E/0x04 (the ISO 15434 envelope: "[)>" RS "06" GS
+#: ... RS EOT).
+_ALLOWED_CONTROL_CHARS = "\t\n\r\x04\x1c\x1d\x1e"
+
+#: Bound on the warn-once cache of distinct rejected payloads (FIFO evicted).
+_REJECT_WARN_MAX = 128
+
 
 @dataclass(slots=True)
 class _Counters:
     pyzbar_calls: int = 0
     dmtx_calls: int = 0
+    zxing_calls: int = 0
     fallback_calls: int = 0
     budget_overruns: int = 0
+    spurious_rejected: int = 0
 
 
 def _decode_sym(
@@ -83,6 +101,36 @@ def _task_decoders() -> tuple[PyzbarDecoder, PylibdmtxDecoder]:
     """Stateless decoder singletons for variant tasks (each worker process
     lazily builds its own pair)."""
     return PyzbarDecoder(), PylibdmtxDecoder()
+
+
+@lru_cache(maxsize=1)
+def _task_zxing() -> ZxingDecoder:
+    """zxing-cpp singleton for variant tasks (per worker process)."""
+    return ZxingDecoder()
+
+
+def _variant_task_zxing(
+    variant_name: str,
+    crop: np.ndarray,
+    symbologies: tuple[Symbology, ...],
+    _dm_timeout_ms: int,
+) -> tuple[str, str, list[RawDecode]]:
+    """zxing-cpp counterpart of :func:`_variant_task` (same signature so the
+    executor.submit site is identical). Data Matrix timeout is unused — zxing
+    has no per-call timeout knob."""
+    processed = preprocess.VARIANTS_BY_NAME[variant_name](crop)
+    hits = _task_zxing().decode(processed, symbologies)
+    if hits:
+        mapped = [
+            RawDecode(
+                payload=h.payload,
+                symbology=h.symbology,
+                roi=preprocess.map_roi_back(variant_name, h.roi, crop.shape),
+            )
+            for h in hits
+        ]
+        return variant_name, f"zxing+{variant_name}", mapped
+    return variant_name, "", []
 
 
 def _variant_task(
@@ -111,7 +159,8 @@ def _variant_task(
 
 
 class DecodeEngine:
-    """Stateless apart from instrumentation counters; one per pipeline."""
+    """Stateless apart from instrumentation counters and the rejection
+    warn-once cache; one per pipeline."""
 
     def __init__(
         self,
@@ -121,12 +170,64 @@ class DecodeEngine:
     ) -> None:
         self._cfg = cfg
         self._executor = executor
+        # Payload-shape gate (REVIEW DEC-01): a configured regex is the strong
+        # defense against decoder false-positives becoming phantom passes. A bad
+        # regex fails fast here at construction.
+        self._payload_re = re.compile(cfg.payload_pattern) if cfg.payload_pattern else None
         self._pyzbar = PyzbarDecoder()
         self._dmtx = PylibdmtxDecoder()
+        # zxing-cpp is built (and imported) only when selected, so legacy
+        # configs never need the package installed.
+        self._zxing = (
+            ZxingDecoder() if cfg.engine is DecodeEngineKind.ZXING else None
+        )
         # Metrics hook: per-frame decode wall time, *including* frames that
         # decoded nothing (successful-only latency would flatter the p95).
         self._observe_wall_ms = observe_wall_ms
+        # Distinct payloads already WARNed about on rejection (see
+        # _log_rejection); insertion-ordered so eviction is FIFO.
+        self._rejected_seen: OrderedDict[str, None] = OrderedDict()
         self.counters = _Counters()
+
+    def _accept(self, payload: str, symbology: Symbology) -> bool:
+        """Payload-shape gate (REVIEW DEC-01): a decode must look like a real
+        label payload, not a decoder false-positive (the 'F\\x00m' phantom). A
+        configured ``decode.payload_pattern`` regex is the strong gate. With
+        none configured, the default is a deliberate behavior change vs the
+        original engine (which accepted every payload): the empty payload and
+        payloads containing C0 control bytes are rejected, EXCEPT the bytes in
+        :data:`_ALLOWED_CONTROL_CHARS` (tab/LF/CR plus the GS1 / ISO 15434
+        separators FS, GS, RS, EOT), which standard barcode payloads embed.
+        DATAMATRIX payloads must additionally reach ``dm_min_payload_len``:
+        pylibdmtx's characteristic misdecode of a noisy crop is a SHORT
+        printable string (e.g. "F'm") that the control-byte check passes."""
+        if self._payload_re is not None:
+            return self._payload_re.search(payload) is not None
+        if (
+            symbology is Symbology.DATAMATRIX
+            and len(payload) < self._cfg.dm_min_payload_len
+        ):
+            return False
+        return payload != "" and not any(
+            ord(c) < 0x20 and c not in _ALLOWED_CONTROL_CHARS for c in payload
+        )
+
+    def _log_rejection(self, payload: str, decoder: str) -> None:
+        """WARNING the first time each distinct payload is rejected, DEBUG
+        after: a recurring decoder false-positive must not become per-frame
+        logging I/O on the pipeline thread. The seen-cache is FIFO-bounded so
+        an adversarial payload stream cannot grow it without limit."""
+        first = payload not in self._rejected_seen
+        if first:
+            self._rejected_seen[payload] = None
+            if len(self._rejected_seen) > _REJECT_WARN_MAX:
+                self._rejected_seen.popitem(last=False)
+        log.log(
+            logging.WARNING if first else logging.DEBUG,
+            "decode: rejected non-conforming payload %r (decoder=%s) — not "
+            "emitting a pass; tune decode.payload_pattern if unexpected",
+            payload, decoder,
+        )
 
     def _results(
         self,
@@ -138,19 +239,25 @@ class DecodeEngine:
     ) -> list[DecodeResult]:
         ox, oy = crop_origin
         latency_ms = (time.perf_counter() - started) * 1000.0
-        return [
-            DecodeResult(
-                payload=r.payload,
-                symbology=r.symbology,
-                roi=Roi(r.roi.x + ox, r.roi.y + oy, r.roi.w, r.roi.h),
-                frame_index=frame.frame_index,
-                ts=frame.ts,
-                source_id=frame.source_id,
-                decoder=decoder,
-                latency_ms=latency_ms,
+        results: list[DecodeResult] = []
+        for r in raw:
+            if not self._accept(r.payload, r.symbology):
+                self.counters.spurious_rejected += 1
+                self._log_rejection(r.payload, decoder)
+                continue
+            results.append(
+                DecodeResult(
+                    payload=r.payload,
+                    symbology=r.symbology,
+                    roi=Roi(r.roi.x + ox, r.roi.y + oy, r.roi.w, r.roi.h),
+                    frame_index=frame.frame_index,
+                    ts=frame.ts,
+                    source_id=frame.source_id,
+                    decoder=decoder,
+                    latency_ms=latency_ms,
+                )
             )
-            for r in raw
-        ]
+        return results
 
     def _count_call(self, sym: Symbology) -> None:
         if sym is Symbology.QR:
@@ -172,22 +279,38 @@ class DecodeEngine:
         origin = (c.x, c.y)
 
         try:
-            # Steps 1+2: plain decoders in priority order. These keep
-            # running after confirmation — a second pallet can share the
-            # motion segment.
-            for sym in cfg.symbology_priority:
-                dm_ms = cfg.dm_timeout_ms
-                if sym is Symbology.DATAMATRIX:
-                    if ctx.confirmed and ctx.frames_attempted % _CONFIRMED_DM_STRIDE:
-                        continue
-                    remaining_ms = (deadline - time.perf_counter()) * 1000.0
-                    if remaining_ms <= 1:
-                        break
-                    dm_ms = min(cfg.dm_timeout_ms, int(remaining_ms))
-                self._count_call(sym)
-                name, hits = _decode_sym(self._pyzbar, self._dmtx, sym, crop, dm_ms)
+            # Steps 1+2: inline decoders, kept running after confirmation so a
+            # second pallet sharing the motion segment is still caught.
+            if self._zxing is not None:
+                # zxing reads both symbologies in one fast (~sub-ms) call, so
+                # the per-symbology DM-timeout / confirmed-stride dance below
+                # is unnecessary.
+                self.counters.zxing_calls += 1
+                hits = self._zxing.decode(crop, tuple(cfg.symbology_priority))
                 if hits:
-                    return self._results(hits, frame, origin, name, started)
+                    # Short-circuit only on gate-ACCEPTED results: hits that
+                    # were all rejected must not stop the cascade.
+                    results = self._results(hits, frame, origin, "zxing", started)
+                    if results:
+                        return results
+            else:
+                for sym in cfg.symbology_priority:
+                    dm_ms = cfg.dm_timeout_ms
+                    if sym is Symbology.DATAMATRIX:
+                        if ctx.confirmed and ctx.frames_attempted % _CONFIRMED_DM_STRIDE:
+                            continue
+                        remaining_ms = (deadline - time.perf_counter()) * 1000.0
+                        if remaining_ms <= 1:
+                            break
+                        dm_ms = min(cfg.dm_timeout_ms, int(remaining_ms))
+                    self._count_call(sym)
+                    name, hits = _decode_sym(self._pyzbar, self._dmtx, sym, crop, dm_ms)
+                    if hits:
+                        # Gate-rejected hits must not stop the cascade — keep
+                        # trying the remaining symbologies, then step 3.
+                        results = self._results(hits, frame, origin, name, started)
+                        if results:
+                            return results
 
             # Step 3: preprocessing variants, only for a stubborn and still
             # unconfirmed pass.
@@ -202,8 +325,9 @@ class DecodeEngine:
             # Variants get what is left of this frame's budget, not a fresh
             # full dm timeout each.
             dm_ms = min(cfg.dm_timeout_ms, max(1, int(remaining_s * 1000.0)))
+            task_fn = _variant_task_zxing if self._zxing is not None else _variant_task
             futures = [
-                self._executor.submit(_variant_task, name, crop, symbologies, dm_ms)
+                self._executor.submit(task_fn, name, crop, symbologies, dm_ms)
                 for name, _ in preprocess.VARIANTS
             ]
             try:
@@ -220,9 +344,13 @@ class DecodeEngine:
                     for fut in done:
                         _, decoder, hits = fut.result()
                         if hits:
-                            return self._results(
+                            # Same rule as steps 1+2: a variant whose hits
+                            # were all gate-rejected must not end the fan-out.
+                            results = self._results(
                                 hits, frame, origin, decoder, started
                             )
+                            if results:
+                                return results
                 return []
             finally:
                 for fut in futures:

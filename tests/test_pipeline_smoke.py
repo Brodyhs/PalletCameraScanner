@@ -154,8 +154,7 @@ def test_discontinuity_breaks_segment_p1_miss_p2_pass(tmp_path) -> None:
     for k in range(30, 30 + 12 + int(2.0 * fps) + 2):
         runner._process_frame(frame(base + k, ts_offset=gap))
     # end-of-stream flush, exactly as _pipeline_loop's finally does
-    tail = runner._gate.flush()
-    if tail is not None:
+    for tail in runner._gate.flush():
         runner._tracker.on_segment_close(tail)
     runner._tracker.flush()
     runner._executor.shutdown(wait=True)

@@ -5,3 +5,14 @@ data/
 .pytest_cache/
 .mypy_cache/
 build/
+
+# Claude Code local session/project data (never publish)
+.claude/
+
+# Vendor datasheets + SDK/manual text extracts — copyrighted reference material,
+# not project code; kept locally, excluded from the public repo.
+*.pdf
+37cugm_manual_extracted.txt
+sdk_extract.txt
+sdk_paged.txt
+_txt

@@ -1,0 +1,201 @@
+# PalletScan STATION (deployment) config — seeded from config/default.yaml.
+#
+# This is the file the station actually runs with: pass it everywhere as
+#   --config config\station.yaml   (RUNBOOK convention).
+# Unlike config/default.yaml (which a test pins to mirror code defaults
+# exactly), this file is yours to customize. Deviations from the code
+# defaults below — everything else matches them (pinned by
+# tests/test_config.py::test_station_yaml_matches_defaults_except_documented_deviations):
+#   - watchdog.max_outage_s: 120  (default null; Finding 5 — pre-live hardening 5.1)
+#   - decode.engine: zxing        (default legacy; needs the [zxing] extra — see decode:)
+#   - cameras[]: the two See3CAMs (default []; station-specific by design)
+#
+# Fill in the two cameras with:  palletscan calibrate --camera <id> --name
+# "<device-name substring>" --save --config config\station.yaml
+# (calibrate --save preserves the watchdog block when it writes cameras).
+
+source:
+  type: synthetic   # synthetic | video | camera  -> set to `camera` once cameras are saved
+  camera: null      # cameras[].id to run; optional when exactly one entry
+  cameras: null     # A/B: e.g. [cam-color, cam-mono]
+
+synthetic:
+  width: 1280
+  height: 720
+  fps: 30.0
+  seed: 42
+  num_passes: 20
+  speed_mph_range: [2.0, 10.0]
+  angle_deg_range: [0.0, 35.0]
+  px_per_module_range: [3.0, 6.0]
+  module_size_mm: 5.0
+  exposure_fraction: 0.03
+  contrast_range: [0.45, 1.0]
+  noise_sigma_range: [2.0, 8.0]
+  lighting_gradient_max: 30.0
+  occlusion_max_frac: 0.15
+  symbologies: [qr, datamatrix]
+  idle_s_range: [0.3, 1.5]
+  realtime: false
+  payload_prefix: "PLT-"
+
+video:
+  path: ""
+  fps_override: null
+  speed: 1.0
+  loop: 1
+
+# Live cameras, identified by device-name substring. Lock with
+# `palletscan calibrate --save`. exposure/gain are RAW backend values.
+#
+# BRING-UP FINDING (2026-06-19): the 24CUG is UNUSABLE under DSHOW/auto on this
+# box — OpenCV's DirectShow backend can't negotiate the mode and pins it at
+# 15fps. MSMF reaches 54fps UYVY at 1920x1200. So backend: msmf is REQUIRED
+# here, which forces fallback_index (MSMF can't use the DSHOW name index) and
+# forfeits name stability — keep OBS Virtual Camera closed so the 24CUG stays
+# at MSMF index 0. Mode LOCKED to UYVY@55 (datasheet Table 2: 55 is the UYVY
+# hardware max at this resolution; the only >55 path is MJPEG@114, which our
+# OpenCV stack can't realize — cv2 decodes MJPEG inline, capping us at ~42fps).
+cameras:
+  - id: cam-color
+    name: "See3CAM_24CUG"        # device-name substring, case-insensitive
+    backend: msmf                # REQUIRED on this unit (DSHOW = 15fps wall)
+    fourcc: UYVY                 # LOCKED: raw (no decode cost); 54.9fps measured through the stack
+    width: 1920
+    height: 1200
+    fps: 55.0                    # datasheet UYVY max @ 1920x1200; do NOT raise (no UYVY@120 exists)
+    convert_rgb: true
+    fallback_index: 0            # MSMF index of the 24CUG (OBS closed); name stability forfeited
+    read_fail_limit: 5           # consecutive read failures before reconnect
+    connect_verify_s: 1.0        # achieved-fps sample per (re)connect; 0 disables
+    settings: {exposure_auto: false, exposure: -6, gain: 10, brightness: null}  # exposure/gain need real-pallet tuning (Step 3)
+    # Identity guard (REVIEW msmf-identity): fingerprint stamped 2026-06-23 from the live
+    # 24CUG so a replug/index reshuffle — or OBS Virtual Camera (enumerated alongside it!)
+    # grabbing the MSMF slot — is caught. policy=warn LOGS drift + bumps connect_mismatches
+    # without blocking startup; flip to 'strict' to REFUSE the wrong device once the USB port
+    # is final (device_path encodes the port topology, so re-stamp after any deliberate move).
+    identity:
+      policy: warn
+      expected_vid_pid: "2560:c128"
+      expected_device_path: '\\?\usb#vid_2560&pid_c128&mi_00#7&1250ea3a&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global'
+  - id: cam-mono                # 37CUGM (Sony IMX900 mono) — plugged in 2026-06-21
+    name: "See3CAM_37CUGM"
+    backend: pygrabber          # REQUIRED: this mono (Y8/Y12-only) cannot be read by OpenCV on Windows
+                                # — MSMF negotiates Y8 but its source reader never starts (0fps, MF err
+                                # -1072875852); DSHOW won't even open it. pygrabber's DirectShow
+                                # SampleGrabber (same path e-CAMView uses; already a pip dep) reads it at
+                                # ~63fps full-res. See palletscan/sources/pygrabber_capture.py.
+    fourcc: "Y8  "             # the real negotiated mono media type (pygrabber auto-selects Y8); 8-bit mono
+    width: 2064                 # full IMX900 array; pygrabber picks the Y8 2064x1552 mode
+    height: 1552
+    fps: 72.0                   # Y8 2064x1552 datasheet max (USB3); ~63 measured through the grab loop
+    convert_rgb: true           # pygrabber delivers 3-ch (H,W,3) like the color cam; to_gray handles it
+    fallback_index: 1           # last-resort DSHOW index if name enum ever yields nothing
+    read_fail_limit: 5
+    connect_verify_s: 1.0
+    # exposure -8 = 2^-8 s ≈ 3.9ms (37CUGM manual Table 3) — tuned for the current
+    # UNLIT bench: restores ~72fps (−6's 15.6ms capped fps at ~62) but does NOT
+    # freeze conveyor motion (OPTICS_SPEC §8 blur budget: 2mph needs ≤2.8ms,
+    # 5mph ≤1.12ms). Once scan-zone lighting per OPTICS_SPEC §8 is installed,
+    # -9/-10 (2ms/1ms) becomes the operating point. exposure/gain now wired via
+    # IAMCameraControl; gain needs real-pallet + scan-zone-lighting tuning.
+    settings: {exposure_auto: false, exposure: -8, gain: 10, brightness: null}
+
+# Stall detection + reconnect for live cameras (synthetic/video unaffected).
+watchdog:
+  stall_timeout_s: 2.0
+  retry: {base_s: 0.5, cap_s: 15.0}
+  max_outage_s: 120        # HARDENING 5.1 (Finding 5): exit 3 after 120s of no frames so
+                           # the supervisor restarts a camera that opens but never delivers.
+                           # default.yaml/code default is null (never) — set here on purpose.
+  max_zombie_readers: 3    # hung reader threads = wedged USB stack signature
+
+# Multi-camera (A/B) station behavior — only applies when source.cameras runs >1 arm.
+station:
+  on_arm_failure: stop_all   # stop_all (default; A/B-strict — one dead arm stops all, supervisor
+                             #   restarts everything) | continue_others (availability-first: a dead
+                             #   camera does NOT take down the healthy arm — recommended unattended)
+
+motion:
+  algorithm: framediff   # framediff | mog2
+  downscale_width: 160
+  diff_threshold: 12
+  min_area_frac: 0.01
+  open_frames: 3   # a 1-frame blip makes 2 active diffs; 3 debounces it
+  quiet_frames: 8
+  roi_pad_px: 32
+
+decode:
+  symbology_priority: [qr, datamatrix]
+  engine: zxing          # zxing-cpp: 100% vs 78% read rate on hard codes & ~250x
+                         #   faster than the legacy pyzbar+pylibdmtx cascade
+                         #   (tools/bench_decoders.py).
+                         #   NON-DEFAULT + optional dep: zxing-cpp ships only in the
+                         #   [zxing] extra — install with `pip install -e ".[dev,zxing]"`
+                         #   (plain `pip install .` does NOT pull it; without it the
+                         #   station fails at startup). Revert: engine: legacy.
+  frame_budget_ms: 50.0
+  dm_timeout_ms: 40
+  executor: thread       # thread | process (see tools/bench_decoders.py)
+  workers: 2
+  fallback_after_frames: 4
+  confirmations: 1
+  payload_pattern: null  # REVIEW DEC-01: set to your label format (e.g. "^PLT-\d{6}$") to reject
+                         #   decoder false-positives ("phantom" passes that become wrong inventory);
+                         #   null = permissive (drops only control-byte garbage). Counts as
+                         #   decode.spurious_rejected on the dashboard.
+
+dedup:
+  window_s: 12.0
+
+buffer:
+  pre_s: 2.0
+  post_s: 2.0
+
+evidence:
+  dir: data/evidence
+  frame_stride: 3
+  jpeg_quality: 85
+  max_total_mb: 500.0
+  max_age_days: 14.0
+
+sinks:
+  console: {enabled: true}
+  jsonl: {enabled: true, path: data/events.jsonl}
+  sqlite: {enabled: true, path: data/palletscan.db}
+  http:
+    enabled: false
+    url: "http://127.0.0.1:8808/events"
+    headers: {}
+    timeout_s: 5.0
+    outbox_path: data/outbox.db
+    retry: {base_s: 1.0, cap_s: 60.0}
+    max_mb: 200.0
+    max_age_days: 14.0
+
+metrics:
+  window_s: 60.0
+  latency_samples: 2048
+
+web:
+  enabled: false
+  host: 127.0.0.1
+  port: 8000
+  preview_fps: 10.0
+  preview_quality: 80
+  preview_width: 640
+
+report:
+  manifest_path: null
+
+logging:
+  level: INFO
+  file:
+    enabled: true
+    dir: data/logs
+    max_mb: 20.0
+    backups: 5
+    max_age_days: 14.0
+
+lock:
+  path: data/palletscan.lock

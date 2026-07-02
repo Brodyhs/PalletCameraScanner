@@ -224,3 +224,68 @@ def test_stop_skips_second_signal_for_already_interrupted_child() -> None:
     fresh = _StubChild()
     demo._stop(fresh)  # the smoke-mode stop still signals once
     assert (len(fresh.signals) + fresh.terminates) == 1
+
+
+class _CtrlCWaitChild:
+    """Popen-shaped child for the interactive wait loop: the first wait()
+    raises KeyboardInterrupt (the operator's Ctrl-C reaching the PARENT).
+    Because it was spawned with CREATE_NEW_PROCESS_GROUP the console event
+    never reaches IT, so it exits only once a stop channel is actually
+    delivered — a bare re-wait() models the pre-fix hang."""
+
+    def __init__(self) -> None:
+        self.signals: list = []
+        self.stop_delivered = False
+        self._interrupts = 1
+        self._alive = True
+
+    def poll(self):
+        return None if self._alive else 0
+
+    def wait(self, timeout=None):
+        if self._interrupts:
+            self._interrupts -= 1
+            raise KeyboardInterrupt
+        if not self.stop_delivered:
+            raise RuntimeError(
+                "wait() re-entered with no stop delivered: the new-process-"
+                "group child never saw the console Ctrl-C and runs forever"
+            )
+        self._alive = False
+        return 0
+
+    def send_signal(self, sig) -> None:
+        self.signals.append(sig)
+        self.stop_delivered = True
+
+    def kill(self) -> None:  # pragma: no cover - wedged-child path
+        self._alive = False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console Ctrl-C semantics")
+def test_windows_ctrl_c_in_wait_loop_stops_the_new_process_group_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review of REVIEW_bringup_4d95b67 (tools/demo.py): spawning the
+    child with CREATE_NEW_PROCESS_GROUP implicitly disables console Ctrl-C
+    delivery to it, but the interactive Ctrl-C paths still assumed 'the
+    event reached the child' and just re-wait()ed — so an interactive
+    Windows demo could no longer be stopped with Ctrl-C. A parent-side
+    KeyboardInterrupt must forward the stop (stop-file latch + CTRL_BREAK),
+    not wait for a drain that never starts."""
+    import signal
+
+    cfg = tmp_path / "demo.yaml"
+    cfg.write_text("web: {enabled: true, port: 18999}\n", encoding="utf-8")
+    child = _CtrlCWaitChild()
+    monkeypatch.setattr(demo.subprocess, "Popen", lambda cmd, **kw: child)
+    monkeypatch.setattr(demo, "port_in_use", lambda host, port: False)
+    monkeypatch.setattr(demo, "_stats_ok", lambda url: True)
+    rc = demo.main(
+        ["--config", str(cfg), "--no-browser", "--data-dir", str(tmp_path / "d")]
+    )
+    assert rc == 0
+    # The durable channel (works without a console) AND the accelerator both
+    # went out — already_signaled=True would have skipped both.
+    assert (tmp_path / "d" / "palletscan.stop").exists()
+    assert signal.CTRL_BREAK_EVENT in child.signals

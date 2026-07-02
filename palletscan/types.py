@@ -92,13 +92,38 @@ class Frame:
 
 
 @dataclass(frozen=True, slots=True)
+class MotionTrack:
+    """One tracked moving object within a frame (TIER 2 multi-object mode).
+
+    A track carries a stable ``track_id`` (== the segment candidate_id once
+    its debounce opens), its full-resolution padded ROI, downscaled-space
+    centroid, blob area, and lifecycle counters (``age`` = frames seen,
+    ``missed`` = consecutive frames unmatched). ``tracks`` on MotionResult is
+    empty in single mode; in multi mode it holds 0..N of these.
+    """
+
+    track_id: str
+    roi: Roi
+    centroid: tuple[float, float]
+    area_px: int
+    age: int
+    missed: int
+
+
+@dataclass(frozen=True, slots=True)
 class MotionResult:
-    """Per-frame output of the MotionGate."""
+    """Per-frame output of the MotionGate.
+
+    ``tracks`` is the single-mode sentinel ``()`` unless multi-object
+    tracking is enabled; in multi mode ``roi``/``candidate_id`` mirror the
+    PRIMARY (largest) open track and ``active = bool(tracks)``.
+    """
 
     active: bool
     candidate_id: str | None
     roi: Roi | None
     motion_frac: float
+    tracks: tuple[MotionTrack, ...] = ()
 
 
 class SegmentKind(enum.StrEnum):

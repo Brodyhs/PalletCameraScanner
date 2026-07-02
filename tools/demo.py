@@ -4,8 +4,11 @@ with the live dashboard open in your browser.
 Spawns ``python -m palletscan synth --ab --dashboard`` on
 ``config/demo.yaml`` (realtime-paced A/B passes), polls ``/stats.json``
 until the dashboard serves, opens the browser, then waits on the child and
-propagates its exit code. Ctrl-C reaches the foreground process group and
-drains gracefully through the pipeline's own handlers.
+propagates its exit code. On POSIX a Ctrl-C reaches the whole foreground
+process group and the child drains through the pipeline's own handlers; on
+Windows the child's ``CREATE_NEW_PROCESS_GROUP`` suppresses console Ctrl-C
+delivery to it, so the parent forwards the stop explicitly (stop-file
+latch + CTRL_BREAK).
 
 Run (from the repo root, venv active):
 
@@ -81,10 +84,19 @@ def port_in_use(host: str, port: int) -> bool:
     return False
 
 
-def _stop(child: subprocess.Popen, *, already_signaled: bool = False) -> int:
-    """Smoke-mode stop. POSIX drains via SIGTERM; Windows smoke runs get a
-    hard terminate (CTRL events can't target a same-group child) — the
-    interactive Windows path is Ctrl-C, which the child handles itself.
+def _stop(
+    child: subprocess.Popen,
+    *,
+    stop_file: Path | None = None,
+    already_signaled: bool = False,
+) -> int:
+    """Graceful stop on both platforms. The primary channel is the
+    writer-level stop latch (``palletscan.stop`` in the child's data dir,
+    watched by reliability/supervisor.py's ``StopFileWatch``) — it needs no
+    console, so it works under pytest/CI capture where console ctrl events
+    cannot be delivered. POSIX additionally sends SIGTERM and Windows
+    CTRL_BREAK_EVENT (the child is spawned with ``CREATE_NEW_PROCESS_GROUP``,
+    supervisor.py's pattern) so an interactive stop drains promptly.
 
     ``already_signaled``: a POSIX Ctrl-C already hit the whole foreground
     group, the child is draining, and its first-signal handler restored
@@ -95,8 +107,16 @@ def _stop(child: subprocess.Popen, *, already_signaled: bool = False) -> int:
 
     if child.poll() is None:
         if not already_signaled:
+            if stop_file is not None:
+                stop_file.parent.mkdir(parents=True, exist_ok=True)
+                stop_file.touch()
             if sys.platform == "win32":
-                child.terminate()
+                # Console-dependent accelerator only: harmless OSError when
+                # no console is shared — the latch above still drains it.
+                try:
+                    child.send_signal(signal.CTRL_BREAK_EVENT)
+                except OSError:
+                    pass
             else:
                 child.send_signal(signal.SIGTERM)
         try:
@@ -155,7 +175,17 @@ def main(argv: list[str] | None = None) -> int:
         "--data-dir",
         str(args.data_dir),
     ]
-    child = subprocess.Popen(cmd)
+    # The child's writer-level stop latch (data-dir scoped, sticky): clear a
+    # stale one from a previous demo run so this run doesn't insta-drain.
+    stop_file = args.data_dir / "palletscan.stop"
+    stop_file.unlink(missing_ok=True)
+    popen_kwargs: dict = {}
+    if sys.platform == "win32":
+        # New process group so _stop's CTRL_BREAK_EVENT targets only the
+        # child (supervisor.py's documented pattern); the child still shares
+        # the console, which is what lets the break event reach it at all.
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    child = subprocess.Popen(cmd, **popen_kwargs)
     interrupted = False
     try:
         try:
@@ -169,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
                     # The child already printed why (port in use, bad config).
                     return child.wait()
                 print("demo: dashboard never became ready", file=sys.stderr)
-                return _stop(child) or 1
+                return _stop(child, stop_file=stop_file) or 1
             print(f"dashboard ready at {url}")
             if not args.no_browser:
                 webbrowser.open(url)
@@ -177,19 +207,33 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     return child.wait(timeout=args.max_seconds)
                 except subprocess.TimeoutExpired:
-                    return _stop(child)
+                    return _stop(child, stop_file=stop_file)
             while True:
                 try:
                     return child.wait()
                 except KeyboardInterrupt:
-                    # Ctrl-C hit the whole foreground group: the child is
-                    # draining and will print its summary; keep waiting.
+                    if sys.platform == "win32":
+                        # CREATE_NEW_PROCESS_GROUP implicitly disables
+                        # console Ctrl-C for the child (CreateProcess's
+                        # SetConsoleCtrlHandler(NULL, TRUE)), so the event
+                        # never reached it — waiting it out would spin
+                        # until the synth plan completes. Stop it
+                        # explicitly (stop-file latch + CTRL_BREAK).
+                        return _stop(child, stop_file=stop_file)
+                    # POSIX: Ctrl-C hit the whole foreground group: the
+                    # child is draining and will print its summary; keep
+                    # waiting.
                     continue
         except KeyboardInterrupt:
-            # Ctrl-C outside the wait loop (readiness poll, browser open):
-            # the console event still reached the child, whose first-signal
-            # handler already restored SIG_DFL — sending a second signal
-            # would hard-kill it mid-drain (REVIEW finding b6). Wait it out.
+            # Ctrl-C outside the wait loop (readiness poll, browser open).
+            if sys.platform == "win32":
+                # Same as above: the new-process-group child never saw the
+                # console event, so it must be stopped explicitly.
+                return _stop(child, stop_file=stop_file)
+            # POSIX: the console event still reached the child, whose
+            # first-signal handler already restored SIG_DFL — sending a
+            # second signal would hard-kill it mid-drain (REVIEW finding
+            # b6). Wait it out.
             interrupted = True
             while True:
                 try:
@@ -198,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                     continue
     finally:
         if child.poll() is None:
-            _stop(child, already_signaled=interrupted)
+            _stop(child, stop_file=stop_file, already_signaled=interrupted)
 
 
 if __name__ == "__main__":

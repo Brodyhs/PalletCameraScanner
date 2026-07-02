@@ -7,9 +7,12 @@ focus/fps/decode line per second, and ``--save`` upserts the locked entry
 into the YAML config (spec §8). ``--preview`` adds an optional cv2 window
 (main-thread only on macOS); it is the one path pytest does not cover.
 
-Hard-fail policy mirrors the control layer's: unverified controls or a
-dead exposure control fail calibration on ``controls_reliable`` backends
-and print an honest warning on AVFoundation dev machines.
+Hard-fail policy mirrors the control layer's: readback-unverified
+controls fail calibration on ``readback_reliable`` backends (DSHOW) and
+print an honest warning where readback is untrustworthy (MSMF,
+AVFoundation, pygrabber). A control write the device REJECTED (``set()``
+returned False) and the exposure-EFFECT check (which measures the image,
+not readback) fail calibration on EVERY backend.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from palletscan.config import (
     AppConfig,
     Backend,
     CameraConfig,
+    CameraIdentity,
     resolve_camera,
     upsert_camera_yaml,
 )
@@ -35,6 +39,7 @@ from palletscan.sources.camera import (
     CaptureFactory,
     DeviceLister,
     default_capture_factory,
+    select_capture_factory,
 )
 from palletscan.sources.controls import (
     all_verified,
@@ -46,7 +51,12 @@ from palletscan.sources.controls import (
     quirks_for,
     verify_exposure_effect,
 )
-from palletscan.sources.devices import backend_flag, find_device, list_devices
+from palletscan.sources.devices import (
+    backend_flag,
+    find_device,
+    identity_for_name,
+    list_devices,
+)
 from palletscan.sources.probe import (
     ModeCandidate,
     candidates_for,
@@ -190,7 +200,42 @@ def run_calibration(
         else _FLAG_TO_BACKEND.get(flag, Backend.AUTO)
     )
     quirks = quirks_for(backend)
-    make_cap = lambda: capture_factory(index, flag)  # noqa: E731
+    # Per-backend capture dispatch (shared with CameraSource/selftest): the
+    # pygrabber mono cam cannot be opened by cv2.VideoCapture, and calibrate
+    # is the step that stamps the fingerprint the identity guard consumes —
+    # it must be able to open every backend the run path can (REVIEW
+    # bringup-4d95b67). The entry is resolved to the chosen backend first so
+    # a backend:auto config still dispatches correctly.
+    entry = entry.model_copy(update={"backend": backend})
+    chosen_factory = select_capture_factory(entry, capture_factory)
+    make_cap = lambda: chosen_factory(index, flag)  # noqa: E731
+
+    def make_cap_for(cand: ModeCandidate) -> Any:
+        """A capture programmed FOR ``cand``. pygrabber's DirectShow format
+        is fixed at graph construction and its mode ``set()`` calls are
+        accepted no-ops, so each candidate must be built into its own graph
+        with the candidate's geometry/fps — through the entry-closed factory
+        every candidate was measured on the seed-negotiated format while the
+        unprogrammed candidate got locked into the YAML (re-review of REVIEW
+        bringup-4d95b67). cv2 backends keep the entry-closed capture;
+        probe_modes programs them via ``set()``."""
+        if backend is not Backend.PYGRABBER:
+            return make_cap()
+        cand_entry = entry.model_copy(
+            update={
+                "fourcc": cand.fourcc,
+                "width": cand.width,
+                "height": cand.height,
+                "fps": cand.fps,
+            }
+        )
+        return select_capture_factory(cand_entry, capture_factory)(index, flag)
+
+    # Capture the chosen device's stable hardware fingerprint so --save can
+    # stamp it for the identity guard. The POLICY is left at its default
+    # ('warn'): calibrate records the fingerprint, the operator opts into
+    # 'strict' deliberately later. None on macOS / when no DevicePath.
+    captured_identity = identity_for_name(devices, entry.name)
 
     # -- probe ---------------------------------------------------------------
     pinned = any(v is not None for v in (opts.fourcc, opts.width, opts.height, opts.fps))
@@ -203,7 +248,7 @@ def run_calibration(
     finally:
         seed_cap.release()
     results = probe_modes(
-        make_cap, candidates, sample_s=opts.probe_sample_s, clock=clock
+        make_cap_for, candidates, sample_s=opts.probe_sample_s, clock=clock
     )
     chosen = choose_mode(results)
     say(format_probe_table(results, chosen))
@@ -224,6 +269,23 @@ def run_calibration(
         return 1
     say(f"chosen mode: {chosen.candidate.describe()} "
         f"(achieved {chosen.achieved_fps:.1f} fps)")
+    if backend is Backend.PYGRABBER and (
+        (chosen.actual_width, chosen.actual_height)
+        != (chosen.candidate.width, chosen.candidate.height)
+    ):
+        # The candidate's geometry was requested at graph construction, so a
+        # different negotiated size means the device does not offer it (the
+        # capture fell back to another capability). Geometry readback IS the
+        # negotiated graph on this backend — trustworthy — and locking the
+        # never-streamed request would stamp a mode the run path's shape
+        # gate can only reject (re-review of REVIEW bringup-4d95b67).
+        say(
+            f"calibrate: device negotiated {chosen.actual_width}x"
+            f"{chosen.actual_height}, not the requested "
+            f"{chosen.candidate.width}x{chosen.candidate.height} — that mode "
+            "never streamed; refusing to lock it (hard on pygrabber)"
+        )
+        return 1
 
     # -- lock settings ----------------------------------------------------------
     settings = entry.settings.model_copy()
@@ -235,6 +297,24 @@ def run_calibration(
         settings = settings.model_copy(update={"exposure": opts.exposure})
     if opts.gain is not None:
         settings = settings.model_copy(update={"gain": opts.gain})
+    # Stamp the identity fingerprint (device_path + vid:pid) onto the entry,
+    # keeping whatever policy the operator already configured (default 'warn')
+    # so the strict opt-in is deliberate. When no identity is available the
+    # block is left at its defaults.
+    if captured_identity is not None:
+        vid_pid = (
+            f"{captured_identity.vid}:{captured_identity.pid}"
+            if captured_identity.vid and captured_identity.pid
+            else None
+        )
+        identity = entry.identity.model_copy(
+            update={
+                "expected_device_path": captured_identity.device_path,
+                "expected_vid_pid": vid_pid,
+            }
+        )
+    else:
+        identity = entry.identity
     locked = entry.model_copy(
         update={
             "backend": backend,
@@ -243,21 +323,72 @@ def run_calibration(
             "height": chosen.candidate.height,
             "fps": chosen.candidate.fps,
             "settings": settings,
+            "identity": identity,
         }
     )
+    if captured_identity is not None:
+        say(
+            "captured identity fingerprint: "
+            f"device_path={captured_identity.device_path!r} "
+            f"vid:pid={locked.identity.expected_vid_pid} "
+            f"(policy={locked.identity.policy})"
+        )
+    else:
+        say(
+            "captured identity fingerprint: unavailable on this platform/device "
+            "(no DevicePath) — identity guard will fall back to NAME match only"
+        )
 
     rc = 0
-    cap = make_cap()
+    # The verification capture streams the CHOSEN mode (on pygrabber the
+    # format only exists if it was built into the graph).
+    cap = make_cap_for(chosen.candidate)
     try:
-        reports = apply_mode(cap, locked) + apply_settings(cap, settings, quirks)
+        mode_reports = apply_mode(cap, locked)  # mode first: it can reset controls
+        control_reports = apply_settings(
+            cap, settings, quirks, backend_name=backend.value
+        )
+        reports = mode_reports + control_reports
         log_reports(f"calibrate cameras[{locked.id}]", reports)
         for r in reports:
-            mark = "ok" if r.verified else ("info" if r.informational else "MISMATCH")
+            if r.verified:
+                mark = "ok"
+            elif r.informational:
+                mark = "info"
+            elif not r.accepted:
+                # The backend refused the write: a failure on EVERY backend
+                # (readback trustworthiness is irrelevant to a rejected set).
+                mark = "REJECTED"
+            elif not r.verifiable:
+                # Applied, but readback can't confirm it on this backend:
+                # honest 'asserted', NOT a failure (would read as MISMATCH).
+                mark = "asserted"
+            else:
+                mark = "MISMATCH"
             say(
                 f"  {r.prop:<14} requested {r.requested:<12g} readback "
                 f"{r.readback:<12g} {mark} {r.note}"
             )
-        controls_ok = all_verified(reports)  # informational props never gate
+        # Informational props never gate; a REJECTED control write fails
+        # calibration on EVERY backend — the device itself refused the
+        # set(), so readback trustworthiness is irrelevant (REVIEW
+        # bringup-4d95b67 + re-review). Scoped to apply_settings reports:
+        # mode props are gated empirically instead (the probe's achieved
+        # fps and, on pygrabber, the negotiated-geometry check above —
+        # pygrabber deliberately rejects a set(FPS) it cannot program even
+        # when the probe just measured that rate).
+        rejected = [
+            r for r in control_reports if not r.accepted and not r.informational
+        ]
+        # Asserted-but-unverifiable controls (readback-unreliable backends;
+        # never populated where readback is trusted) keep the honest
+        # 'controls unverified' warning even when every write was accepted.
+        asserted_only = [
+            r
+            for r in control_reports
+            if not r.informational and not r.verifiable and not r.verified
+        ]
+        controls_ok = all_verified(reports) and not rejected and not asserted_only
         effect_ok = True
         if not settings.exposure_auto and settings.exposure is not None:
             effect = verify_exposure_effect(cap, settings.exposure)
@@ -267,14 +398,37 @@ def run_calibration(
                 f"{'ok' if effect.ok else 'NO EFFECT'}"
             )
             effect_ok = effect.ok
-        if not (controls_ok and effect_ok):
-            if quirks.controls_reliable:
+        if not effect_ok:
+            # The exposure-effect check measures the IMAGE, not readback: a
+            # physically dead exposure control fails calibration on EVERY
+            # backend — untrustworthy readback must never demote it (REVIEW
+            # bringup-4d95b67: exposure-effect gate restoration).
+            say(
+                "calibrate: exposure has NO measurable effect on the image "
+                "(hard on every backend)"
+            )
+            rc = 1
+        if not controls_ok:
+            if quirks.readback_reliable:
                 say("calibrate: control verification failed (hard on this backend)")
+                rc = 1
+            elif rejected:
+                # Readback-unreliable backend, but the write never needed
+                # readback to fail: the device itself REFUSED the set()
+                # (on pygrabber a False set() is device-confirmed). Warn-
+                # downgrading this locked settings the device provably
+                # refused (re-review of REVIEW bringup-4d95b67).
+                say(
+                    "calibrate: control write(s) REJECTED by the backend "
+                    f"({', '.join(r.prop for r in rejected)}) — hard on "
+                    "every backend: the device refused the set()"
+                )
                 rc = 1
             else:
                 say(
-                    "warning: controls unverified — expected on AVFoundation "
-                    "dev machines; verify on the Windows target"
+                    "warning: controls unverified — readback is unreliable on "
+                    "this backend; trusting the exposure-effect and "
+                    "achieved-fps checks instead"
                 )
 
         # -- live metrics loop -------------------------------------------------

@@ -14,16 +14,16 @@ from palletscan.calibrate import CalibrateOptions, focus_metric, run_calibration
 from palletscan.config import AppConfig, load_config
 from palletscan.selftest import SELFTEST_ASSETS
 from palletscan.sources.controls import fourcc_float
-from palletscan.sources.devices import devices_from_names
+from palletscan.sources.devices import DeviceInfo, IdentityInfo, devices_from_names
 from palletscan.types import Symbology
 from tests.camera_fakes import FakeCapture, FakeCaptureFactory, FakeClock
 
 MSMF = int(cv2.CAP_MSMF)
 
 
-def _lister(*names: str):
+def _lister(*names: str, backend: int = MSMF):
     return lambda: devices_from_names(
-        list(names) or ["See3CAM_24CUG"], MSMF
+        list(names) or ["See3CAM_24CUG"], backend
     )
 
 
@@ -162,6 +162,61 @@ def test_save_upserts_locked_entry(tmp_path: Path) -> None:
     assert saved.dedup.window_s == 9.0  # neighbors untouched
 
 
+def test_save_stamps_identity_fingerprint_leaving_policy_default(
+    tmp_path: Path,
+) -> None:
+    """calibrate --save stamps the chosen device's device_path + vid:pid into
+    identity, but leaves policy at the default 'warn' so the operator opts
+    into strict deliberately. The captured fingerprint is also printed."""
+    clock = FakeClock()
+    config_path = tmp_path / "station.yaml"
+
+    def lister():
+        return [
+            DeviceInfo(
+                name="See3CAM_24CUG",
+                index=0,
+                backend=MSMF,
+                identity=IdentityInfo(
+                    friendly_name="See3CAM_24CUG",
+                    device_path=r"usb#vid_2560&pid_c128&mi_00#calib",
+                    vid="2560",
+                    pid="c128",
+                ),
+            )
+        ]
+
+    opts = CalibrateOptions(
+        seconds=0, exposure=-6.0, save=True, config_path=config_path
+    )
+    rc, out = _run(_cfg(), opts, _see3cam_factory(clock), lister, clock)
+    assert rc == 0, out
+    assert "captured identity fingerprint" in out
+    assert "vid:pid=2560:c128" in out
+    saved = load_config(config_path)
+    ident = saved.cameras[0].identity
+    assert ident.policy == "warn"  # operator opts into strict deliberately
+    assert ident.expected_vid_pid == "2560:c128"
+    assert ident.expected_device_path == r"usb#vid_2560&pid_c128&mi_00#calib"
+
+
+def test_save_without_identity_leaves_fingerprint_unset(tmp_path: Path) -> None:
+    """No identity available (macOS / name-only enumeration): --save still
+    works, prints the 'unavailable' note, and leaves the fingerprint unset."""
+    clock = FakeClock()
+    config_path = tmp_path / "station.yaml"
+    opts = CalibrateOptions(
+        seconds=0, exposure=-6.0, save=True, config_path=config_path
+    )
+    rc, out = _run(_cfg(), opts, _see3cam_factory(clock), _lister(), clock)
+    assert rc == 0, out
+    assert "captured identity fingerprint: unavailable" in out
+    ident = load_config(config_path).cameras[0].identity
+    assert ident.policy == "warn"
+    assert ident.expected_vid_pid is None
+    assert ident.expected_device_path is None
+
+
 def test_save_without_config_is_usage_error() -> None:
     clock = FakeClock()
     rc, out = _run(
@@ -210,10 +265,10 @@ def test_rejected_control_hard_fails_on_reliable_backend() -> None:
         )
 
     rc, out = _run(
-        _cfg(),  # backend msmf: controls_reliable
+        _cfg(backend="dshow"),  # DSHOW: truthful readback -> hard-fails
         CalibrateOptions(seconds=0, exposure=-6.0),
         FakeCaptureFactory(default=make),
-        _lister(),
+        _lister(backend=int(cv2.CAP_DSHOW)),
         clock,
     )
     assert rc == 1
@@ -221,12 +276,22 @@ def test_rejected_control_hard_fails_on_reliable_backend() -> None:
 
 
 def test_unverified_controls_warn_on_avfoundation() -> None:
+    """Readback-unreliable backend, controls PHYSICALLY working: unverified
+    controls are an honest warning, not a hard failure. (The fixture used
+    to reject the exposure set too, which also killed the exposure-EFFECT
+    check — under the restored gate, REVIEW bringup-4d95b67, a dead effect
+    is hard on EVERY backend; and a set() the driver REFUSES is now hard on
+    every backend too (re-review), so the gated writes here must actually
+    apply for this test to isolate the readback-warn contract.)"""
     from tests.camera_fakes import avfoundation_hooks
 
     clock = FakeClock()
+    hooks = avfoundation_hooks()
+    del hooks[cv2.CAP_PROP_EXPOSURE]  # exposure applies; readback still untrusted
+    del hooks[cv2.CAP_PROP_AUTO_EXPOSURE]  # ditto: applied, just unverifiable
     factory = FakeCaptureFactory(
         default=lambda i, b: FakeCapture(
-            hooks=avfoundation_hooks(),
+            hooks=hooks,
             clock=clock,
             real_fps=lambda cap: min(cap.get(cv2.CAP_PROP_FPS) or 30.0, 120.0),
         )
@@ -242,7 +307,36 @@ def test_unverified_controls_warn_on_avfoundation() -> None:
         clock,
     )
     assert rc == 0, out  # honest warning, not a hard failure
-    assert "verify on the Windows target" in out
+    assert "controls unverified" in out
+    assert "exposure effect" in out and "NO EFFECT" not in out
+
+
+def test_dead_exposure_control_hard_fails_even_on_msmf() -> None:
+    """REVIEW bringup-4d95b67 (exposure-effect gate restoration): flipping
+    MSMF to readback-unreliable also demoted the exposure-EFFECT gate, so a
+    physically dead exposure control exited calibrate rc=0 with a warning
+    claiming to trust 'the exposure-effect check' — the very check that had
+    just reported NO EFFECT. The effect check measures pixels, not
+    readback: hard on every backend."""
+    clock = FakeClock()
+
+    def make(i: int, b: int) -> FakeCapture:
+        return FakeCapture(
+            hooks={cv2.CAP_PROP_EXPOSURE: lambda v: None},  # physically dead
+            clock=clock,
+            real_fps=lambda cap: min(cap.get(cv2.CAP_PROP_FPS) or 30.0, 120.0),
+        )
+
+    rc, out = _run(
+        _cfg(),  # backend msmf: readback-unreliable, effect gate still hard
+        CalibrateOptions(seconds=0, exposure=-6.0),
+        FakeCaptureFactory(default=make),
+        _lister(),
+        clock,
+    )
+    assert rc == 1, out
+    assert "NO EFFECT" in out
+    assert "hard on every backend" in out
 
 
 def test_exit_codes_for_failure_paths() -> None:
@@ -331,6 +425,228 @@ def test_explicit_backend_with_fallback_uses_pinned_index() -> None:
     assert "fallback_index 1" in out
     assert all(call[0] == 1 for call in factory.calls)
     assert all(call[1] == MSMF for call in factory.calls)
+
+
+def test_pygrabber_backend_dispatches_pygrabber_capture_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REVIEW bringup-4d95b67: run_calibration built cv2.VideoCapture for
+    EVERY backend, so the Y8-only mono cam (which this commit documents
+    OpenCV cannot open) could never be calibrated — and calibrate is the
+    step that stamps the identity fingerprint. The capture factory must
+    dispatch by backend exactly like CameraSource. A stub module stands in
+    for pygrabber_capture so no COM/hardware is touched."""
+    import sys
+    import types
+
+    clock = FakeClock()
+    created: list[tuple] = []
+
+    class StubPyGrabberCapture(FakeCapture):
+        def __init__(
+            self,
+            index: int,
+            *,
+            width: int | None = None,
+            height: int | None = None,
+            fps: float | None = None,
+        ) -> None:
+            super().__init__(
+                clock=clock,
+                real_fps=lambda cap: min(cap.get(cv2.CAP_PROP_FPS) or 30.0, 120.0),
+            )
+            created.append((index, width, height, fps))
+
+    stub_mod = types.ModuleType("palletscan.sources.pygrabber_capture")
+    stub_mod.PyGrabberCapture = StubPyGrabberCapture  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        sys.modules, "palletscan.sources.pygrabber_capture", stub_mod
+    )
+
+    from palletscan.sources.camera import default_capture_factory
+
+    rc, out = _run(
+        _cfg(backend="pygrabber", width=640, height=480),
+        CalibrateOptions(fourcc="GREY", width=640, height=480, fps=30.0,
+                         seconds=0, exposure=-6.0),
+        default_capture_factory,  # the production default — must NOT be used
+        _lister(backend=int(cv2.CAP_DSHOW)),  # pygrabber enumerates as DSHOW
+        clock,
+    )
+    assert created, "the pygrabber capture factory was never dispatched"
+    assert rc == 0, out
+    # The seed capture is entry-closed (fps is None here: _cfg does not set
+    # one on the camera entry) ...
+    assert created[0] == (0, 640, 480, None)
+    # ... but the probe + verification captures are built FOR the pinned
+    # candidate: pygrabber cannot program a mode post-build, so the
+    # candidate's geometry AND rate must reach graph construction
+    # (re-review of REVIEW bringup-4d95b67).
+    assert created[1:] == [(0, 640, 480, 30.0), (0, 640, 480, 30.0)]
+
+
+def _fixed_format_stub(
+    clock: FakeClock,
+    formats: list[tuple[int, int, float]],
+    created: list[tuple],
+):
+    """A PyGrabberCapture stand-in mirroring the REAL class's contract: the
+    format is chosen from the device's capability table at CONSTRUCTION
+    (the requested geometry when offered, else the first capability — the
+    real choose_format's Y8 fallback); mode ``set()`` calls are accepted
+    no-ops; ``set(FPS)`` succeeds only at the negotiated fixed rate."""
+
+    class StubPyGrabberCapture(FakeCapture):
+        def __init__(
+            self,
+            index: int,
+            *,
+            width: int | None = None,
+            height: int | None = None,
+            fps: float | None = None,
+        ) -> None:
+            created.append((index, width, height, fps))
+            w, h, rate = next(
+                (f for f in formats if (f[0], f[1]) == (width, height)),
+                formats[0],
+            )
+            keep = lambda cur: (lambda v: cur)  # noqa: E731 - accepted no-op
+            super().__init__(
+                props={
+                    cv2.CAP_PROP_FRAME_WIDTH: float(w),
+                    cv2.CAP_PROP_FRAME_HEIGHT: float(h),
+                    cv2.CAP_PROP_FPS: rate,
+                    cv2.CAP_PROP_FOURCC: fourcc_float("GREY"),
+                },
+                hooks={
+                    cv2.CAP_PROP_FRAME_WIDTH: keep(float(w)),
+                    cv2.CAP_PROP_FRAME_HEIGHT: keep(float(h)),
+                    cv2.CAP_PROP_FOURCC: keep(fourcc_float("GREY")),
+                    cv2.CAP_PROP_FPS: (
+                        lambda v, _r=rate: _r if abs(v - _r) <= 0.5 else None
+                    ),
+                },
+                clock=clock,
+                real_fps=rate,
+            )
+
+    return StubPyGrabberCapture
+
+
+def _run_pygrabber_pinned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    formats: list[tuple[int, int, float]],
+) -> tuple[int, str, list[tuple], Path]:
+    """Pinned GREY 2064x1552@72 calibration of a null-geometry pygrabber
+    entry (the documented first-calibration flow) against a fixed-format
+    device offering ``formats``."""
+    import sys
+    import types
+
+    from palletscan.sources.camera import default_capture_factory
+
+    clock = FakeClock()
+    created: list[tuple] = []
+    stub_mod = types.ModuleType("palletscan.sources.pygrabber_capture")
+    stub_mod.PyGrabberCapture = _fixed_format_stub(  # type: ignore[attr-defined]
+        clock, formats, created
+    )
+    monkeypatch.setitem(
+        sys.modules, "palletscan.sources.pygrabber_capture", stub_mod
+    )
+    config_path = tmp_path / "station.yaml"
+    rc, out = _run(
+        _cfg(backend="pygrabber"),  # width/height/fps still null
+        CalibrateOptions(
+            fourcc="GREY", width=2064, height=1552, fps=72.0,
+            seconds=0, exposure=-6.0, save=True, config_path=config_path,
+        ),
+        default_capture_factory,  # production default -> pygrabber dispatch
+        _lister(backend=int(cv2.CAP_DSHOW)),
+        clock,
+    )
+    return rc, out, created, config_path
+
+
+def test_pygrabber_probe_measures_the_candidate_not_the_seed_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review of REVIEW bringup-4d95b67: probe_modes programs candidates
+    via cap.set() — an accepted NO-OP on pygrabber (the DirectShow format is
+    fixed at graph construction) — so every candidate was measured on the
+    seed-negotiated format (e.g. the first Y8 capability, 640x480@120) while
+    the unprogrammed candidate's geometry/fps got stamped into the YAML.
+    Each candidate must be built into its own graph and measured there."""
+    rc, out, created, config_path = _run_pygrabber_pinned(
+        tmp_path, monkeypatch,
+        # First capability is the fast low-res one the seed graph negotiates;
+        # the pinned mode IS offered and streams at its own 72 fps.
+        formats=[(640, 480, 120.0), (2064, 1552, 72.0)],
+    )
+    assert rc == 0, out
+    # The probe capture was built FOR the candidate (not entry-closed nulls)...
+    assert (0, 2064, 1552, 72.0) in created
+    # ...and the candidate was measured on ITS capability: 72 fps, not the
+    # seed format's 120 (which is what the pre-fix probe reported).
+    assert "achieved 72.0 fps" in out
+    cam = load_config(config_path).cameras[0]
+    assert (cam.fourcc, cam.width, cam.height, cam.fps) == ("GREY", 2064, 1552, 72.0)
+
+
+def test_pygrabber_refuses_to_lock_a_mode_the_device_never_streamed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review of REVIEW bringup-4d95b67, second arm: when the device does
+    not offer the pinned geometry the capture falls back to another
+    capability (the real choose_format's Y8 fallback), whose achieved fps
+    can still satisfy the candidate's gate — calibrate must hard-fail on
+    the geometry readback instead of stamping a never-streamed mode with
+    rc=0 (pygrabber's readback of the negotiated graph IS trustworthy)."""
+    rc, out, created, config_path = _run_pygrabber_pinned(
+        tmp_path, monkeypatch,
+        formats=[(640, 480, 120.0)],  # the pinned 2064x1552 is NOT offered
+    )
+    assert rc == 1, out
+    assert "never streamed" in out
+    assert "640x480" in out and "2064x1552" in out
+    assert (0, 2064, 1552, 72.0) in created  # the candidate WAS requested
+    assert not config_path.exists(), "a never-streamed mode was saved"
+
+
+def test_rejected_control_hard_fails_even_where_readback_is_untrusted(
+    tmp_path: Path,
+) -> None:
+    """Re-review of REVIEW bringup-4d95b67: on readback-unreliable backends
+    (MSMF/AVFoundation/pygrabber) a device-REFUSED set() — accepted=False,
+    which controls.py documents as 'a failure on EVERY backend' — still
+    exited rc=0 under the readback-trust warning, so --save could lock
+    settings the device provably refused. With exposure_auto true no
+    exposure-effect check runs either: the rejection itself must gate."""
+    clock = FakeClock()
+
+    def make(i: int, b: int) -> FakeCapture:
+        return FakeCapture(
+            hooks={cv2.CAP_PROP_GAIN: lambda v: None},  # driver refuses gain
+            clock=clock,
+            real_fps=lambda cap: min(cap.get(cv2.CAP_PROP_FPS) or 30.0, 120.0),
+        )
+
+    config_path = tmp_path / "station.yaml"
+    rc, out = _run(
+        _cfg(),  # backend msmf: readback-unreliable
+        CalibrateOptions(
+            seconds=0, gain=10.0, auto_exposure=True,
+            save=True, config_path=config_path,
+        ),
+        FakeCaptureFactory(default=make),
+        _lister(),
+        clock,
+    )
+    assert rc == 1, out
+    assert "REJECTED" in out
+    assert "hard on every backend" in out
+    assert not config_path.exists(), "refused settings were saved"
 
 
 def test_metrics_loop_reads_negotiated_luma_plane() -> None:

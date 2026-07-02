@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+import time
+from concurrent.futures import (
+    Executor,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+)
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -26,7 +32,7 @@ from palletscan.events.evidence import EvidenceWriter
 from palletscan.events.http_sink import HttpSink
 from palletscan.events.sinks import ConsoleSink, JsonlSink, Sink, SqliteSink
 from palletscan.metrics import MetricsRegistry
-from palletscan.pipeline.decode_engine import DecodeEngine
+from palletscan.pipeline.decode_engine import DecodeEngine, PassDecodeContext
 from palletscan.pipeline.motion_gate import MotionGate
 from palletscan.pipeline.pass_tracker import PassTracker
 from palletscan.pipeline.rolling_buffer import RollingFrameBuffer
@@ -42,6 +48,7 @@ from palletscan.types import (
     GroundTruthRecord,
     MissEvent,
     PassEvent,
+    Roi,
     SegmentKind,
     iso_at,
 )
@@ -212,7 +219,7 @@ class PipelineRunner:
         self.metrics = MetricsRegistry(cfg.metrics)
         self._collector = _ListSink()
         self._bus = EventBus(sinks + [self._collector, _MetricsSink(self.metrics)])
-        self._frame_q = DroppingQueue(maxsize=64)
+        self._frame_q = DroppingQueue(maxsize=cfg.frame_queue_size)
         self._executor: Executor = (
             ThreadPoolExecutor(
                 max_workers=cfg.decode.workers, thread_name_prefix="decode"
@@ -221,9 +228,46 @@ class PipelineRunner:
             else ProcessPoolExecutor(max_workers=cfg.decode.workers)
         )
         self._gate = MotionGate(cfg.motion, source.source_id)
+        # Static/idle scan (opt-in motion.idle_scan_s): read static codes when no
+        # motion segment is open. Additive — never feeds the pass/miss accounting.
+        self._idle_scan_s = cfg.motion.idle_scan_s
+        self._last_idle_scan = 0.0
+        self._idle_reads = 0
+        # ONE decode context persists across idle scans (reset on a successful
+        # read) so frames_attempted accrues and the step-3 variant fan-out can
+        # engage for a stubborn static code — a fresh context per scan pinned
+        # it at 0 forever (REVIEW_bringup_4d95b67).
+        self._idle_ctx = PassDecodeContext()
+        # At most one idle scan in flight; it runs off the pipeline thread
+        # (the legacy pyzbar step has no timeout on a full frame) — but NOT
+        # on the shared decode executor: there the scan occupied the very
+        # worker its own step-3 variant fan-out needs (decode.workers: 1
+        # starved the fan-out for the entire frame budget). Idle results
+        # feed only _idle_reads and the preview — never tracker accounting —
+        # so async delivery is safe.
+        self._idle_future: Future[list[DecodeResult]] | None = None
         self._engine = DecodeEngine(
             cfg.decode, self._executor, observe_wall_ms=self.metrics.record_decode_wall_ms
         )
+        # The idle scan gets its OWN engine + dedicated single thread:
+        # sharing the pipeline's engine raced its counters / warn-once cache
+        # / decoder handles between the pipeline thread and the executor
+        # worker with no synchronization (re-review of
+        # REVIEW_bringup_4d95b67). Each engine's state stays single-threaded
+        # (one idle scan in flight); variant tasks still fan out on the
+        # shared decode executor, which only ever runs stateless tasks.
+        self._idle_engine: DecodeEngine | None = None
+        self._idle_executor: ThreadPoolExecutor | None = None
+        if self._idle_scan_s > 0.0:
+            self._idle_engine = DecodeEngine(
+                cfg.decode,
+                self._executor,
+                observe_wall_ms=self.metrics.record_decode_wall_ms,
+            )
+            if cfg.decode.executor is ExecutorKind.THREAD:
+                self._idle_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="idle-scan"
+                )
         # The tracker snapshots pre-roll/segment evidence while a segment is
         # open, so the buffer only ever serves pre-roll (at open) and
         # post-roll (at the miss deadline) lookbacks.
@@ -292,10 +336,12 @@ class PipelineRunner:
             evidence_failures=lambda: self._tracker.evidence_failures,
             events_handled=lambda: self._bus.events_handled,
             sink_errors=lambda: self._bus.sink_errors,
-            pyzbar_calls=lambda: self._engine.counters.pyzbar_calls,
-            dmtx_calls=lambda: self._engine.counters.dmtx_calls,
-            fallback_calls=lambda: self._engine.counters.fallback_calls,
-            budget_overruns=lambda: self._engine.counters.budget_overruns,
+            pyzbar_calls=lambda: self._decode_counter("pyzbar_calls"),
+            dmtx_calls=lambda: self._decode_counter("dmtx_calls"),
+            fallback_calls=lambda: self._decode_counter("fallback_calls"),
+            budget_overruns=lambda: self._decode_counter("budget_overruns"),
+            spurious_rejected=lambda: self._decode_counter("spurious_rejected"),
+            idle_reads=lambda: self._idle_reads,
         )
         # Watchdog counters stay the single source of truth (same lazy-gauge
         # pattern); non-camera runs report zeros in the "source" section.
@@ -322,6 +368,14 @@ class PipelineRunner:
         if source is None:
             source = create_source(cfg)
         return cls(cfg, source, build_sinks(cfg))
+
+    def _decode_counter(self, name: str) -> int:
+        """Pipeline + idle-scan engine counters combined: the idle scan runs
+        on its own engine so no counter is ever written from two threads."""
+        total = getattr(self._engine.counters, name)
+        if self._idle_engine is not None:
+            total += getattr(self._idle_engine.counters, name)
+        return total
 
     def stop(self) -> None:
         """Request a graceful shutdown (drains queues before exiting)."""
@@ -376,8 +430,7 @@ class PipelineRunner:
             # post-gap frames are never pallet-exit evidence, and a segment
             # spanning the gap would let a decoded pallet on this side
             # swallow the pre-gap pallet's MissEvent (REVIEW finding 2).
-            broke = self._gate.break_segment()
-            if broke is not None:
+            for broke in self._gate.break_segment():
                 self._tracker.on_segment_close(broke)
             self._tracker.flush_pending()
         # Deadline work runs BEFORE this frame enters the rolling buffer: a
@@ -385,18 +438,102 @@ class PipelineRunner:
         # before _finalize_miss harvests them (REVIEW finding b4).
         self._tracker.on_frame(frame)
         self._buffer.append(frame)
-        result, seg_event = self._gate.update(frame)
-        if seg_event is not None and seg_event.kind is SegmentKind.OPEN:
-            self._tracker.on_segment_open(seg_event)
-        ctx = self._tracker.open_ctx
+        result, seg_events = self._gate.update(frame)
+        # Opens first so a same-frame open->decode sees its own context.
+        for ev in seg_events:
+            if ev.kind is SegmentKind.OPEN:
+                self._tracker.on_segment_open(ev)
         decodes: list[DecodeResult] = []
-        if result.active and result.roi is not None and ctx is not None:
-            decodes = self._engine.decode_frame(frame, result.roi, ctx)
-            self._tracker.on_decode(decodes)
-        if seg_event is not None and seg_event.kind is SegmentKind.CLOSE:
-            self._tracker.on_segment_close(seg_event)
+        if result.tracks:
+            # Multi-object mode: decode each OPEN track's ROI independently and
+            # route its decodes to that track's segment, so a decoded pallet
+            # never swallows a co-located undecoded one's MissEvent. A track's
+            # ``track_id`` IS its segment candidate_id (set by the gate).
+            # The per-track calls SHARE one frame budget — a fresh budget per
+            # track burned budget x track_max_objects on the pipeline thread —
+            # and the starting track rotates by frame_index so one slow ROI
+            # cannot permanently starve the rest (REVIEW_bringup_4d95b67
+            # finding 15).
+            deadline = (
+                time.perf_counter() + self._cfg.decode.frame_budget_ms / 1000.0
+            )
+            n = len(result.tracks)
+            start = frame.frame_index % n
+            for k in range(n):
+                track = result.tracks[(start + k) % n]
+                ctx = self._tracker.ctx_for(track.track_id)
+                if ctx is None:
+                    continue
+                td = self._engine.decode_frame(frame, track.roi, ctx)
+                self._tracker.on_decode(track.track_id, td)
+                if td:
+                    decodes = decodes + td
+                if time.perf_counter() >= deadline:
+                    break  # budget exhausted; the rotation resumes next frame
+        elif result.active and result.roi is not None:
+            ctx = self._tracker.open_ctx
+            if ctx is not None:
+                decodes = self._engine.decode_frame(frame, result.roi, ctx)
+                self._tracker.on_decode(result.candidate_id, decodes)
+        idle = self._harvest_idle_scan()
+        if idle:
+            self._idle_reads += len(idle)
+            decodes = decodes + idle
+        if (
+            self._idle_future is None
+            and not self._tracker.has_open
+            and self._idle_scan_s > 0.0
+            and frame.ts - self._last_idle_scan >= self._idle_scan_s
+        ):
+            # No motion segment open: periodically full-frame-decode so a STOPPED
+            # pallet / static code is still read + shown. Additive to the preview
+            # + idle_reads counter ONLY — never the segment pass/miss accounting
+            # (which is what makes the executor hand-off safe; results are
+            # harvested on a later frame).
+            self._last_idle_scan = frame.ts
+            h, w = frame.image.shape[:2]
+            full = Roi(0, 0, w, h)
+            assert self._idle_engine is not None  # built with idle_scan_s > 0
+            if self._idle_executor is not None:
+                # Dedicated thread + dedicated engine: on the shared decode
+                # executor the scan sat on the worker its own step-3 variant
+                # fan-out needed (with decode.workers: 1 the futures never
+                # started and the scan burned the whole frame budget), and
+                # the shared engine's state raced across threads (re-review
+                # of REVIEW_bringup_4d95b67).
+                self._idle_future = self._idle_executor.submit(
+                    self._idle_engine.decode_frame, frame, full, self._idle_ctx
+                )
+            else:
+                # A process pool cannot pickle the engine; keep the scan
+                # inline there (legacy behavior) but harvest it uniformly.
+                fut: Future[list[DecodeResult]] = Future()
+                fut.set_result(
+                    self._idle_engine.decode_frame(frame, full, self._idle_ctx)
+                )
+                self._idle_future = fut
+        for ev in seg_events:
+            if ev.kind is SegmentKind.CLOSE:
+                self._tracker.on_segment_close(ev)
         if self.preview is not None:
             self.preview.update(frame, result, decodes)
+
+    def _harvest_idle_scan(self) -> list[DecodeResult]:
+        """Non-blocking pickup of a finished async idle scan, if any."""
+        fut = self._idle_future
+        if fut is None or not fut.done():
+            return []
+        self._idle_future = None
+        try:
+            idle = fut.result()
+        except Exception:
+            log.exception("idle scan failed")
+            return []
+        if idle:
+            # A successful read re-arms the fan-out gate: the next static
+            # code starts from a fresh, unconfirmed context.
+            self._idle_ctx = PassDecodeContext()
+        return idle
 
     def _pipeline_loop(self) -> None:
         try:
@@ -427,8 +564,7 @@ class PipelineRunner:
             # Always flush: pending misses must become events even when the
             # loop died, or open segments vanish without a trace.
             try:
-                tail = self._gate.flush()
-                if tail is not None:
+                for tail in self._gate.flush():
                     self._tracker.on_segment_close(tail)
                 self._tracker.flush()
             except Exception as exc:
@@ -470,6 +606,10 @@ class PipelineRunner:
             pipeline_t.join()
         finally:
             stats_stop.set()
+            # Idle first: an in-flight idle scan still fans variant tasks
+            # onto the shared decode executor, so that one must outlive it.
+            if self._idle_executor is not None:
+                self._idle_executor.shutdown(wait=True)
             self._executor.shutdown(wait=True)
             drained = self._bus.shutdown()
         if self._thread_errors:

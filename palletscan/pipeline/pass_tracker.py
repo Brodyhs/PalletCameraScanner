@@ -115,7 +115,12 @@ class PassTracker:
         # finalize ran — an outage-deferred miss must not land in the
         # reconnect's report window (REVIEW finding b12).
         self._ts_to_wall = ts_to_wall
-        self._open: _SegmentState | None = None
+        #: candidate_id -> open segment. Single mode keeps a dict-of-one
+        #: (behaviorally identical); multi mode runs concurrent segments, each
+        #: with its OWN reservoir + decode context + miss/finalize block, so a
+        #: decoded pallet never swallows a co-located undecoded one's miss
+        #: (the account-for-everything win).
+        self._open: dict[str, _SegmentState] = {}
         self._recent: dict[str, float] = {}  # payload -> last_seen_ts
         self._pending: list[_PendingMiss] = []
         self.passes_emitted = 0
@@ -126,36 +131,61 @@ class PassTracker:
     # -- pipeline-thread API ------------------------------------------------
 
     def on_segment_open(self, ev: SegmentEvent) -> PassDecodeContext:
-        """Start tracking a candidate; returns its decode context."""
-        if self._open is not None:
+        """Start tracking a candidate; returns its decode context.
+
+        Concurrency is legal (multi mode): a DUPLICATE candidate_id is the
+        only error worth warning about — re-opening an already-tracked id
+        would silently drop the in-flight segment's decodes/evidence.
+        """
+        if ev.candidate_id in self._open:
             log.warning(
-                "segment %s opened while %s still open; closing previous",
+                "duplicate open for segment %s; finalizing the previous one",
                 ev.candidate_id,
-                self._open.candidate_id,
             )
-            self._finalize_segment(self._open, ev.frame_index, ev.ts)
-        self._open = _SegmentState(
+            self._finalize_segment(
+                self._open[ev.candidate_id], ev.frame_index, ev.ts
+            )
+        seg = _SegmentState(
             candidate_id=ev.candidate_id, open_frame=ev.frame_index, open_ts=ev.ts
         )
+        self._open[ev.candidate_id] = seg
         # Snapshot the pre-roll now: by the time a long segment closes and
         # its post-roll deadline passes, these frames are long evicted from
         # the rolling buffer.
         for f in self._buffer.extract(
             ev.ts - self._buffer_cfg.pre_s, float("inf")
         ):
-            self._open.evidence.add(f)
-        return self._open.ctx
+            seg.evidence.add(f)
+        return seg.ctx
 
     @property
     def open_ctx(self) -> PassDecodeContext | None:
-        """Decode context of the currently open segment, if any."""
-        return self._open.ctx if self._open is not None else None
+        """Decode context of the single open segment, if exactly one is open.
 
-    def on_decode(self, results: list[DecodeResult]) -> None:
-        """Attach decode results from the current frame to the open segment."""
-        if self._open is None or not results:
+        Single-mode convenience (dict-of-one). Multi-mode callers route per
+        candidate_id and must not rely on this.
+        """
+        if len(self._open) == 1:
+            return next(iter(self._open.values())).ctx
+        return None
+
+    @property
+    def has_open(self) -> bool:
+        """True if any segment is currently open (multi-mode idle-scan gate)."""
+        return bool(self._open)
+
+    def ctx_for(self, candidate_id: str) -> PassDecodeContext | None:
+        """Decode context for a specific open segment, or None."""
+        seg = self._open.get(candidate_id)
+        return seg.ctx if seg is not None else None
+
+    def on_decode(
+        self, candidate_id: str, results: list[DecodeResult]
+    ) -> None:
+        """Attach decode results from the current frame to one open segment."""
+        seg = self._open.get(candidate_id)
+        if seg is None or not results:
             return
-        seg = self._open
         seg.decodes.extend(results)
         for d in results:
             n = seg.payload_counts.get(d.payload, 0) + 1
@@ -164,16 +194,20 @@ class PassTracker:
                 seg.ctx.confirmed = True
 
     def on_segment_close(self, ev: SegmentEvent) -> None:
-        if self._open is None or self._open.candidate_id != ev.candidate_id:
+        seg = self._open.pop(ev.candidate_id, None)
+        if seg is None:
             log.warning("close for unknown segment %s", ev.candidate_id)
             return
-        self._finalize_segment(self._open, ev.frame_index, ev.ts)
-        self._open = None
+        self._finalize_segment(seg, ev.frame_index, ev.ts)
 
     def on_frame(self, frame: Frame) -> None:
-        """Per-frame hook: collect in-segment evidence, then advance the clock."""
-        if self._open is not None:
-            self._open.evidence.add(frame)
+        """Per-frame hook: collect in-segment evidence, then advance the clock.
+
+        EVERY open segment's reservoir is fed, so concurrent segments each
+        accumulate their own evidence burst.
+        """
+        for seg in self._open.values():
+            seg.evidence.add(frame)
         self.on_frame_ts(frame.ts)
 
     def on_frame_ts(self, ts: float) -> None:
@@ -205,12 +239,12 @@ class PassTracker:
 
     def flush(self) -> None:
         """End-of-stream: finalize everything with whatever frames exist."""
-        if self._open is not None:
-            log.warning("flush with open segment %s", self._open.candidate_id)
-            last = self._open.decodes[-1].frame_index if self._open.decodes else self._open.open_frame
-            last_ts = self._open.decodes[-1].ts if self._open.decodes else self._open.open_ts
-            self._finalize_segment(self._open, last, last_ts)
-            self._open = None
+        for seg in list(self._open.values()):
+            log.warning("flush with open segment %s", seg.candidate_id)
+            last = seg.decodes[-1].frame_index if seg.decodes else seg.open_frame
+            last_ts = seg.decodes[-1].ts if seg.decodes else seg.open_ts
+            self._finalize_segment(seg, last, last_ts)
+        self._open.clear()
         self.flush_pending()
 
     # -- internals ------------------------------------------------------------
