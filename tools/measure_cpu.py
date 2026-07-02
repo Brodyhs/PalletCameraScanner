@@ -127,14 +127,24 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _write_child_config(path: Path, port: int | None) -> None:
-    """Quiet sinks for an unattended child; fixed dashboard port if any."""
+def _write_child_config(
+    path: Path, port: int | None, recording: bool = False
+) -> None:
+    """Quiet sinks for an unattended child; fixed dashboard port if any.
+
+    ``recording`` enables trial recording mode (Phase 6.1) so the owner can
+    measure its CPU delta (``--scenario recording`` vs ``baseline``); the
+    child's ``--data-dir`` rebases the recording dir, so bursts land under
+    the child's own scratch tree, not the repo.
+    """
     raw: dict = {
         "sinks": {"console": {"enabled": False}},
         "logging": {"level": "WARNING"},
     }
     if port is not None:
         raw["web"] = {"port": port}
+    if recording:
+        raw["recording"] = {"enabled": True}
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
 
@@ -245,6 +255,21 @@ def run_baseline(
     return [summarize(k, v) for k, v in samples.items()]
 
 
+def run_recording(
+    clip: Path, base: Path, seconds: float, interval_s: float
+) -> list[CpuSummary]:
+    """baseline replay with trial recording ON — the CPU delta vs baseline
+    is the recorder + off-thread burst writes."""
+    cfg_path = base / "recording.yaml"
+    _write_child_config(cfg_path, port=None, recording=True)
+    child = _spawn_replay(clip, cfg_path, base / "recording", dashboard=False)
+    try:
+        samples = _sample({"replay (1 cam, recording on)": child.pid}, seconds, interval_s)
+    finally:
+        _stop_child(child)
+    return [summarize(k, v) for k, v in samples.items()]
+
+
 def run_station(
     clip: Path, base: Path, seconds: float, interval_s: float
 ) -> list[CpuSummary]:
@@ -286,7 +311,12 @@ def run_station(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--scenario", choices=("baseline", "station", "both"), default="both"
+        "--scenario",
+        choices=("baseline", "station", "recording", "both"),
+        default="both",
+        help="'recording' (opt-in) is baseline + trial recording ON; "
+        "run it vs 'baseline' for the recorder CPU delta. 'both' stays "
+        "baseline+station (recording excluded).",
     )
     ap.add_argument(
         "--seconds", type=float, default=300.0, help="sampling window per scenario"
