@@ -26,6 +26,19 @@ from palletscan.sources.inject import CameraInjectionSource  # noqa: E402
 from palletscan.types import Symbology  # noqa: E402
 
 
+def pick_mid_pass_frame(frames, rec, nominal_fps):
+    """The collected (frame_index, image, ts) tuple nearest the pass midpoint.
+
+    Truth ``first_frame``/``last_frame`` are nominal-fps ticks of the live
+    ts clock (TRUTH TIME-BASE in palletscan/sources/inject.py), NOT camera
+    frame indices — matching them against ``frame_index`` picked a frame
+    offset by the camera's connect time x fps (past the pass entirely, so
+    the saved 'mid-pass' PNG showed a code-free scene while the tool printed
+    PHASE A OK — re-review of REVIEW_bringup_4d95b67). Match on ts."""
+    mid_ts = (rec.first_frame + rec.last_frame) / (2.0 * nominal_fps)
+    return min(frames, key=lambda f: abs(f[2] - mid_ts))
+
+
 def main() -> int:
     for s in (sys.stdout, sys.stderr):
         try:
@@ -86,8 +99,7 @@ def main() -> int:
     assert rec.first_frame < rec.last_frame, f"bad span {rec.first_frame}->{rec.last_frame}"
     assert "px_per_module" in rec.params and "blur_modules" in rec.params
 
-    mid = (rec.first_frame + rec.last_frame) // 2
-    pick = min(frames, key=lambda f: abs(f[0] - mid))
+    pick = pick_mid_pass_frame(frames, rec, src.nominal_fps)
     out = Path("data/inject_phaseA.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out), pick[1])

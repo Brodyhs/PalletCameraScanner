@@ -349,7 +349,9 @@ def test_idle_scan_persists_context_and_runs_off_thread(tmp_path: Path) -> None:
     full-frame step has no timeout — it must run on the decode executor."""
     runner = _manual_runner(tmp_path, motion=MotionConfig(idle_scan_s=0.5))
     engine = _IdleEngine()
-    runner._engine = engine  # type: ignore[assignment]
+    # The idle scan runs on its own engine (never the pipeline thread's —
+    # sharing one raced its state across threads, re-review).
+    runner._idle_engine = engine  # type: ignore[assignment]
     img = np.full((H, W), BG, np.uint8)
 
     def drive(i: int, ts: float) -> None:
@@ -397,7 +399,7 @@ def test_only_one_idle_scan_in_flight(tmp_path: Path) -> None:
             release.wait(2.0)
             return []
 
-    runner._engine = _BlockingEngine()  # type: ignore[assignment]
+    runner._idle_engine = _BlockingEngine()  # type: ignore[assignment]
     img = np.full((H, W), BG, np.uint8)
     started = time.perf_counter()
     runner._process_frame(Frame(image=img, ts=1.0, frame_index=0, source_id="cam0"))
@@ -416,4 +418,47 @@ def test_only_one_idle_scan_in_flight(tmp_path: Path) -> None:
     assert fut is not None  # slot freed -> the next scan went out
     fut.result(timeout=5.0)
     assert calls == [0, 3]
+    runner._executor.shutdown(wait=True)
+
+
+def test_idle_scan_fanout_executes_with_a_single_decode_worker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Re-review of REVIEW_bringup_4d95b67 (app.py idle scan): the async
+    idle scan was submitted to the SAME bounded decode executor its own
+    step-3 variant fan-out uses, so with decode.workers: 1 the scan occupied
+    the only worker, its variant futures could never start, and it burned
+    the entire frame budget before returning [] — the stubborn static code
+    the fix existed for was never variant-decoded. The scan must run on its
+    own dedicated thread (and its own engine, so no engine state is shared
+    across threads) while the variants fan out on the decode executor."""
+    import palletscan.pipeline.decode_engine as de
+
+    ran: list[str] = []
+
+    def instant_variant(name, crop, symbologies, dm_ms):
+        ran.append(threading.current_thread().name)
+        return name, "", []
+
+    monkeypatch.setattr(de, "_variant_task", instant_variant)
+    runner = _manual_runner(
+        tmp_path,
+        motion=MotionConfig(idle_scan_s=0.5),
+        decode=DecodeConfig(
+            workers=1, fallback_after_frames=0, frame_budget_ms=10_000.0
+        ),
+    )
+    assert runner._idle_engine is not runner._engine  # no shared engine state
+    img = np.full((H, W), BG, np.uint8)
+    runner._process_frame(Frame(image=img, ts=1.0, frame_index=0, source_id="cam0"))
+    fut = runner._idle_future
+    assert fut is not None
+    # Pre-fix this timed out: the scan held the pool's only worker while its
+    # own fan-out futures sat queued behind it until the 10 s budget expired.
+    fut.result(timeout=5.0)
+    assert ran, "the step-3 variant fan-out never executed"
+    # The variants ran on the decode pool; the scan itself did not occupy it.
+    assert all(t.startswith("decode") for t in ran)
+    assert runner._idle_engine.counters.fallback_calls == 1
+    runner._idle_executor.shutdown(wait=True)
     runner._executor.shutdown(wait=True)

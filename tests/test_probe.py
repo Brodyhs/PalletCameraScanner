@@ -85,7 +85,7 @@ def test_probe_modes_fresh_capture_per_candidate_and_readback() -> None:
         ModeCandidate("MJPG", 1280, 1200, 120.0),
     ]
     results = probe_modes(
-        lambda: factory(0, 0), cands, sample_s=0.5, warmup_frames=2, clock=clock
+        lambda cand: factory(0, 0), cands, sample_s=0.5, warmup_frames=2, clock=clock
     )
     assert len(factory.created) == 2  # fresh capture per candidate
     assert all(c.release_calls == 1 for c in factory.created)
@@ -95,6 +95,26 @@ def test_probe_modes_fresh_capture_per_candidate_and_readback() -> None:
     assert mjpg.actual_width == 1920  # snap caught by readback
     assert mjpg.actual_fourcc == "MJPG"
     assert uyvy.frames_sampled > 0
+
+
+def test_probe_modes_hands_each_candidate_to_make_cap() -> None:
+    """Re-review of REVIEW bringup-4d95b67: backends whose format is fixed
+    at capture construction (pygrabber's DirectShow graph) must build each
+    candidate into its own capture — probe_modes hands ``make_cap`` the
+    candidate being probed, in order."""
+    clock = FakeClock()
+    seen: list[ModeCandidate] = []
+
+    def make_cap(cand: ModeCandidate) -> FakeCapture:
+        seen.append(cand)
+        return FakeCapture(clock=clock, real_fps=30.0)
+
+    cands = [
+        ModeCandidate("GREY", 2064, 1552, 72.0),
+        ModeCandidate("MJPG", 1280, 720, 60.0),
+    ]
+    probe_modes(make_cap, cands, sample_s=0.2, warmup_frames=0, clock=clock)
+    assert seen == cands
 
 
 def test_probe_modes_records_open_failures_and_exceptions() -> None:
@@ -109,7 +129,7 @@ def test_probe_modes_records_open_failures_and_exceptions() -> None:
     )
     cands = [ModeCandidate("YUY2", 640, 480, 30.0)] * 3
     results = probe_modes(
-        lambda: factory(0, 0), cands, sample_s=0.2, warmup_frames=0, clock=clock
+        lambda cand: factory(0, 0), cands, sample_s=0.2, warmup_frames=0, clock=clock
     )
     assert not results[0].opened and "open" in (results[0].error or "")
     assert not results[1].opened and "driver crash" in (results[1].error or "")

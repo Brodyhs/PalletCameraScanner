@@ -206,6 +206,24 @@ def _exposure_tag(exposure_ms: float) -> str:
     return s
 
 
+def _account(truth, events, nominal_fps):
+    """Split truth passes into (decoded, missed, unaccounted) counts.
+
+    Truth ``first_frame``/``last_frame`` are nominal-fps ticks of the live
+    ts clock (TRUTH TIME-BASE in palletscan/sources/inject.py) — the same
+    axis live Pass/MissEvent timestamps use — so the app's own ts-space
+    ``reconcile_truth`` is the correct join. The old frame-index overlap
+    matched those ticks against MissEvent camera frame indices, which
+    diverge from ts under watchdog outages and real-vs-nominal fps error:
+    every genuinely missed pass then reported "not-flagged" — the exact
+    mis-accounting the truth time-base fix eliminated (re-review of
+    REVIEW_bringup_4d95b67)."""
+    from palletscan.app import reconcile_truth
+
+    rec = reconcile_truth(truth, events, nominal_fps)
+    return rec.decoded, rec.missed, len(rec.unaccounted)
+
+
 def _run_one_exposure(app_cfg, syn, *, exposure_ms, passes, dashboard_flag, write_truth=True):
     """Build a FRESH CameraInjectionSource + PipelineRunner for this exposure (the
     source is single-use), run it, print the per-condition report, and return
@@ -234,7 +252,8 @@ def _run_one_exposure(app_cfg, syn, *, exposure_ms, passes, dashboard_flag, writ
             dashboard.stop()
 
     # join truth -> events for per-condition read-rate + TTFD
-    passes_map = {ev.payload: ev for ev in getattr(runner, "collected_events", [])
+    events = getattr(runner, "collected_events", [])
+    passes_map = {ev.payload: ev for ev in events
                   if getattr(ev, "kind", None) == "pass"}
     rows = [(rec.payload in passes_map, rec.params) for rec in src.truth]
     ttfds = [(passes_map[rec.payload].first_decode_ts - passes_map[rec.payload].first_seen_ts) * 1000.0
@@ -242,24 +261,9 @@ def _run_one_exposure(app_cfg, syn, *, exposure_ms, passes, dashboard_flag, writ
              if rec.payload in passes_map
              and passes_map[rec.payload].first_decode_ts is not None]
 
-    # Account by FRAME overlap, not time: a live camera's event ts is monotonic
-    # capture time (not frame_index/fps), so the product reconcile_truth's
-    # time-window miss match misaligns and mislabels real misses as unaccounted.
-    miss_spans = [(ev.first_frame, ev.last_frame)
-                  for ev in getattr(runner, "collected_events", [])
-                  if getattr(ev, "kind", None) == "miss"]
-
-    def _ov(a0, a1, b0, b1):
-        return a0 <= b1 and b0 <= a1
-
-    decoded = missed = unacc = 0
-    for r in src.truth:
-        if r.payload in passes_map:
-            decoded += 1
-        elif any(_ov(r.first_frame, r.last_frame, m0, m1) for m0, m1 in miss_spans):
-            missed += 1
-        else:
-            unacc += 1
+    # ts-space accounting: truth spans are nominal-fps ticks of the live ts
+    # clock, the same axis Pass/MissEvent timestamps use (see _account).
+    decoded, missed, unacc = _account(src.truth, events, src.nominal_fps)
 
     tag = _exposure_tag(exposure_ms)
     if write_truth:

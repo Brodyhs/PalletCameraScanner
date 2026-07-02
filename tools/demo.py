@@ -4,8 +4,11 @@ with the live dashboard open in your browser.
 Spawns ``python -m palletscan synth --ab --dashboard`` on
 ``config/demo.yaml`` (realtime-paced A/B passes), polls ``/stats.json``
 until the dashboard serves, opens the browser, then waits on the child and
-propagates its exit code. Ctrl-C reaches the foreground process group and
-drains gracefully through the pipeline's own handlers.
+propagates its exit code. On POSIX a Ctrl-C reaches the whole foreground
+process group and the child drains through the pipeline's own handlers; on
+Windows the child's ``CREATE_NEW_PROCESS_GROUP`` suppresses console Ctrl-C
+delivery to it, so the parent forwards the stop explicitly (stop-file
+latch + CTRL_BREAK).
 
 Run (from the repo root, venv active):
 
@@ -209,14 +212,28 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     return child.wait()
                 except KeyboardInterrupt:
-                    # Ctrl-C hit the whole foreground group: the child is
-                    # draining and will print its summary; keep waiting.
+                    if sys.platform == "win32":
+                        # CREATE_NEW_PROCESS_GROUP implicitly disables
+                        # console Ctrl-C for the child (CreateProcess's
+                        # SetConsoleCtrlHandler(NULL, TRUE)), so the event
+                        # never reached it — waiting it out would spin
+                        # until the synth plan completes. Stop it
+                        # explicitly (stop-file latch + CTRL_BREAK).
+                        return _stop(child, stop_file=stop_file)
+                    # POSIX: Ctrl-C hit the whole foreground group: the
+                    # child is draining and will print its summary; keep
+                    # waiting.
                     continue
         except KeyboardInterrupt:
-            # Ctrl-C outside the wait loop (readiness poll, browser open):
-            # the console event still reached the child, whose first-signal
-            # handler already restored SIG_DFL — sending a second signal
-            # would hard-kill it mid-drain (REVIEW finding b6). Wait it out.
+            # Ctrl-C outside the wait loop (readiness poll, browser open).
+            if sys.platform == "win32":
+                # Same as above: the new-process-group child never saw the
+                # console event, so it must be stopped explicitly.
+                return _stop(child, stop_file=stop_file)
+            # POSIX: the console event still reached the child, whose
+            # first-signal handler already restored SIG_DFL — sending a
+            # second signal would hard-kill it mid-drain (REVIEW finding
+            # b6). Wait it out.
             interrupted = True
             while True:
                 try:
