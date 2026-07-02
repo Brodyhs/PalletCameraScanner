@@ -185,6 +185,15 @@ class MotionConfig(_StrictModel):
     # debounce needs 3 consecutive active frames. Opens are backdated.
     open_frames: int = 3
     quiet_frames: int = 8  # consecutive quiet frames to close a segment
+    #: Time-based debounce (A/B parity): when set, these override the
+    #: frame-count knobs above, converted per camera at MotionGate
+    #: construction using the source's nominal fps
+    #: (frames = max(1, round(seconds * fps))). Two arms running at different
+    #: rates (color 55 fps, mono ~63) then share ONE wall-clock open/close
+    #: behavior instead of fps-skewed frame counts — required before trusting
+    #: A/B miss attribution. None (default) = frame counts, byte-identical.
+    open_s: float | None = None
+    quiet_s: float | None = None
     roi_pad_px: int = 32
     #: Static/idle scan (user request): 0 (default) = purely motion-gated
     #: (CPU-cheap; static codes are NOT read). Set > 0 to ALSO full-frame-decode
@@ -222,6 +231,13 @@ class MotionConfig(_StrictModel):
     #: churny micro-tracks (each of which opens + closes as a spurious miss).
     #: Sized to bridge intra-object gaps without fusing separate objects; 0 off.
     track_close_kernel_frac: float = 0.04
+
+    @field_validator("open_s", "quiet_s")
+    @classmethod
+    def _debounce_seconds_positive(cls, v: float | None) -> float | None:
+        if v is not None and v <= 0:
+            raise ValueError(f"motion.open_s/quiet_s must be > 0 when set, got {v}")
+        return v
 
     @field_validator("track_max_objects")
     @classmethod

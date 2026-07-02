@@ -227,7 +227,9 @@ class PipelineRunner:
             if cfg.decode.executor is ExecutorKind.THREAD
             else ProcessPoolExecutor(max_workers=cfg.decode.workers)
         )
-        self._gate = MotionGate(cfg.motion, source.source_id)
+        self._gate = MotionGate(
+            cfg.motion, source.source_id, nominal_fps=source.nominal_fps
+        )
         # Static/idle scan (opt-in motion.idle_scan_s): read static codes when no
         # motion segment is open. Additive — never feeds the pass/miss accounting.
         self._idle_scan_s = cfg.motion.idle_scan_s

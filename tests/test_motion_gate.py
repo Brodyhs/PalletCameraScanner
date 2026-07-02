@@ -253,3 +253,85 @@ def test_run_token_makes_candidate_ids_restart_unique() -> None:
     default_gate = MotionGate(MotionConfig(), "cam0")
     _, events = _run(default_gate, images)
     assert re.fullmatch(r"cam0-\d{6}-000001", events[0].candidate_id)
+
+
+# -- time-based debounce (motion.open_s / quiet_s) -----------------------------
+
+
+def test_time_debounce_matches_frame_counts_at_same_fps() -> None:
+    """open_s/quiet_s at the stream fps must reproduce the frame-count
+    behavior exactly (the conversion is frames = round(seconds * fps))."""
+    frames = _moving_square_stream(40, start=5, stop=20)
+    by_frames = MotionGate(
+        MotionConfig(open_frames=3, quiet_frames=8), "cam0", run_token="t0"
+    )
+    by_seconds = MotionGate(
+        MotionConfig(open_s=3 / 30.0, quiet_s=8 / 30.0),
+        "cam0",
+        run_token="t0",
+        nominal_fps=30.0,
+    )
+    _, ev_a = _run(by_frames, frames)
+    _, ev_b = _run(by_seconds, frames)
+    assert [(e.kind, e.candidate_id, e.frame_index) for e in ev_a] == [
+        (e.kind, e.candidate_id, e.frame_index) for e in ev_b
+    ]
+    assert ev_a, "sanity: the stream must produce a segment"
+
+
+def test_time_debounce_equalizes_wall_clock_across_fps() -> None:
+    """The A/B parity property: at 55 vs 63 fps the SAME quiet_s converts to
+    different frame counts whose wall-clock durations agree to within half a
+    frame — instead of the same frame count meaning different durations."""
+    cfg = MotionConfig(open_s=0.055, quiet_s=0.145)
+    gate55 = MotionGate(cfg, "color", nominal_fps=55.0)
+    gate63 = MotionGate(cfg, "mono", nominal_fps=63.0)
+    assert gate55._quiet_frames != gate63._quiet_frames  # different counts...
+    for gate, fps in ((gate55, 55.0), (gate63, 63.0)):
+        assert abs(gate._quiet_frames / fps - 0.145) <= 0.5 / fps
+        assert abs(gate._open_frames / fps - 0.055) <= 0.5 / fps
+    # Old behavior (the bug this fixes): quiet_frames=8 is 145ms at 55fps but
+    # only 127ms at 63fps — the mono arm closed segments ~13% sooner.
+
+
+def test_time_debounce_close_fires_at_converted_count() -> None:
+    """Behavioral check that the converted count actually drives the close:
+    at 63fps quiet_s=0.145 -> 9 quiet frames (not the 8 of quiet_frames)."""
+    cfg = MotionConfig(open_s=0.055, quiet_s=0.145, quiet_frames=8)
+    gate = MotionGate(cfg, "mono", run_token="t0", nominal_fps=63.0)
+    frames = _moving_square_stream(40, start=0, stop=12)
+    close_at: int | None = None
+    for i, img in enumerate(frames):
+        _, evs = gate.update(_frame(img, i))
+        if any(e.kind is SegmentKind.CLOSE for e in evs):
+            close_at = i
+            break
+    # Motion ends after frame 11 (last moving frame; its disappearance diff
+    # makes frame 12 active too), so quiet frames start at 13 and the 9th
+    # quiet frame is 21 — one LATER than quiet_frames=8 would fire.
+    assert close_at == 21, close_at
+
+
+def test_time_debounce_without_fps_falls_back_with_warning(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, "palletscan.pipeline.motion_gate"):
+        gate = MotionGate(
+            MotionConfig(open_s=0.06, quiet_s=0.15, open_frames=3, quiet_frames=8),
+            "cam0",
+        )
+    assert (gate._open_frames, gate._quiet_frames) == (3, 8)
+    assert any("no nominal fps" in r.message for r in caplog.records)
+
+
+def test_time_debounce_unset_ignores_fps() -> None:
+    gate = MotionGate(MotionConfig(open_frames=4, quiet_frames=6), "cam0",
+                      nominal_fps=55.0)
+    assert (gate._open_frames, gate._quiet_frames) == (4, 6)
+
+
+def test_time_debounce_config_rejects_nonpositive() -> None:
+    with pytest.raises(ValueError):
+        MotionConfig(open_s=0.0)
+    with pytest.raises(ValueError):
+        MotionConfig(quiet_s=-1.0)

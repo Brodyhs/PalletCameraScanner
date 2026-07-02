@@ -977,3 +977,22 @@ and where the review corrected it.
     grace → kill); this latch is the unsupervised/tooling channel, and
     the watch is stopped with the `_WriterLease` teardown so in-process
     pytest runs leak no threads.
+
+73. **Time-based motion debounce: `motion.open_s`/`quiet_s` (2026-07-02,
+    the A/B prerequisite).** The open/quiet debounce knobs are frame
+    COUNTS, but the two arms run at different rates (color 55 fps, mono
+    ~63 measured), so `quiet_frames: 8` meant ~145 ms on the color arm
+    and only ~127 ms on the mono arm - the mono closed segments ~13%
+    sooner, skewing exactly the per-camera pass/miss attribution an A/B
+    trial measures (HANDOFF 7.4 and REVIEW_bringup_4d95b67 strategic
+    concern 5 both called the time-based fix required "before trusting
+    A/B"). New optional `motion.open_s`/`motion.quiet_s` (validated > 0)
+    override the frame counts, converted ONCE at MotionGate construction
+    via the source's nominal fps: frames = max(1, round(seconds * fps)).
+    Both single and multi tracking paths honor the converted counts.
+    Defaults are None: frame-count behavior is byte-identical (pinned by
+    tests). If seconds are set but the source has no nominal fps, the
+    gate warns and falls back to the frame counts - a silent default-fps
+    guess would skew the very parity these knobs exist to protect.
+    Station values for the A/B flip: open_s 0.055 / quiet_s 0.145
+    (matching today's 3/8 frames at 55 fps).

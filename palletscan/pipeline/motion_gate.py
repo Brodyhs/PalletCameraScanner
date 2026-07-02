@@ -15,6 +15,7 @@ whole-mask-union path, byte-for-byte unchanged.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 
@@ -30,6 +31,8 @@ from palletscan.types import (
     SegmentEvent,
     SegmentKind,
 )
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -78,7 +81,12 @@ class MotionGate:
     """
 
     def __init__(
-        self, cfg: MotionConfig, source_id: str, run_token: str | None = None
+        self,
+        cfg: MotionConfig,
+        source_id: str,
+        run_token: str | None = None,
+        *,
+        nominal_fps: float | None = None,
     ) -> None:
         self._cfg = cfg
         self._source_id = source_id
@@ -87,6 +95,30 @@ class MotionGate:
             if run_token is not None
             else time.strftime("%H%M%S", time.gmtime())
         )
+        # Time-based debounce (motion.open_s/quiet_s): converted to per-camera
+        # frame counts once here so the hot loop stays integer-streak based.
+        # Falls back to the frame-count knobs when the source's rate is
+        # unknown — a silent default-fps guess would skew exactly the A/B
+        # wall-clock parity these knobs exist to protect.
+        self._open_frames = cfg.open_frames
+        self._quiet_frames = cfg.quiet_frames
+        if cfg.open_s is not None or cfg.quiet_s is not None:
+            if nominal_fps is None or nominal_fps <= 0:
+                log.warning(
+                    "motion.open_s/quiet_s set but source %s has no nominal "
+                    "fps; falling back to frame-count debounce "
+                    "(open_frames=%d, quiet_frames=%d)",
+                    source_id,
+                    cfg.open_frames,
+                    cfg.quiet_frames,
+                )
+            else:
+                if cfg.open_s is not None:
+                    self._open_frames = max(1, round(cfg.open_s * nominal_fps))
+                if cfg.quiet_s is not None:
+                    self._quiet_frames = max(
+                        1, round(cfg.quiet_s * nominal_fps)
+                    )
         self._prev_small: np.ndarray | None = None
         self._mog2 = self._make_mog2()
         self._mog2_primed = False
@@ -178,7 +210,7 @@ class MotionGate:
             if self._active_streak == 1:
                 self._open_backdate = (frame.frame_index, frame.ts)
             self._last_active = (frame.frame_index, frame.ts)
-            if self._open_id is None and self._active_streak >= cfg.open_frames:
+            if self._open_id is None and self._active_streak >= self._open_frames:
                 self._segment_count += 1
                 self._open_id = (
                     f"{self._source_id}-{self._run_token}"
@@ -195,7 +227,7 @@ class MotionGate:
             self._active_streak = 0
             if self._open_id is not None:
                 self._quiet_streak += 1
-                if self._quiet_streak >= cfg.quiet_frames:
+                if self._quiet_streak >= self._quiet_frames:
                     event = self._close_segment()
 
         return (
@@ -472,7 +504,7 @@ class MotionGate:
         freshly spawned track (active_streak == 1) must open on its spawn
         frame when open_frames == 1, matching single mode's debounce
         (REVIEW_bringup_4d95b67 finding 9)."""
-        if t.open_id is not None or t.active_streak < self._cfg.open_frames:
+        if t.open_id is not None or t.active_streak < self._open_frames:
             return None
         self._segment_count += 1
         t.open_id = (
@@ -490,7 +522,6 @@ class MotionGate:
     def _track_inactive(
         self, frame: Frame, tid: str, t: _Track
     ) -> SegmentEvent | None:
-        cfg = self._cfg
         t.missed += 1
         # merge_streak is NOT reset here: an unmatched track contending for
         # the fused blob (a genuine merge leaves the loser unmatched) must
@@ -499,13 +530,13 @@ class MotionGate:
         t.active_streak = 0
         if t.open_id is not None:
             t.quiet_streak += 1
-            if t.quiet_streak >= cfg.quiet_frames:
+            if t.quiet_streak >= self._quiet_frames:
                 return self._close_track(tid)
         else:
             # A never-opened provisional track that goes quiet for the close
             # window is dropped (it never debounced into a segment).
             t.quiet_streak += 1
-            if t.quiet_streak >= cfg.quiet_frames:
+            if t.quiet_streak >= self._quiet_frames:
                 self._tracks.pop(tid, None)
         return None
 
