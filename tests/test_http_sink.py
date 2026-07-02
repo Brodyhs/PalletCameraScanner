@@ -236,14 +236,21 @@ def test_size_cap_prunes_oldest_and_counts(tmp_path: Path) -> None:
     max_mb = (body_len * cap_events + body_len // 2) / (1024 * 1024)
     sink = HttpSink(_sink_cfg(dead_url, tmp_path / "o.db", max_mb=max_mb))
     try:
+        # Stop the uploader first: its POST attempt holds the oldest row
+        # in-flight, which the prune (correctly) skips — timing-dependent
+        # on how fast the dead endpoint refuses (the pre-existing Windows
+        # flake of this test). Same determinism pattern as
+        # test_age_cap_prunes_expired: this pins the bus-thread size-prune
+        # logic itself.
+        sink.close()
         for i in range(10):
             sink.handle(_pass_event(i))
         stats = sink.outbox_stats()
-        assert stats["depth"] <= cap_events
-        assert stats["dropped"] == sink.dropped == 10 - stats["depth"]
-        # Oldest went first: what remains is the tail of the sequence.
+        assert stats["depth"] == cap_events
+        assert stats["dropped"] == sink.dropped == 10 - cap_events
+        # Oldest went first: what remains is exactly the tail.
         remaining = _outbox_rows(tmp_path / "o.db")
-        assert remaining == [f"evt-{i:04d}" for i in range(10 - len(remaining), 10)]
+        assert remaining == [f"evt-{i:04d}" for i in range(10 - cap_events, 10)]
     finally:
         sink.close()
 

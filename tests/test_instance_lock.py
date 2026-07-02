@@ -36,12 +36,12 @@ sinks:
 """
 
 _HOLD_CHILD = """
-import sys, time
+import os, sys, time
 from palletscan.reliability.instance_lock import InstanceLock
 
 lock = InstanceLock(sys.argv[1])
 lock.acquire()
-print("held", flush=True)
+print(f"held {os.getpid()}", flush=True)
 time.sleep(120)
 """
 
@@ -83,20 +83,37 @@ def test_holder_json_readable_while_locked(tmp_path: Path) -> None:
 
 def test_hard_killed_holder_leaves_no_stale_lock(tmp_path: Path) -> None:
     """The D1 stale-lock proof: SIGKILL the holder (no cleanup runs) and
-    the next acquire succeeds because the OS released the lock."""
+    the next acquire succeeds because the OS released the lock.
+
+    The holder child reports ITS OWN pid: on a Windows venv, sys.executable
+    is a launcher shim, so Popen.pid is the shim while the lock (correctly)
+    records the real interpreter — the product contract is "the message
+    names the actual holder", and the kill must target the actual holder
+    too or the shim dies while the interpreter keeps the lock (the
+    pre-existing Windows failure of this test)."""
     path = tmp_path / "palletscan.lock"
     proc = subprocess.Popen(
         [sys.executable, "-c", _HOLD_CHILD, str(path)],
         stdout=subprocess.PIPE,
         text=True,
     )
+    holder_pid = proc.pid
     try:
         assert proc.stdout is not None
-        assert proc.stdout.readline().strip() == "held"
+        line = proc.stdout.readline().split()
+        assert line and line[0] == "held"
+        holder_pid = int(line[1])  # the real interpreter, not the shim
         with pytest.raises(InstanceLockHeld) as exc_info:
             InstanceLock(path).acquire()
-        assert str(proc.pid) in str(exc_info.value), "message names the holder"
+        assert str(holder_pid) in str(exc_info.value), "message names the holder"
     finally:
+        if holder_pid != proc.pid:
+            # Kill the real holder first (the shim's death won't release
+            # the lock its child interpreter holds).
+            subprocess.run(
+                ["taskkill", "/PID", str(holder_pid), "/F"],
+                capture_output=True,
+            )
         proc.kill()
         proc.wait(timeout=30)
     # The kernel releases the lock with the process; allow a brief grace

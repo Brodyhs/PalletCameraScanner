@@ -165,12 +165,23 @@ if sys.platform == "win32":
         info.BasicLimitInformation.LimitFlags = (
             _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         )
+        # Popen._handle is a private CPython attribute; a Popen-shaped object
+        # without one (test fakes, alternative runtimes) gets the same
+        # degraded path as any other job-object failure below.
+        handle = getattr(proc, "_handle", None)
+        if handle is None:
+            log.warning(
+                "child has no OS process handle; relying on the "
+                "child-side parent watch"
+            )
+            k32.CloseHandle(job)
+            return None
         ok = k32.SetInformationJobObject(
             job,
             _JobObjectExtendedLimitInformation,
             ctypes.byref(info),
             ctypes.sizeof(info),
-        ) and k32.AssignProcessToJobObject(job, wintypes.HANDLE(proc._handle))
+        ) and k32.AssignProcessToJobObject(job, wintypes.HANDLE(int(handle)))
         if not ok:
             log.warning(
                 "job-object assignment failed (%d); relying on the "
