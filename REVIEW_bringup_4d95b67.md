@@ -395,3 +395,113 @@ line numbers) is stale — the bring-up moved to a dict of concurrent segments a
 *Full per-finding verifier reasoning and the 4.6M-token workflow journal:*
 `C:\Users\brody\AppData\Local\Temp\claude\...\tasks\w35fstbo9.output` and the
 workflow transcript dir (`wf_cc92fa42-02d/journal.jsonl`).
+
+---
+
+# Addendum — Fixes applied 2026-07-01 (dc7c3d9)
+
+*Append-only addendum; the findings text above is unchanged. Disposition
+derived from the dc7c3d9 fix commit (47 files, +3677/−457; each fix landed
+with a discriminating test proven to fail pre-fix) and the post-fix suite
+run: fast 646/649 (3 documented pre-existing Windows-env failures),
+acceptance 3/3 — including the replay acceptance test that failed
+deterministically at the top of this review. Backfilled ledger entries:
+ASSUMPTIONS.md #61–72; RUNBOOK gained the mono-camera section, the
+`[dev,zxing]` install, the engine-revert procedure, and the
+`palletscan.stop` latch.*
+
+## Ranked findings 1–15
+
+| # | Disposition |
+|---|---|
+| 1 (motion-gate downscale) | **Fixed** — single full INTER_AREA resize restored; acceptance suite green again (ASSUMPTIONS #67). |
+| 2 (payload gate eats GS1) | **Fixed** — default gate allows GS/RS/FS/EOT; DATAMATRIX additionally requires `dm_min_payload_len` (default 4 — a deliberate default change with config escape hatches, ASSUMPTIONS #66); gate-rejected hits no longer short-circuit the cascade/fan-out; per-payload warn-once. |
+| 3 (enumeration never CoInitializes) | **Fixed** — `_list_windows` CoInitializeEx's its calling thread for the duration (balanced; RPC_E_CHANGED_MODE-aware; moniker refs dropped before CoUninitialize). Identity guard now functions on watchdog reopen. |
+| 4 (mono cannot be calibrated) | **Fixed** — calibrate/selftest capture factory dispatches by backend; the 37CUGM is calibratable (RUNBOOK §4). |
+| 5 (zxing deployed untested) | **Fixed** — station.yaml header documents ALL deviations from defaults (pinned by a new test) and the `[zxing]` install; CI matrix 3.11/3.13 installs `.[dev,zxing]`; `engine: zxing` without zxing-cpp is an actionable startup error. Residual: the promotion bench itself is still owed (see residuals). |
+| 6 (pid-None identity mismatch) | **Fixed** — pid-absent identity is unverifiable, never a declared mismatch. |
+| 7 (exposure-EFFECT gate demoted) | **Fixed** — exposure-EFFECT is a hard gate on every backend; readback trustworthiness split into its own `readback_reliable` quirk (ASSUMPTIONS #64). |
+| 8 (fps fabricated-verified) | **Fixed** — fps-aware capability selection (normalized swapped min/max ranges; the factory forwards `cfg.fps`); `set(CAP_PROP_FPS)` rejects what the device wasn't programmed to; `get()` returns the known device rate or 0.0. Residual: the ~63-measured vs 72-configured margin over selftest's 61.2 fps gate stands until retuned on hardware (ASSUMPTIONS #65). |
+| 9 (multi-mode merge cluster) | **Fixed** — merge streaks accrue only for genuinely contended blobs, once per frame; merge-commit cleans abandoned-blob mappings; `open_frames=1` spawn parity with single mode. |
+| 10 (station policy) | **Fixed** — business-bus drain failure is never tolerated; `continue_others` no longer converts `WatchdogEscalation` (checked incl. `__cause__`) into silent permanent arm loss — it re-raises so exit-3/supervisor restart engages. |
+| 11 (ctor-timeout lifecycle) | **Fixed** — constructor timeout no longer leaks a graph-running owner thread or flips `_opened` on a released object; COM refs are released before CoUninitialize. |
+| 12 (injection accounting) | **Fixed** — truth recorded in ts space (reconcilable); in-flight injected passes finalized into truth on watchdog discontinuity; idle-gap contract preserved under `max_concurrent`; diagonal exit uses min per-axis time; plan overrides via `model_validate`; pass-0 plan cached (the `:216` efficiency item) (ASSUMPTIONS #71). |
+| 13 (choose_format ranking) | **Fixed** — exact configured resolution outranks the any-Y8 preference. |
+| 14 (OPTICS_SPEC contradictions) | **NOT fixed — documented, still owed.** OPTICS_SPEC.md is untouched by dc7c3d9; its three internal contradictions still gate the lens/lighting purchase ("fix the spec before buying lights" stands). |
+| 15 (multi-track budget) | **Fixed** — per-track decodes share ONE `frame_budget_ms` deadline (rotation resumes next frame); unmatched tracks are not decoded. Residual: zxing has no per-call timeout knob; the single-call latency bound belongs to the promotion bench (ASSUMPTIONS #62/#68). |
+
+## Grouped findings 16–72
+
+- **Capture / sources — fixed**, except one documented constraint:
+  auto-exposure sentinel no longer reported as successful readback;
+  strict-identity raise releases the published capture; rejected control
+  writes (`accepted=False`) warn and bump `connect_mismatches` regardless
+  of backend verifiability; per-moniker FriendlyName guard (one bad
+  moniker no longer aborts enumeration to `[]`). **`pygrabber_capture.py`
+  RGB24 SampleGrabber: documented-not-fixed** — see residuals.
+- **Pipeline / decode — fixed**: per-payload warn-once (no per-frame
+  logging I/O); the idle scan keeps a persistent `PassDecodeContext`
+  (fan-out can engage) and runs on a dedicated thread with a dedicated
+  engine, off the pipeline thread; `frame_queue_size` validates `ge=1`
+  (ASSUMPTIONS #70).
+- **Tools — fixed**: soak snapshots honor `--data-dir` (no append
+  interleave); bench tile shows decodes/s vs attempts/s; `/control`
+  appends under the lock; capture read-failure backs off instead of
+  busy-spinning behind a green LIVE dot; bench_decoders reports a real
+  p95; bench_sim gives equal decode chances per speed; expo_probe uses
+  the actual frame shape; inject_grid wraps the re-iterable source.
+- **Tests / CI — fixed**: pygrabber fakes model the real one-shot
+  BufferCB re-arm and drive the real `_command_loop`; the fake-module
+  double-install corruption is gone; the Windows enumeration-failure test
+  injects at the enumeration seam instead of running real COM enumeration
+  (it passes on Windows now); CI matrix runs 3.11 + 3.13 installing
+  `.[dev,zxing]`, so the deployed engine and factory Python are covered.
+- **The 18 unverified low-priority cleanup candidates** (tool/pipeline
+  wiring duplication, bench.py's parallel implementations,
+  live_decode.py) were **not addressed** — open backlog, unchanged.
+
+## Known residuals (deliberate, documented)
+
+1. **RGB24 SampleGrabber media type — tolerated constraint, fork-only
+   fix.** pygrabber hardcodes the grabber to RGB24 and its BufferCB is
+   3-channel-only, so the mono Y8 stream still takes a colour round-trip
+   plus two copies per frame (~13 MB at 2064×1552). Grabbing Y800/GREY
+   requires forking pygrabber internals; the measured ~63–72 fps at full
+   res does not justify that fork today. Documented in the module
+   docstring and ASSUMPTIONS #61; revisit if CPU headroom becomes the
+   binding constraint.
+2. **mypy pre-existing errors untouched.** dc7c3d9 did not clean the
+   pre-existing mypy backlog; no new suppressions were added.
+3. **Three tolerated Windows-env test failures** (pre-existing, not
+   introduced by the bring-up or the fixes): `test_http_sink` (size
+   cap), `test_instance_lock` (hard-kill pid), `test_supervisor`
+   (`_FakeProc` handle). Fast suite is 646/649 with exactly these.
+4. **OPTICS_SPEC.md contradictions (finding 14) remain** and must be
+   resolved before the lens/lighting purchase.
+5. **zxing promotion evidence (strategic concern 2) still owed**: the
+   `[zxing]` extra, install docs, actionable error, and CI leg now
+   exist, but the real legacy-vs-zxing bench on standard + hard corpora
+   and a measured worst-case zxing latency bound remain revised-Phase-6
+   work; `engine: legacy` is the documented trial-day revert (RUNBOOK §9).
+
+## Addition beyond the findings
+
+- **Writer-level stop latch** (`StopFileWatch`, `<data-dir>/palletscan.stop`)
+  — grew out of the finding-1 fallout: with the motion gate fixed, the
+  demo smoke run needed a graceful, console-free drain channel on
+  Windows (CTRL_BREAK requires a shared console, which services and
+  captured-output shells lack). Unsupervised `run`/`synth`/`replay`
+  watch the file next to the instance lock; sticky like
+  `supervisor.stop`; `tools/demo.py` uses it and the demo smoke test is
+  green on Windows. Documented in RUNBOOK §6/§8 and ASSUMPTIONS #72.
+
+## Strategic concerns — status
+
+1. Process bypass: closed for this commit pair (review + fixes are the
+   house loop, run post-hoc); the snapshot+fix history is preserved
+   unrewritten. 2. zxing promotion: partially addressed (see residual 5).
+3. CI/deployed-config gap: closed (3.13 + `[dev,zxing]` leg). 4. Ledger:
+   closed (ASSUMPTIONS #61–72, RUNBOOK updates — this addendum's header
+   lists them). 5. Dual-camera drift and 6. trial/replay corpus gap:
+   untouched by dc7c3d9 — they remain the hardware-validation and
+   revised-6.1 work queued in "Recommended sequence" above.

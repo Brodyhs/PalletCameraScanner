@@ -783,3 +783,197 @@ arrives.
     (`published_after_shutdown`) and logged. The supervised-stop path is
     unchanged: the 15 s grace kill preempts the join and is already a
     documented, logged loss boundary.
+
+## Bring-up backfill (4d95b67 hardware bring-up, as fixed by dc7c3d9) — 2026-07-01
+
+The 2026-06-20→23 bring-up commit `4d95b67` made these decisions without
+ledger entries (REVIEW_bringup_4d95b67.md, strategic concern 4: "the
+documentation ledger broke"). Backfilled 2026-07-01, recorded as amended
+by the dc7c3d9 fix session — each entry states both the bring-up decision
+and where the review corrected it.
+
+61. **pygrabber DirectShow backend for the mono camera (37CUGM).** The
+    See3CAM_37CUGM (Sony IMX900 mono) exposes ONLY Y8/Y12 formats, which
+    OpenCV cannot read on Windows: MSMF negotiates Y8 but its source
+    reader never starts (0 fps, MF error -1072875852) and DSHOW won't
+    open the device at all. `backend: pygrabber` drives the same
+    DirectShow SampleGrabber graph e-CAMView uses — pygrabber was already
+    a pip dependency, so the InfoSec posture (Python + pip only, no
+    vendor SDK, no driver) holds. The load-bearing design: the entire
+    graph lives on ONE dedicated COM-initialized owner thread
+    (DirectShow objects are apartment-bound; the watchdog reopens from
+    other threads), hidden behind the existing `Capture` protocol so
+    CameraSource/watchdog/settings run unchanged. Accepted constraint:
+    pygrabber hardcodes the SampleGrabber media type to RGB24, so every
+    mono frame takes a colour round-trip plus two copies (~13 MB/frame
+    at 2064×1552); grabbing Y800/GREY directly requires forking
+    pygrabber internals (its BufferCB is 3-channel-only), which the
+    measured ~63–72 fps at full res does not justify today. Revisit if
+    CPU headroom becomes the binding constraint.
+
+62. **zxing engine: promoted in station.yaml on thin evidence; the
+    promotion bench is still owed.** `config/station.yaml` ships
+    `decode.engine: zxing` off an 18-crop synthetic compare ("100% vs
+    78%", ~250× faster) — below PLAN_PHASE6's own promotion bar. What
+    exists now (dc7c3d9): zxing-cpp lives in the optional `[zxing]`
+    extra; the documented install is `pip install -e ".[dev,zxing]"`;
+    CI runs a 3.11/3.13 matrix installing `.[dev,zxing]` so the deployed
+    engine finally has automated coverage; `engine: zxing` without
+    zxing-cpp installed is an actionable startup error; and
+    station.yaml's deviations-from-default header is pinned by a test.
+    Still owed (revised Phase 6): a real legacy-vs-zxing bench on
+    generated standard + hard corpora, and a measured worst-case zxing
+    latency bound on full-res mono ROIs — zxing has no per-call timeout
+    knob, so the frame budget bounds work *between* calls, not within
+    one. `engine: legacy` is the one-line trial-day revert (RUNBOOK §9).
+
+63. **Camera identity guard — functional only after the
+    CoInitialize-on-enumeration fix.** The guard (calibrate stamps
+    `expected_vid_pid`/`expected_device_path`; every (re)connect
+    compares; `identity.policy: warn|strict`) closes the MSMF
+    pinned-index wrong-camera hole. As shipped it was inert on exactly
+    the reconnect path it was built for: comtypes auto-initializes COM
+    only on the importing (main) thread, so `list_devices()` on the
+    watchdog consumer thread raised CO_E_NOTINITIALIZED — swallowed to
+    `[]` — on every `reopen()`. dc7c3d9: `_list_windows` CoInitializeEx's
+    its calling thread for the duration (balanced pairing;
+    RPC_E_CHANGED_MODE means usable-as-is with NO paired uninit; moniker
+    refs are dropped before the CoUninitialize), pid-absent identity
+    (the `'2560:None'` composite-device case) is unverifiable-never-
+    mismatch, and a strict-policy raise releases the capture it used to
+    leak. `policy: warn` stays the default until the USB topology is
+    final (device_path encodes port topology — re-stamp after any
+    deliberate move).
+
+64. **Exposure-EFFECT is a hard gate on every backend; readback
+    reliability is its own quirk.** Bring-up flipped MSMF's
+    `controls_reliable = False` (justified: garbage readback), but that
+    single flag also demoted the exposure-EFFECT gate — a physically
+    dead exposure control exited calibrate/selftest rc=0 with a warning
+    claiming to trust the very check that had just reported NO EFFECT.
+    dc7c3d9 splits the quirk: `readback_reliable` governs only whether
+    numeric readback mismatches hard-fail (calibrate/selftest) or warn,
+    while `verify_exposure_effect` — which measures delivered pixels,
+    not readback — is a hard gate on EVERY backend. Production
+    mis-exposure fails loudly again.
+
+65. **pygrabber fps: capability selection only, reported honestly
+    (~63 measured vs 72 configured).** pygrabber's `set_format` programs
+    the capability's own media type and exposes no `AvgTimePerFrame`
+    hook, so this backend can *select* a capability but never program an
+    arbitrary rate. `choose_format` prefers, within each format tier
+    (exact configured resolution first — dc7c3d9), a capability whose
+    advertised framerate range contains the requested fps (pygrabber
+    reports min/max swapped — smallest interval = highest fps — so the
+    range is normalized); `set(CAP_PROP_FPS)` succeeds only when the
+    negotiated capability is fixed-rate at the request, otherwise it
+    returns False and the control report files fps as REJECTED — never
+    the bring-up's fabricated verified=True echo of a mirror. Ground
+    truth per station.yaml: Y8 2064×1552 datasheet max is 72 fps; ~63
+    measured through the grab loop. That clears selftest's hard
+    0.85×72 = 61.2 fps gate by only ~1.8 fps — a standing flaky-selftest
+    watch item until the configured fps or the gate is retuned on
+    hardware.
+
+66. **Default payload gate: GS1/ISO-15434 separators allowed,
+    `dm_min_payload_len: 4` — a deliberate default behavior change.**
+    Bring-up added a default-on gate rejecting all C0 control bytes to
+    kill a real pylibdmtx phantom (short printable garbage like `"F'm"`
+    decoded from noisy crops), but it also rejected GS (0x1D) — the GS1
+    FNC1/AI separator standard warehouse labels embed — finalizing real
+    pallets as MISSes. dc7c3d9's default gate: allow GS/RS/FS/EOT (GS1
+    separators and the ISO 15434 message envelope), reject other C0
+    bytes, and additionally require `dm_min_payload_len` (default 4)
+    for DATAMATRIX results only — the short-garbage phantom is
+    printable, so the control-byte check alone cannot catch it. This IS
+    a behavior change against the Phases 1–5 defaults (a 1–3 char DM
+    payload is now dropped by default), made deliberately: the phantom
+    is an observed decoder false positive that becomes wrong inventory.
+    Escape hatches: `dm_min_payload_len: 1` restores the old
+    accept-anything-printable behavior; a configured `payload_pattern`
+    supersedes the heuristic gate entirely. Gate-rejected hits no longer
+    short-circuit the symbology cascade or variant fan-out, and each
+    rejected payload warns once, then counts.
+
+67. **Motion-gate downscale is one full INTER_AREA resize; strided
+    pre-slicing is banned.** Bring-up replaced the single INTER_AREA
+    resize with a strided pre-slice (`image[::sy, ::sx]`) for speed; at
+    common resolutions the follow-up resize became a no-op, so the
+    "downscale" decimated instead of averaged and raw per-pixel sensor
+    noise flooded the frame diff — phantom motion_frac 0.14–0.74 on
+    static noisy scenes, segments that never closed, and a failing
+    acceptance suite, in both single (default) and multi mode. dc7c3d9
+    reverts to the single full INTER_AREA resize. Lesson recorded: the
+    downscale's *averaging* is the motion gate's noise filter, not an
+    optimization detail — any future fast path must first prove noise
+    equivalence against the discriminating static-noisy-scene test that
+    now pins this.
+
+68. **Multi-track decode shares ONE frame budget.** In `tracking: multi`,
+    the per-track `decode_frame` calls share a single `frame_budget_ms`
+    deadline per frame — a fresh budget per track burned
+    budget × `track_max_objects` (up to 8×) on the single pipeline
+    thread — and the rotation resumes at the next frame when the budget
+    is exhausted. Only tracks matched in the current frame are decoded:
+    stale ROIs of unmatched tracks no longer burn budget during quiet
+    frames. The budget stays soft per #12; with `engine: zxing` a single
+    call still has no internal timeout — bounded in practice by
+    measured sub-ms calls, with the formal worst-case bound owed by the
+    promotion bench (#62).
+
+69. **Station `continue_others` tolerates arm failures only — never
+    accounting or escalation failures.** The availability-first policy
+    (`station.on_arm_failure: continue_others`: a dead camera arm does
+    not take down the healthy arm) has two hard exclusions restored by
+    dc7c3d9: a business-bus drain failure is NEVER tolerated (bring-up's
+    guard swallowed it whenever any arm error existed — silent
+    business-event loss), and a `WatchdogEscalation` (checked including
+    `__cause__`) is never a tolerable arm error — it re-raises so the
+    CLI's exit-3 mapping and the supervisor restart engage, instead of
+    the escalation quietly becoming permanent arm loss with no respawn.
+    When multiple errors exist, the escalation is preferred as the
+    raised error so the exit code survives.
+
+70. **`frame_queue_size` must be ≥ 1 (validated).** `queue.Queue`
+    treats `maxsize <= 0` as INFINITE, so a configured 0 silently turned
+    DroppingQueue's bounded drop-oldest contract into an unbounded FIFO
+    that never drops. Now `ge=1` — a config error, loud at startup.
+    Sizing rule recorded with it: the default 64 absorbs decode bursts
+    for account-for-everything; a live-view/demo wants it SMALL, because
+    a FIFO backlog is queue_depth/fps of latency (the 72 fps mono at
+    depth 64 shows ~1 s of lag).
+
+71. **Injection-harness truth accounting: ts-space reconcile +
+    discontinuity finalization.** Trial-rehearsal numbers are only as
+    good as truth reconciliation, so dc7c3d9 makes the injected ground
+    truth reconcilable: truth is recorded in the same ts space the
+    frames are yielded in (bring-up recorded live-camera frame_index
+    space against wall-clock ts, so every genuinely missed injected pass
+    reported as "unaccounted" instead of MISSED); a watchdog
+    discontinuity FINALIZES in-flight injected passes into truth
+    (their frames were already delivered — discarding them understated
+    misses); `launch_in` decrements only while a launch slot is open,
+    preserving the idle-gap contract under `max_concurrent`; diagonal
+    trajectories exit at the min of per-axis exit times; plan overrides
+    go through `model_validate` (a camera config that legitimately
+    omits its locked mode fails loudly instead of smuggling None into
+    plan fields and crashing deep in rendering); and pass 0's plan is
+    computed once and cached instead of rendered twice.
+
+72. **Writer-level stop latch: `palletscan.stop` — sticky,
+    console-free.** An unsupervised writer (`run`/`synth`/`replay`)
+    watches `<data-dir>/palletscan.stop` next to its instance lock
+    (`StopFileWatch`, 0.25 s poll) and drains gracefully when it
+    appears. Why a file and not a signal: CTRL_BREAK needs a *shared
+    console*, which services, captured-output CI shells, and
+    tools/demo.py's smoke mode do not have — this channel grew out of
+    the finding-1 fallout (the demo smoke test needed a graceful,
+    console-free stop on Windows once the motion gate was fixed). Same
+    latch semantics as the supervisor's `supervisor.stop` (#54): STICKY
+    — the watcher never deletes the file, whoever created it clears it —
+    and a file already present at start fires immediately, so a stale
+    latch stops the next run at startup; clear it before restarting.
+    The supervised path is unchanged (`supervisor.stop` → CTRL_BREAK →
+    grace → kill); this latch is the unsupervised/tooling channel, and
+    the watch is stopped with the `_WriterLease` teardown so in-process
+    pytest runs leak no threads.

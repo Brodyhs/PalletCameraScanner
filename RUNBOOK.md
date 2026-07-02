@@ -42,21 +42,24 @@ In PowerShell:
 cd C:\palletscan
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install .
+pip install -e ".[dev,zxing]"
 palletscan version        # prints 0.1.0
 ```
 
 Notes:
 
+- **The `[zxing]` extra is required for the station config**:
+  `config\station.yaml` runs `decode.engine: zxing` (zxing-cpp), which a
+  plain `pip install .` does NOT pull in — without it the station fails
+  at startup with a message pointing here. `[dev]` adds the test/dev
+  extras (`pytest`, `mypy`, `psutil`, `httpx`); install both as shown.
 - On Windows the `pyzbar` and `pylibdmtx` wheels **bundle their native
   DLLs** — nothing extra to install. If `pyzbar` fails to import with a
   DLL error on an unusual box, install the
   [Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
   and retry.
-- `pip install .` pulls `pygrabber` automatically on Windows (DirectShow
-  device names).
-- For development/test extras (`pytest`, `mypy`, `psutil`, `httpx`):
-  `pip install -e ".[dev]"`.
+- The install pulls `pygrabber` automatically on Windows (DirectShow
+  device names, and the capture backend for the mono camera — §4).
 
 Sanity check with zero hardware:
 
@@ -107,6 +110,27 @@ the authoritative list of hardware claims to verify, in dependency order.
 `selftest` is the refuse-to-run-blind gate: it enumerates the cameras,
 verifies achieved fps, decodes bundled known-good symbols through the full
 pipeline, and checks disk space.
+
+### The mono camera (37CUGM) is a pygrabber device
+
+The See3CAM_37CUGM exposes only Y8/Y12 mono formats, which OpenCV cannot
+read on Windows (MSMF opens it but never delivers a frame; DSHOW won't
+open it at all). Its `cameras[]` entry therefore uses
+`backend: pygrabber` — a DirectShow SampleGrabber graph driven by the
+already-installed `pygrabber` pip package; no vendor SDK, no driver.
+`calibrate` and `selftest` dispatch by backend, so both commands work
+for the mono exactly like the color camera (earlier builds could not
+calibrate it — fixed in the dc7c3d9 session). Expect **~63 fps
+measured** at Y8 2064×1552 against the 72 fps datasheet maximum; that
+is normal for this grab path, not a fault.
+
+**Keep OBS Virtual Camera (and any other virtual camera) closed** on the
+station: virtual cameras enumerate alongside the real ones and can shift
+the 24CUG's pinned MSMF `fallback_index`, capturing the wrong device.
+The identity guard (`cameras[].identity`, `policy: warn`) logs such
+drift and bumps `source.connect_mismatches`; flip to `strict` to refuse
+the wrong device once the USB topology is final (re-stamp the
+fingerprint after any deliberate port move).
 
 ## 5. Install as a service (Task Scheduler + supervisor)
 
@@ -183,6 +207,23 @@ lock: if the service is running on the same data dir, the manual run
 exits **4** and tells you who holds the lock. Stop the service first, or
 use a different `--data-dir`.
 
+**Stopping an unsupervised writer (`run`/`synth`/`replay`) without a
+console**: create `<data-dir>\palletscan.stop` (next to the instance
+lock), e.g.
+
+```powershell
+New-Item C:\palletscan\data\palletscan.stop
+```
+
+The writer notices within ~0.25 s and drains gracefully — queues
+flushed, open segments finalized, the same run summary as Ctrl-C — no
+console required (CTRL_BREAK needs a shared console, which services and
+captured-output shells often lack). Like `supervisor.stop`, this latch
+is **sticky**: nothing deletes it for you, and a writer started while it
+exists drains immediately at startup. **Delete the file before the next
+run.** The supervised service uses `supervisor.stop` via the scripts
+above; `palletscan.stop` is the channel for manual runs and tools.
+
 ## 7. Exit codes and counting failures
 
 | code | meaning | supervisor reaction |
@@ -226,6 +267,7 @@ Default data dir `C:\palletscan\data` (everything below is per
 | `outbox.db` | store-and-forward queue for the HTTP sink | capped: 200 MB / 14 days |
 | `palletscan.lock`, `palletscan.supervisor.lock` | instance locks; content = holder diagnostics JSON (pid/start/argv) | persist after exit (harmless last-holder info; never delete while running) |
 | `supervisor.stop` | stop latch ("this station should be stopped") | sticky: never deleted by the supervisor; removed by `start_palletscan.ps1` |
+| `palletscan.stop` | writer-level stop latch (drains an unsupervised `run`/`synth`/`replay` — §6) | sticky: never deleted by the writer; delete it by hand before restarting |
 | `data\demo\` | demo runs (`tools/demo.py`) | disposable |
 
 **Log-tailing caveat:** don't hold rotating logs open —
@@ -271,6 +313,22 @@ degrades loudly, not silently: misses are still emitted (flagged
 `evidence_error`, counted in the dashboard's `misses.evidence_failures`)
 even when their JPEG bursts cannot be stored, and the supervisor keeps
 restarting the child even when its own `restarts.jsonl` is unwritable.
+
+**Decode engine misbehaving (trial day) — revert to legacy** — the
+station runs the zxing-cpp engine (`decode.engine: zxing` in
+`station.yaml`). If it misreads, phantom-decodes, or stalls, fall back
+to the Phases 1–5 certified pyzbar+pylibdmtx cascade:
+
+```powershell
+# edit config\station.yaml:  decode.engine: zxing  ->  decode.engine: legacy
+deploy\stop_palletscan.ps1; deploy\start_palletscan.ps1
+```
+
+`legacy` needs no extra packages (safe even on a box installed without
+the `[zxing]` extra) and is budget-bounded per decode call. Restore
+`engine: zxing` the same way to undo. Note the read-rate/latency
+difference in the trial log either way — the numbers are not comparable
+across engines.
 
 **Config typo after an edit** — the child exits 2, the supervisor logs
 `fix the config` and retries forever; fix `station.yaml` and the next
