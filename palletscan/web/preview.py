@@ -43,6 +43,10 @@ class LivePreview:
         self._motion: MotionResult | None = None
         self._decodes: deque[DecodeResult] = deque(maxlen=_MAX_OVERLAYS)
         self._stamp = 0
+        #: Encode-on-change cache: (stamp, jpeg bytes). The MJPEG poll re-calls
+        #: render_jpeg every ~100ms and, when idle, the keepalive re-polls the
+        #: SAME frame — reuse the last encode instead of re-doing it.
+        self._cache: tuple[int, bytes] | None = None
 
     def update(
         self, frame: Frame, motion: MotionResult, decodes: list[DecodeResult]
@@ -65,67 +69,67 @@ class LivePreview:
 
     def render_jpeg(self) -> tuple[bytes | None, int]:
         """Encode the latest frame with overlays; ``(None, stamp)`` before
-        the first frame arrives."""
+        the first frame arrives.
+
+        Downscale FIRST, then convert/draw/encode on the small image: a mono
+        2064x1552 GRAY->BGR + full-res overlay draw + full-res INTER_AREA is ~2x
+        the small-image path and competes with the pipeline thread for CPU (the
+        source of the laggy mono live view). Overlay coordinates scale by the
+        same factor. Results are cached per stamp so an idle keepalive re-poll
+        of the same frame does not re-encode."""
         with self._lock:
             frame = self._frame
             motion = self._motion
             decodes = list(self._decodes)
             stamp = self._stamp
+            cached = self._cache
         if frame is None:
             return None, stamp
-        # All drawing happens on a private BGR copy outside the lock. Apply the
-        # cosmetic preview brightness boost to the camera image FIRST so overlays
-        # drawn on top stay vivid (view-only; capture/decode are unaffected).
-        base = frame.image
+        if cached is not None and cached[0] == stamp:
+            return cached[1], stamp
+
+        # Downscale the cheap 1-channel frame BEFORE any colour-convert/draw.
+        src = frame.image
+        full_h, full_w = src.shape[:2]
+        width = self._cfg.preview_width
+        if full_w > width:
+            scale = width / full_w
+            small = cv2.resize(
+                src,
+                (width, max(1, int(round(full_h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            scale = 1.0
+            small = src
+        # Cosmetic preview brightness boost (view-only) on the small image.
         if self._cfg.preview_gain != 1.0:
-            base = cv2.convertScaleAbs(base, alpha=self._cfg.preview_gain)
-        image = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+            small = cv2.convertScaleAbs(small, alpha=self._cfg.preview_gain)
+        image = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+
+        def box(roi):  # full-frame ROI -> downscaled preview rectangle
+            c = roi.clamp(src.shape)
+            x, y = int(c.x * scale), int(c.y * scale)
+            return x, y, int(c.w * scale), int(c.h * scale)
+
         if motion is not None and motion.tracks:
             # Multi-object mode: one amber box + small track-id label per track.
             for track in motion.tracks:
-                roi = track.roi.clamp(frame.image.shape)
-                cv2.rectangle(
-                    image,
-                    (roi.x, roi.y),
-                    (roi.x + roi.w, roi.y + roi.h),
-                    _MOTION_COLOR,
-                    2,
-                )
+                x, y, w, h = box(track.roi)
+                cv2.rectangle(image, (x, y), (x + w, y + h), _MOTION_COLOR, 2)
                 cv2.putText(
-                    image,
-                    track.track_id,
-                    (roi.x, max(14, roi.y - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    _MOTION_COLOR,
-                    1,
+                    image, track.track_id, (x, max(14, y - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, _MOTION_COLOR, 1,
                 )
         elif motion is not None and motion.active and motion.roi is not None:
-            roi = motion.roi.clamp(frame.image.shape)
-            cv2.rectangle(
-                image,
-                (roi.x, roi.y),
-                (roi.x + roi.w, roi.y + roi.h),
-                _MOTION_COLOR,
-                2,
-            )
+            x, y, w, h = box(motion.roi)
+            cv2.rectangle(image, (x, y), (x + w, y + h), _MOTION_COLOR, 2)
         for decode in decodes:
-            roi = decode.roi.clamp(frame.image.shape)
-            cv2.rectangle(
-                image,
-                (roi.x, roi.y),
-                (roi.x + roi.w, roi.y + roi.h),
-                _DECODE_COLOR,
-                3,
-            )
+            x, y, w, h = box(decode.roi)
+            cv2.rectangle(image, (x, y), (x + w, y + h), _DECODE_COLOR, 3)
             cv2.putText(
-                image,
-                decode.payload,
-                (roi.x, max(20, roi.y - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                _DECODE_COLOR,
-                2,
+                image, decode.payload, (x, max(20, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, _DECODE_COLOR, 2,
             )
         header = (
             f"{frame.source_id}  f={frame.frame_index}  t={frame.ts:.2f}s"
@@ -134,18 +138,12 @@ class LivePreview:
         cv2.putText(
             image, header, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, _TEXT_COLOR, 2
         )
-        width = self._cfg.preview_width
-        if image.shape[1] > width:
-            scale = width / image.shape[1]
-            image = cv2.resize(
-                image,
-                (width, max(1, int(round(image.shape[0] * scale)))),
-                interpolation=cv2.INTER_AREA,
-            )
         ok, buf = cv2.imencode(
             ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, self._cfg.preview_quality]
         )
         if not ok:  # pragma: no cover - encoder failure
             return None, stamp
-        data: np.ndarray = buf
-        return data.tobytes(), stamp
+        data: bytes = buf.tobytes()
+        with self._lock:
+            self._cache = (stamp, data)
+        return data, stamp

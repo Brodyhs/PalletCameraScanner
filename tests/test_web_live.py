@@ -102,3 +102,39 @@ def test_mjpeg_stream_yields_parts_and_app_survives(tmp_path: Path) -> None:
         thread.join(timeout=30)
         server.stop()
     assert not thread.is_alive()
+
+
+# -- LivePreview render performance (downscale-first + encode-on-change) -------
+
+
+def test_render_jpeg_downscales_to_preview_width_and_caches() -> None:
+    """Mono-sized frame: render_jpeg encodes at preview_width (not full res),
+    and a repeat call at the same stamp reuses the cached bytes."""
+    import cv2
+    import numpy as np
+
+    from palletscan.config import WebConfig
+    from palletscan.types import Frame, MotionResult, Roi
+
+    cfg = WebConfig(preview_width=640)
+    preview = LivePreview("cam-mono", cfg)
+    img = np.full((1552, 2064), 128, np.uint8)  # full-res mono
+    motion = MotionResult(active=True, candidate_id="c", roi=Roi(200, 200, 400, 400),
+                          motion_frac=0.1)
+    preview.update(Frame(image=img, ts=1.0, frame_index=7, source_id="cam-mono"),
+                   motion, [])
+
+    data, stamp = preview.render_jpeg()
+    assert data is not None
+    decoded = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    assert decoded.shape[1] == 640, "preview must be encoded downscaled, not full-res"
+
+    # Encode-on-change: same stamp -> identical cached bytes (no re-encode).
+    data2, stamp2 = preview.render_jpeg()
+    assert stamp2 == stamp and data2 is data
+
+    # A new frame bumps the stamp and invalidates the cache.
+    preview.update(Frame(image=img, ts=1.1, frame_index=8, source_id="cam-mono"),
+                   motion, [])
+    data3, stamp3 = preview.render_jpeg()
+    assert stamp3 != stamp and data3 is not data
