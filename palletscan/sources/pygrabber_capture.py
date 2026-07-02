@@ -29,19 +29,22 @@ giving a steady stream. ``read()`` blocks for the NEXT frame (a sequence counter
 under a Condition), matching ``cv2.VideoCapture`` semantics — no stale frames, and
 ``measure_achieved_fps`` reads the real rate (~72 fps at Y8 2064x1552).
 
-Native Y8 grabber (perf): pygrabber DEFAULTS the grabber media type to RGB24 and
-its ``SampleGrabberCallback.BufferCB`` reshapes ``(h, w, 3)``, which would force a
-mono Y8 stream through an inserted DirectShow colour-converter (~9.6 MB/frame at
+Native mono grabber (perf): pygrabber DEFAULTS the grabber media type to RGB24
+and its ``SampleGrabberCallback.BufferCB`` reshapes ``(h, w, 3)``, which forces a
+mono stream through an inserted DirectShow colour-converter (~9.6 MB/frame at
 2064x1552) plus a 9.6 MB ``np.copy`` plus a 3.2 MB luma slice — ~22.4 MB/frame,
 all serialised on the DirectShow streaming thread that gates delivery, causing
-frame drops at 72 fps. We avoid all of it: for a mono sensor the grabber is set to
-GUID_NULL ("accept the pin's native subtype") so it connects DIRECTLY to the Y8
-capture pin with no converter, and ``patch_pygrabber_subtypes`` swaps in a
-channel-aware ``BufferCB`` that reshapes ``(h, w)`` for a 1-byte buffer — one
-~3.2 MB copy total, ~7x less bandwidth. ``_on_frame`` then receives a 2-D array
-and skips its slice. If a device won't connect Y8 the connect raises; we set a
-module flag and the watchdog's next reopen falls back to the RGB24 path (which
-still works via the same channel-aware BufferCB, ``(h, w, 3)`` branch).
+frame drops at 72 fps. We avoid the converter: for a mono sensor the grabber is
+set to GUID_NULL ("accept the pin's native subtype") so it connects DIRECTLY with
+no converter, and ``_y8_callback_class`` installs a channel-aware ``BufferCB``
+that extracts the 8-bit luma from whatever depth the pin delivers. On the 37CUGM
+that is a PACKED 2-byte format (luma in byte 0, a neutral 0x80 filler in byte 1 —
+forcing the specific Y8 subtype does not connect on this device), so ~6.4 MB is
+delivered and one ~3.2 MB luma plane is copied out: ~2.3x less bandwidth than
+RGB24 and no colour-convert CPU. ``_on_frame`` receives a 2-D array and skips its
+slice. If a device won't connect at all the connect raises; a module flag makes
+the watchdog's next reopen fall back to the RGB24 path (same BufferCB,
+``(h, w, 3)`` branch).
 
 Frame-rate honesty: pygrabber's ``set_format`` programs the capability's OWN
 media type and exposes no ``AvgTimePerFrame`` hook, so this backend can only
@@ -122,7 +125,10 @@ def _framerate_range(f: dict) -> tuple[float, float] | None:
 
 
 #: GUID_NULL subtype: tells the SampleGrabber "accept the pin's native media
-#: subtype" so a Y8 capture pin connects DIRECTLY (no inserted RGB24 converter).
+#: subtype" so the mono sensor connects DIRECTLY (no inserted RGB24 converter).
+#: On the 37CUGM this negotiates Y16 (2 bytes/px) — forcing the specific Y8 GUID
+#: instead fails to connect — so the channel-aware BufferCB extracts the 8-bit
+#: luma from whatever depth arrives (Y8 1B / Y16 2B / RGB24 3B).
 _GUID_NULL_STR = "{00000000-0000-0000-0000-000000000000}"
 
 #: Flips True if a device ever rejects the native-Y8 grabber connection, so
@@ -140,12 +146,34 @@ _native_y8_disabled = False
 _Y8_CALLBACK_CLASS: type | None = None
 
 
+def _extract_mono_luma(flat: np.ndarray, w: int, h: int) -> np.ndarray | None:
+    """8-bit luma plane from a FLAT uint8 grabber buffer, chosen by its actual
+    byte count so no format is misread as another (reading a 2-byte buffer as
+    1-byte gives a split/interlaced image). Never reads past the buffer:
+
+    - ``>= h*w*3`` bytes: RGB24 -> ``(h, w, 3)`` (``_on_frame`` slices one channel);
+    - ``>= h*w*2`` bytes: packed 2-byte mono (this 37CUGM) -> byte 0 is the luma,
+      byte 1 a neutral 0x80 filler (verified on hardware);
+    - ``>= h*w`` bytes: Y8 -> ``(h, w)``;
+    - otherwise ``None`` (buffer too small; caller skips the frame).
+
+    Returns a view/strided slice; the caller makes it contiguous and flips it.
+    """
+    px = h * w
+    n = int(flat.shape[0])
+    if px <= 0 or n < px:
+        return None
+    if n >= px * 3:
+        return flat[: px * 3].reshape(h, w, 3)
+    if n >= px * 2:
+        return flat[: px * 2].reshape(h, w, 2)[:, :, 0]
+    return flat[:px].reshape(h, w)
+
+
 def _y8_callback_class() -> type:
-    """A ``SampleGrabberCallback`` subclass whose ``BufferCB`` reshapes by the
-    buffer's ACTUAL byte count, so a native Y8 grabber (1 byte/px, ~3.2 MB at
-    2064×1552) is not misread as RGB24. Defensive: the chosen shape can never
-    require more than ``BufferLen`` bytes, so a surprising buffer skips the frame
-    rather than over-reading. Built once, memoized."""
+    """A ``SampleGrabberCallback`` subclass whose ``BufferCB`` pulls the 8-bit
+    luma from whatever depth the pin delivers (see :func:`_extract_mono_luma`),
+    so a native mono grabber is not misread as RGB24. Built once, memoized."""
     global _Y8_CALLBACK_CLASS
     if _Y8_CALLBACK_CLASS is not None:
         return _Y8_CALLBACK_CLASS
@@ -157,17 +185,11 @@ def _y8_callback_class() -> type:
                 return 0
             self.keep_photo = False
             w, h = self.image_resolution  # pygrabber stores (width, height)
-            px = h * w
-            if px <= 0:
+            flat = np.ctypeslib.as_array(pBuffer, shape=(int(BufferLen),))
+            plane = _extract_mono_luma(flat, w, h)
+            if plane is None:
                 return 0
-            if BufferLen >= px * 3:
-                shape: tuple[int, ...] = (h, w, 3)
-            elif BufferLen >= px:
-                shape = (h, w)
-            else:
-                return 0  # buffer smaller than one plane; skip, never over-read
-            img = np.ctypeslib.as_array(pBuffer, shape=shape)
-            img = np.flip(np.copy(img), axis=0)
+            img = np.flip(np.ascontiguousarray(plane), axis=0)
             self.callback(img)  # type: ignore[arg-type]
             return 0
 
@@ -356,14 +378,14 @@ class PyGrabberCapture:
             graph.add_sample_grabber(self._on_frame)
             graph.add_null_render()
             self._check_stop()
-            # Mono: connect the grabber to the device's NATIVE Y8 output
-            # (GUID_NULL subtype = "any") so DirectShow inserts NO Y8->RGB24
-            # converter — cutting per-frame copy bandwidth ~7x (22.4MB -> 3.2MB)
-            # and freeing the streaming thread that gates frame delivery. Replace
-            # the stock 3-channel callback with the channel-aware subclass so the
-            # 1-byte buffer is reshaped correctly. If a quirky UVC stack won't
-            # connect Y8 the connect raises: disable native for future opens
-            # (module flag) and re-raise so the watchdog's next reopen uses RGB24.
+            # Mono: connect the grabber to the pin's native subtype (GUID_NULL)
+            # so DirectShow inserts NO RGB24 converter — dropping ~22.4MB/frame
+            # of copy+convert to ~9.6MB and freeing the streaming thread that
+            # gates delivery. The channel-aware BufferCB extracts the luma from
+            # whatever depth arrives (this 37CUGM: a packed 2-byte format, luma
+            # in byte 0). If the grabber won't connect at all the connect
+            # raises: disable native for future opens (module flag) and re-raise
+            # so the watchdog's next reopen uses RGB24.
             from pygrabber.dshow_ids import MediaTypes
             use_native_y8 = self._mono and not _native_y8_disabled
             if use_native_y8:
@@ -405,7 +427,7 @@ class PyGrabberCapture:
                 log.error("PyGrabberCapture[%d]: %s", self._index, self._build_error)
             else:
                 layout = (
-                    "native Y8, no RGB24 converter"
+                    "native mono, no RGB24 converter"
                     if self._grabber_native_y8 else "RGB24 converter"
                 )
                 log.info(

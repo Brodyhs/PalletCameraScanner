@@ -3,36 +3,48 @@ r"""Smooth live camera viewer + QR/DataMatrix decode overlay (bring-up test).
 Throwaway hand-test tool (not product). Decoding runs on a BACKGROUND thread so
 the display loop only reads + shows frames — the window then refreshes at the
 camera's true delivery rate instead of being throttled by pyzbar/pylibdmtx.
-(This mirrors the production pipeline: capture never blocks on decode.)
+(This mirrors the production pipeline: capture never blocks on decode.) A native
+cv2 window at the full frame rate, so it is far smoother than the dashboard's
+10 fps MJPEG stream.
 
-Note on fps: the camera maxes at 55 fps in hardware, and that rate is exposure-
-bound — a bright image in dim light needs a long exposure, which lowers fps.
-Press d (shorter exposure) or add light to push toward 55. A 144 Hz monitor
-can't show more frames than the camera delivers.
+Works for BOTH cameras:
+  --camera color  (default)  the See3CAM_24CUG on MSMF (OpenCV)
+  --camera mono              the See3CAM_37CUGM on the pygrabber backend
+                             (OpenCV cannot read its Y8 stream)
 
-Auto-exposure by default. The manual-focus S-mount lens has no software focus,
-so the overlay shows a focus score (variance of Laplacian) — turn the lens ring
-to MAXIMIZE it.
+Auto-exposure/focus: the manual-focus S-mount lens has no software focus, so the
+overlay shows a focus score (variance of Laplacian) — turn the lens ring to
+MAXIMIZE it. A bright image in dim light needs a long exposure, which lowers fps;
+press d (shorter) or add light to push the rate back up.
 
 Keys:  q quit · a auto/manual exposure · e brighter · d darker (e/d: MANUAL only)
-Run:  .\.venv\Scripts\python.exe tools\live_decode.py
+       · f focus-zoom (1:1 center crop)
+Run:  .\.venv\Scripts\python.exe tools\live_decode.py --camera mono
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import threading
 import time
+from pathlib import Path
 
 import cv2
 from pylibdmtx.pylibdmtx import decode as dm_decode
 from pyzbar.pyzbar import ZBarSymbol
 from pyzbar.pyzbar import decode as qr_decode
 
-INDEX = 0            # MSMF index of the See3CAM_24CUG (OBS closed)
-MANUAL_EXPO = -6.0   # start here: matches station.yaml -> short exposure -> full 55 fps
-                     # (image is DARK without scan-zone light; press e to brighten = fps drops)
-_AE_AUTO = 0.75      # MSMF auto-exposure magic values (SET works; readback lies)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+_AE_AUTO = 0.75      # DSHOW/MSMF auto-exposure sentinel (SET works; readback lies)
 _AE_MANUAL = 0.25
+
+#: Per-camera defaults. Color: MSMF UYVY 1920x1200@55, exposure -6. Mono:
+#: pygrabber Y8 2064x1552@72, exposure -8 (both from config/station.yaml).
+_CAMERAS = {
+    "color": dict(index=0, width=1920, height=1200, fps=55.0, expo=-6.0),
+    "mono": dict(index=1, width=2064, height=1552, fps=72.0, expo=-8.0),
+}
 
 
 def _apply_exposure(cap, auto: bool, expo: float) -> None:
@@ -41,6 +53,27 @@ def _apply_exposure(cap, auto: bool, expo: float) -> None:
     else:
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, _AE_MANUAL)
         cap.set(cv2.CAP_PROP_EXPOSURE, expo)
+
+
+def _open_color(cfg):
+    cap = cv2.VideoCapture(cfg["index"], cv2.CAP_MSMF)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg["width"])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg["height"])
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"UYVY"))
+    cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+    cap.set(cv2.CAP_PROP_FPS, cfg["fps"])
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # freshest frame, low latency
+    return cap
+
+
+def _open_mono(cfg):
+    # The mono streams Y8/packed-mono that OpenCV cannot read; the product's
+    # pygrabber DirectShow backend delivers a 2-D grayscale frame via read().
+    from palletscan.sources.pygrabber_capture import PyGrabberCapture
+
+    return PyGrabberCapture(
+        cfg["index"], width=cfg["width"], height=cfg["height"], fps=cfg["fps"]
+    )
 
 
 class Decoder(threading.Thread):
@@ -91,26 +124,29 @@ class Decoder(threading.Thread):
                 self.payload, self.hit_t = new, now
 
 
-def main() -> int:
-    cap = cv2.VideoCapture(INDEX, cv2.CAP_MSMF)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1200)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"UYVY"))
-    cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-    cap.set(cv2.CAP_PROP_FPS, 55)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # freshest frame, low latency
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--camera", choices=("color", "mono"), default="color")
+    ap.add_argument("--index", type=int, default=None, help="override the device index")
+    args = ap.parse_args(argv)
+    cfg = dict(_CAMERAS[args.camera])
+    if args.index is not None:
+        cfg["index"] = args.index
+    is_mono = args.camera == "mono"
+
+    cap = _open_mono(cfg) if is_mono else _open_color(cfg)
     if not cap.isOpened():
-        print("FAILED to open camera on MSMF index", INDEX, flush=True)
+        print(f"FAILED to open {args.camera} camera at index {cfg['index']}", flush=True)
         return 1
 
-    auto = False          # start in MANUAL short exposure so fps is the full 55 (press a for AUTO)
-    expo = MANUAL_EXPO
+    auto = False          # start MANUAL short exposure so fps is full (press a for AUTO)
+    expo = cfg["expo"]
     _apply_exposure(cap, auto, expo)
 
     dec = Decoder()
     dec.start()
 
-    win = "palletscan live  (q quit | a auto/manual | e/d exposure | f focus-zoom)"
+    win = f"palletscan live [{args.camera}]  (q quit | a auto/manual | e/d exposure | f focus-zoom)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, 1600, 1000)
 
@@ -119,10 +155,10 @@ def main() -> int:
     count = 0
     focus_zoom = False     # f toggles a magnified 1:1 center crop for fine focusing
     focus_peak = 0.0       # running best focus score so you know when you've maximized it
-    print("live_decode: streaming FULL-RES (auto-exposure, threaded decode) - hold a code up",
+    print(f"live_decode [{args.camera}]: streaming FULL-RES (threaded decode) - hold a code up",
           flush=True)
     while True:
-        ok, img = cap.read()                            # img is full-res 1920x1200 BGR
+        ok, img = cap.read()
         if not ok or img is None:
             continue
         count += 1
@@ -132,11 +168,15 @@ def main() -> int:
             count = 0
             last_t = now
 
-        gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)       # full-res, never downscaled
-        dec.submit(gray_full)                                   # QR decodes at full res; DM downscales internally
+        # The mono backend already delivers 2-D grayscale; the color cam is BGR.
+        if img.ndim == 2:
+            gray_full = img
+        else:
+            gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        dec.submit(gray_full)  # QR decodes at full res; DM downscales internally
 
         h, w = gray_full.shape
-        rw, rh = 800, 600                                       # center focus ROI (FULL-res px)
+        rw, rh = min(800, w), min(600, h)                      # center focus ROI (FULL-res px)
         x0, y0 = (w - rw) // 2, (h - rh) // 2
         roi = gray_full[y0:y0 + rh, x0:x0 + rw]
         focus = cv2.Laplacian(roi, cv2.CV_64F).var()           # full-res ROI => true focus signal
@@ -144,9 +184,12 @@ def main() -> int:
 
         if focus_zoom:                                          # 1:1 center crop, max detail
             view = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+        elif img.ndim == 2:
+            view = cv2.cvtColor(gray_full, cv2.COLOR_GRAY2BGR)  # mono: colorize for overlays
+            cv2.rectangle(view, (x0, y0), (x0 + rw, y0 + rh), (0, 200, 255), 2)
         else:
-            view = img                                          # FULL 1920x1200 resolution
-            cv2.rectangle(view, (x0, y0), (x0 + rw, y0 + rh), (0, 200, 255), 2)  # aim code here
+            view = img                                          # color: FULL-res BGR
+            cv2.rectangle(view, (x0, y0), (x0 + rw, y0 + rh), (0, 200, 255), 2)
 
         fresh = (now - dec.hit_t) < 1.5
         mode = "AUTO" if auto else f"MANUAL {expo:+.0f}"

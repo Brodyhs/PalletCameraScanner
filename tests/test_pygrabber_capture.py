@@ -110,3 +110,34 @@ def test_patch_adds_mono_guids_idempotently_without_clobbering() -> None:
     snapshot = dict(ids.subtypes)
     patch_pygrabber_subtypes()
     assert ids.subtypes == snapshot
+
+
+def test_extract_mono_luma_by_depth() -> None:
+    """The BufferCB luma extractor must pick the right bytes for each pin depth
+    (the split/interlaced-image bug was reading a 2-byte buffer as 1-byte, and a
+    later miss took byte 1 - the neutral 0x80 filler - instead of byte 0)."""
+    import numpy as np
+
+    from palletscan.sources.pygrabber_capture import _extract_mono_luma
+
+    w, h = 4, 3
+    px = w * h
+
+    # Y8: one byte per pixel -> (h, w) as-is.
+    out = _extract_mono_luma(np.arange(px, dtype=np.uint8), w, h)
+    assert out.shape == (h, w) and out[0, 0] == 0 and out[h - 1, w - 1] == px - 1
+
+    # Packed 2-byte (this 37CUGM): luma in byte 0, neutral 0x80 filler in byte 1.
+    flat2 = np.empty(px * 2, np.uint8)
+    flat2[0::2] = np.arange(px)     # byte 0: the real luma ramp
+    flat2[1::2] = 0x80              # byte 1: constant filler
+    out2 = _extract_mono_luma(flat2, w, h)
+    assert out2.shape == (h, w)
+    # MUST be the luma ramp (byte 0), NOT the constant 0x80 (byte 1).
+    assert np.array_equal(out2.ravel(), np.arange(px, dtype=np.uint8))
+
+    # RGB24: three bytes per pixel -> (h, w, 3) for _on_frame's downstream slice.
+    assert _extract_mono_luma(np.zeros(px * 3, np.uint8), w, h).shape == (h, w, 3)
+
+    # Buffer shorter than one plane -> None (skip, never over-read).
+    assert _extract_mono_luma(np.zeros(px - 1, np.uint8), w, h) is None

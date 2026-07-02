@@ -1074,20 +1074,29 @@ and where the review corrected it.
     luma channel (3.2MB) = ~22.4MB/frame, all serialized on the ONE
     DirectShow streaming thread that gates delivery (can't re-arm within the
     13.9ms budget). FIX: for a mono sensor the grabber is set to GUID_NULL
-    ("accept the pin's native subtype") so it connects DIRECTLY to the Y8
-    pin with NO converter, plus a channel-aware BufferCB (a
-    SampleGrabberCallback SUBCLASS - a class-level monkeypatch does not reach
-    comtypes' per-instance vtable and segfaults reading (h,w,3) on a 1-byte
-    buffer) reshaping by actual BufferLen: one ~3.2MB copy, ~7x less
-    bandwidth. Defensive: never over-reads the buffer; if a device rejects
-    the native connect a module flag makes the watchdog's next reopen use
-    RGB24. (2) PREVIEW: render_jpeg did a full-res GRAY->BGR + overlay draw +
-    INTER_AREA + encode on the HTTP thread EVERY poll; FIX: downscale to
-    preview_width FIRST then convert/draw/encode small (~2x cheaper) + a
-    stamp cache so idle keepalive re-polls don't re-encode. VERIFIED on
-    hardware: native Y8 confirmed (raw frame ndim=2), and an A/B run showed
-    mono 72.0fps with 0 dropped (was ~12%), color 0 dropped. Gated to mono;
-    color/RGB24 unchanged. NOTE (separate, environmental): the color 24CUG
+    ("accept the pin's native subtype") so it connects DIRECTLY with NO
+    converter, plus a channel-aware BufferCB (a SampleGrabberCallback SUBCLASS -
+    a class-level monkeypatch does not reach comtypes' per-instance vtable and
+    SEGFAULTS reading (h,w,3) on a shorter buffer) that extracts the 8-bit luma
+    by the buffer's ACTUAL byte count. HARDWARE REALITY (found by looking at
+    the pixels, not just the shape): forcing the specific Y8 subtype does NOT
+    connect on this 37CUGM; GUID_NULL negotiates a PACKED 2-byte format - luma
+    in byte 0, a neutral 0x80 filler in byte 1 (reading it as 1-byte gave a
+    split/interlaced image; taking byte 1 gave a flat 0x80 frame). So the win
+    is ~6.4MB delivered + one ~3.2MB luma copy = ~2.3x less bandwidth than
+    RGB24 and NO colour-convert CPU (NOT the 7x a true 1-byte Y8 would give).
+    Defensive: the reshape never over-reads; a device that won't connect
+    natively falls back to RGB24 (module flag). (2) PREVIEW: render_jpeg did a
+    full-res GRAY->BGR + overlay draw + INTER_AREA + encode on the HTTP thread
+    EVERY poll; FIX: downscale to preview_width FIRST then convert/draw/encode
+    small (~2x cheaper) + a stamp cache so idle keepalive re-polls don't
+    re-encode. VERIFIED on hardware: the mono image is clean and decodes 4
+    codes, and an A/B run showed mono 72.0fps with 0 dropped (was ~12%), color
+    0 dropped. Gated to mono; color/RGB24 unchanged.
+    DASHBOARD vs NATIVE: the dashboard MJPEG (preview_fps 10) is inherently
+    laggier than a native cv2.imshow window at the full frame rate;
+    tools/live_decode.py was generalized (--camera mono, via PyGrabberCapture)
+    to give the mono the same smooth native viewer the color arm had. NOTE (separate, environmental): the color 24CUG
     (MSMF) delivered only ~19fps in dim light because its manual exposure is
     unverifiable on MSMF (readback lies) and a long effective exposure caps
     fps - the documented exposure<->fps<->light coupling (OPTICS_SPEC 8),
