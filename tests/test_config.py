@@ -139,3 +139,24 @@ def test_log_file_config_validators() -> None:
     with pytest.raises(ValidationError):
         LogFileConfig(max_age_days=0)
     assert LogFileConfig().enabled is True
+
+
+def test_live_and_bench_profiles_load_and_select_a_camera() -> None:
+    """The hardware/bench profiles (BENCH_PROTOCOL.md) must stay loadable and
+    keep their load-bearing knobs: each selects a real camera source, and
+    bench_wave keeps the small-object motion floor + time-based debounce +
+    idle scan it exists for."""
+    root = Path(__file__).resolve().parents[1] / "config"
+    for name, camera in (
+        ("live_color.yaml", "cam-color"),
+        ("live_mono.yaml", "cam-mono"),
+        ("bench_wave.yaml", "cam-color"),
+    ):
+        cfg = load_config(root / name)
+        assert cfg.source.type == "camera", name
+        assert cfg.source.camera == camera, name
+        assert len(cfg.cameras) == 2, name
+    bench = load_config(root / "bench_wave.yaml")
+    assert bench.motion.min_area_frac < 0.01  # small hand-held object floor
+    assert bench.motion.open_s is not None and bench.motion.quiet_s is not None
+    assert bench.motion.idle_scan_s > 0  # held (static) codes still read

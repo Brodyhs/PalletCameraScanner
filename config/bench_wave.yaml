@@ -1,0 +1,171 @@
+# PalletScan BENCH box-wave profile — hand-held barcode testing at 2-4 ft.
+#
+# The product-pipeline bench test (BENCH_PROTOCOL.md): wave a box with printed
+# codes in front of ONE camera and verify passes decode and misses get flagged
+# with evidence. Derived from config/station.yaml; deviations tuned for a
+# SMALL HAND-HELD object instead of a pallet:
+#   - motion.min_area_frac: 0.003  (a 6" box at 3 ft is ~0.5% of frame — the
+#     pallet-sized 0.01 floor would never open a segment; live-tune this)
+#   - motion.open_s/quiet_s: 0.06/0.15  (time-based debounce; hand waves are
+#     brief — frame-count defaults remain as the no-fps fallback)
+#   - motion.idle_scan_s: 2.0  (a HELD (static) code still gets read + shown;
+#     idle reads never create pass/miss accounting)
+#   - decode.payload_pattern: set it to your printed codes' format before the
+#     drill to reject decoder false positives (e.g. "^BENCH-").
+#
+#   palletscan run --dashboard --config config\bench_wave.yaml --data-dir data\bench
+#
+# Keep bench data out of production: always pass --data-dir data\bench.
+# Switch source.camera to cam-mono to run the same drill on the mono arm.
+
+source:
+  type: camera
+  camera: cam-color
+  cameras: null
+
+synthetic:
+  width: 1280
+  height: 720
+  fps: 30.0
+  seed: 42
+  num_passes: 20
+  speed_mph_range: [2.0, 10.0]
+  angle_deg_range: [0.0, 35.0]
+  px_per_module_range: [3.0, 6.0]
+  module_size_mm: 5.0
+  exposure_fraction: 0.03
+  contrast_range: [0.45, 1.0]
+  noise_sigma_range: [2.0, 8.0]
+  lighting_gradient_max: 30.0
+  occlusion_max_frac: 0.15
+  symbologies: [qr, datamatrix]
+  idle_s_range: [0.3, 1.5]
+  realtime: false
+  payload_prefix: "PLT-"
+
+video:
+  path: ""
+  fps_override: null
+  speed: 1.0
+  loop: 1
+
+# Both cameras defined so `calibrate --save` against this file works for
+# either arm; source.camera above selects which one runs. Values mirror
+# config/station.yaml — keep them in sync when calibrate re-locks a mode.
+cameras:
+  - id: cam-color
+    name: "See3CAM_24CUG"
+    backend: msmf                # REQUIRED on this unit (DSHOW = 15fps wall)
+    fourcc: UYVY                 # LOCKED: 54.9fps measured through the stack
+    width: 1920
+    height: 1200
+    fps: 55.0                    # datasheet UYVY max @ 1920x1200
+    convert_rgb: true
+    fallback_index: 0            # MSMF index (keep OBS Virtual Camera closed)
+    read_fail_limit: 5
+    connect_verify_s: 1.0
+    settings: {exposure_auto: false, exposure: -6, gain: 10, brightness: null}
+    identity:
+      policy: warn
+      expected_vid_pid: "2560:c128"
+      expected_device_path: '\\?\usb#vid_2560&pid_c128&mi_00#7&1250ea3a&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global'
+  - id: cam-mono
+    name: "See3CAM_37CUGM"
+    backend: pygrabber           # REQUIRED: OpenCV cannot read the Y8-only mono
+    fourcc: "Y8  "
+    width: 2064
+    height: 1552
+    fps: 72.0                    # ~63 measured through the grab loop
+    convert_rgb: true
+    fallback_index: 1
+    read_fail_limit: 5
+    connect_verify_s: 1.0
+    settings: {exposure_auto: false, exposure: -8, gain: 10, brightness: null}
+
+watchdog:
+  stall_timeout_s: 2.0
+  retry: {base_s: 0.5, cap_s: 15.0}
+  max_outage_s: 120
+  max_zombie_readers: 3
+
+station:
+  on_arm_failure: stop_all
+
+motion:
+  algorithm: framediff
+  downscale_width: 160
+  diff_threshold: 12
+  min_area_frac: 0.003   # BENCH: small hand-held box (~0.5% of frame at 3 ft);
+                         # raise back toward 0.01 if hands/shadows open segments
+  open_frames: 3         # fallback when the source has no nominal fps
+  quiet_frames: 8        # fallback when the source has no nominal fps
+  open_s: 0.06           # time-based debounce (ASSUMPTIONS #73): ~3 frames @55fps
+  quiet_s: 0.15          # ~8 frames @55fps / ~9 @63fps — equal wall-clock close
+  roi_pad_px: 32
+  idle_scan_s: 2.0       # BENCH: read a HELD code every 2s (additive; no pass/miss)
+
+decode:
+  symbology_priority: [qr, datamatrix]
+  engine: zxing          # needs the [zxing] extra: pip install -e ".[dev,zxing]"
+  frame_budget_ms: 50.0
+  dm_timeout_ms: 40
+  executor: thread
+  workers: 2
+  fallback_after_frames: 4
+  confirmations: 1
+  payload_pattern: null
+
+dedup:
+  window_s: 12.0
+
+buffer:
+  pre_s: 2.0
+  post_s: 2.0
+
+evidence:
+  dir: data/evidence
+  frame_stride: 3
+  jpeg_quality: 85
+  max_total_mb: 500.0
+  max_age_days: 14.0
+
+sinks:
+  console: {enabled: true}
+  jsonl: {enabled: true, path: data/events.jsonl}
+  sqlite: {enabled: true, path: data/palletscan.db}
+  http:
+    enabled: false
+    url: "http://127.0.0.1:8808/events"
+    headers: {}
+    timeout_s: 5.0
+    outbox_path: data/outbox.db
+    retry: {base_s: 1.0, cap_s: 60.0}
+    max_mb: 200.0
+    max_age_days: 14.0
+
+metrics:
+  window_s: 60.0
+  latency_samples: 2048
+
+web:
+  enabled: false
+  host: 127.0.0.1
+  port: 8000
+  preview_fps: 10.0
+  preview_quality: 80
+  preview_width: 640
+
+report:
+  manifest_path: null
+
+logging:
+  level: INFO
+  file:
+    enabled: true
+    dir: data/logs
+    max_mb: 20.0
+    backups: 5
+    max_age_days: 14.0
+
+lock:
+  path: data/palletscan.lock
