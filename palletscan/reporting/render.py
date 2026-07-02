@@ -117,3 +117,44 @@ def reconciliation_csv(rec: ManifestReconciliation) -> str:
     for payload in rec.unexpected:
         writer.writerow([payload, "unexpected"])
     return out.getvalue()
+
+
+def session_csv(session: dict[str, Any]) -> str:
+    """One operator session as CSV: the reconciliation block, then the
+    per-camera table, then payload-level manifest matching when present.
+    Works for open sessions too (live counts under the same keys)."""
+    counts = session.get("counts") or {}
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["field", "value"])
+    for key in (
+        "id",
+        "status",
+        "started_utc",
+        "closed_utc",
+        "expected_count",
+        "ack_note",
+    ):
+        value = session.get(key)
+        writer.writerow([key, "" if value is None else value])
+    for key in ("decoded", "missed", "shortfall"):
+        writer.writerow([key, _num(counts.get(key)) if counts else ""])
+    cameras: dict[str, Any] = session.get("cameras") or {}
+    if cameras:
+        writer.writerow([])
+        writer.writerow(["camera", "passes_seen", "passes_decoded", "misses"])
+        for camera, r in cameras.items():
+            writer.writerow(
+                [camera, r["passes_seen"], r["passes_decoded"], r["misses"]]
+            )
+    manifest: dict[str, Any] | None = session.get("manifest")
+    if manifest:
+        writer.writerow([])
+        writer.writerow(["payload", "status"])
+        for payload in manifest.get("matched", []):
+            writer.writerow([payload, "matched"])
+        for payload in manifest.get("missing", []):
+            writer.writerow([payload, "missing"])
+        for payload in manifest.get("unexpected", []):
+            writer.writerow([payload, "unexpected"])
+    return out.getvalue()

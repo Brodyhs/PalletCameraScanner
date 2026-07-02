@@ -389,12 +389,130 @@ async function refreshReport() {
     : "";
 }
 
+/* -- operator session ---------------------------------------------------- */
+
+/* The close attempt that just demanded an acknowledgement, so the note box
+   only appears after the server said requires_ack (the 409 drives the UI). */
+let sessionNeedsAck = false;
+let lastClosedSession = null;
+
+function renderSession(current) {
+  const idle = $("#session-idle");
+  const open = $("#session-open");
+  const last = $("#session-last");
+  if (!current) {
+    idle.hidden = false;
+    open.hidden = true;
+    sessionNeedsAck = false;
+    if (lastClosedSession) {
+      last.hidden = false;
+      const s = lastClosedSession;
+      const c = s.counts || {};
+      $("#session-last-summary").textContent =
+        `session ${s.id} closed: expected ${s.expected_count} · ` +
+        `decoded ${fmt(c.decoded)} · missed ${fmt(c.missed)} · ` +
+        `shortfall ${fmt(c.shortfall)}` +
+        (s.ack_note ? ` · note: ${s.ack_note}` : "");
+      $("#session-last-csv").href = `/report/session/${s.id}.csv`;
+    }
+    return;
+  }
+  idle.hidden = true;
+  open.hidden = false;
+  last.hidden = true;
+  $("#session-started").textContent = (current.started_utc || "").slice(0, 19);
+  const c = current.counts || {};
+  const grid = $("#session-tiles");
+  grid.replaceChildren();
+  grid.appendChild(tile("expected", fmt(current.expected_count)));
+  grid.appendChild(tile("decoded", fmt(c.decoded)));
+  grid.appendChild(tile("missed", fmt(c.missed), c.missed ? "warn" : ""));
+  grid.appendChild(
+    tile("shortfall", fmt(c.shortfall), c.shortfall ? "warn" : "")
+  );
+  $("#session-ack").hidden = !sessionNeedsAck;
+}
+
+async function refreshSession() {
+  const active = document.activeElement;
+  if (active && active.id === "session-ack-note") {
+    return; /* operator is typing the acknowledgement: don't rebuild */
+  }
+  const out = await getJSON("/api/session");
+  renderSession(out.session);
+}
+
+async function startSession() {
+  const status = $("#session-status");
+  const expected = parseInt($("#session-expected").value, 10);
+  if (!Number.isInteger(expected) || expected < 1) {
+    status.textContent = "expected pallets must be a whole number ≥ 1";
+    return;
+  }
+  try {
+    const resp = await fetch("/api/session/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_count: expected }),
+    });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      status.textContent = `start failed: ${detail || resp.status}`;
+      return;
+    }
+    status.textContent = "";
+    lastClosedSession = null;
+    renderSession(await resp.json());
+  } catch (err) {
+    status.textContent = `start failed: ${err.message}`;
+  }
+}
+
+async function closeSession() {
+  const status = $("#session-status");
+  const note = $("#session-ack-note").value.trim();
+  try {
+    const resp = await fetch("/api/session/close", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ack_note: sessionNeedsAck && note ? note : null }),
+    });
+    if (resp.status === 409) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      if (detail && detail.requires_ack) {
+        /* The server's counts drive the prompt: show the note box. */
+        sessionNeedsAck = true;
+        $("#session-ack").hidden = false;
+        status.textContent =
+          `expected ${detail.expected}, accounted ` +
+          `${detail.decoded + detail.missed} (decoded ${detail.decoded}, ` +
+          `missed ${detail.missed}) — add a note to close anyway`;
+        return;
+      }
+      status.textContent = `close failed: ${detail || 409}`;
+      return;
+    }
+    if (!resp.ok) {
+      status.textContent = `close failed: ${resp.status}`;
+      return;
+    }
+    lastClosedSession = await resp.json();
+    sessionNeedsAck = false;
+    $("#session-ack-note").value = "";
+    status.textContent = "";
+    renderSession(null);
+  } catch (err) {
+    status.textContent = `close failed: ${err.message}`;
+  }
+}
+
 /* -- poll loop ------------------------------------------------------------ */
 
 async function tick() {
   try {
     renderStats(await getJSON("/stats.json"));
     renderEvents(await getJSON("/api/events?limit=50"));
+    await refreshSession();
   } catch (err) {
     $("#generated").textContent = `connection lost (${err.message})`;
   }
@@ -413,4 +531,6 @@ async function loop() {
 
 $("#manifest-upload").onclick = uploadManifest;
 $("#unreviewed-only").onchange = () => refreshMisses().catch(() => {});
+$("#session-start").onclick = startSession;
+$("#session-close").onclick = closeSession;
 loop();

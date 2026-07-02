@@ -14,6 +14,7 @@ beyond the host.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -25,20 +26,25 @@ from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from palletscan.config import WebConfig
-from palletscan.reporting.ab import ABReport, compute_ab_report
+from palletscan.reporting.ab import ABReport, compute_ab_report, rows_in_window
 from palletscan.reporting.manifest import (
     ManifestReconciliation,
     parse_manifest,
     reconcile,
 )
-from palletscan.reporting.render import ab_csv, ab_markdown, reconciliation_csv
+from palletscan.reporting.render import (
+    ab_csv,
+    ab_markdown,
+    reconciliation_csv,
+    session_csv,
+)
 from palletscan.types import now_iso
 from palletscan.web.preview import LivePreview
-from palletscan.web.store import ReadStore
+from palletscan.web.store import ReadStore, SessionConflict
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +75,14 @@ class DashboardContext:
 class ReviewRequest(BaseModel):
     reviewed: bool = True
     note: str | None = None
+
+
+class SessionStartRequest(BaseModel):
+    expected_count: int = Field(ge=1)
+
+
+class SessionCloseRequest(BaseModel):
+    ack_note: str | None = None
 
 
 def _mjpeg_part(data: bytes) -> bytes:
@@ -286,6 +300,156 @@ def create_app(ctx: DashboardContext) -> FastAPI:
             media_type="text/csv; charset=utf-8",
             headers={
                 "Content-Disposition": 'attachment; filename="ab-report.csv"'
+            },
+        )
+
+    # -- operator sessions -------------------------------------------------------
+
+    def _session_counts(
+        started_utc: str, closed_utc: str | None
+    ) -> tuple[dict[str, Any], ABReport]:
+        """Business-level counts for a session window: cross-camera-deduped
+        passes/misses (one pallet seen by both arms counts once). The window
+        end is the close stamp, or now for a live view of an open session."""
+        report = _ab_report(started_utc, closed_utc)
+        return (
+            {
+                "decoded": report.business_passes,
+                "missed": report.business_misses,
+            },
+            report,
+        )
+
+    def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
+        """A session enriched for the API: closed sessions carry their
+        persisted summary; open sessions get live counts computed now."""
+        payload = {
+            k: session[k]
+            for k in (
+                "id",
+                "expected_count",
+                "started_utc",
+                "closed_utc",
+                "status",
+                "ack_note",
+            )
+        }
+        if session["status"] == "closed" and isinstance(
+            session.get("summary"), dict
+        ):
+            payload.update(session["summary"])
+            return payload
+        counts, report = _session_counts(session["started_utc"], None)
+        counts["shortfall"] = session["expected_count"] - (
+            counts["decoded"] + counts["missed"]
+        )
+        payload["counts"] = counts
+        payload["cameras"] = {
+            cam: r.to_dict() for cam, r in report.cameras.items()
+        }
+        return payload
+
+    def _session_summary(
+        session: dict[str, Any], closed_utc: str
+    ) -> dict[str, Any]:
+        """The final reconciliation persisted at close: business counts,
+        per-camera detail, and payload-level manifest matching (windowed to
+        the session) when a manifest is loaded."""
+        counts, report = _session_counts(session["started_utc"], closed_utc)
+        counts["shortfall"] = session["expected_count"] - (
+            counts["decoded"] + counts["missed"]
+        )
+        summary: dict[str, Any] = {
+            "counts": counts,
+            "cameras": {cam: r.to_dict() for cam, r in report.cameras.items()},
+            "manifest": None,
+        }
+        expected_payloads = ctx.store.manifest_payloads()
+        if expected_payloads:
+            scanned = [
+                p["payload"]
+                for p in rows_in_window(
+                    ctx.store.pass_and_miss_rows()[0],
+                    window_from=session["started_utc"],
+                    window_to=closed_utc,
+                )
+            ]
+            summary["manifest"] = reconcile(expected_payloads, scanned).to_dict()
+        return summary
+
+    @app.post("/api/session/start", status_code=201)
+    async def session_start(body: SessionStartRequest) -> dict[str, Any]:
+        try:
+            session = await run_in_threadpool(
+                ctx.store.open_session, body.expected_count
+            )
+        except SessionConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _session_payload(session)
+
+    @app.get("/api/session")
+    def session_current() -> dict[str, Any]:
+        session = ctx.store.current_session()
+        return {
+            "session": None if session is None else _session_payload(session)
+        }
+
+    @app.post("/api/session/close")
+    async def session_close(
+        body: SessionCloseRequest | None = None,
+    ) -> dict[str, Any]:
+        session = ctx.store.current_session()
+        if session is None:
+            raise HTTPException(409, "no open session")
+        # One close stamp: the persisted window end and closed_utc must be
+        # the same instant or the stored counts drift from the stored window.
+        closed_utc = now_iso()
+        summary = _session_summary(session, closed_utc)
+        counts = summary["counts"]
+        ack_note = (body.ack_note or "").strip() if body is not None else ""
+        if counts["shortfall"] != 0 and not ack_note:
+            # Acknowledge-to-close: a mismatched count needs an operator
+            # note explaining it before the session may close.
+            raise HTTPException(
+                409,
+                detail={
+                    "requires_ack": True,
+                    "expected": session["expected_count"],
+                    **counts,
+                },
+            )
+        try:
+            closed = await run_in_threadpool(
+                lambda: ctx.store.close_session(
+                    session["id"],
+                    closed_utc=closed_utc,
+                    ack_note=ack_note or None,
+                    summary_json=json.dumps(summary),
+                )
+            )
+        except SessionConflict as exc:  # double close from a second tab
+            raise HTTPException(409, str(exc)) from exc
+        return _session_payload(closed)
+
+    @app.get("/api/session/history")
+    def session_history(limit: int = 20) -> list[dict[str, Any]]:
+        rows = ctx.store.session_history(
+            limit=max(1, min(limit, _MAX_EVENT_LIMIT))
+        )
+        return [_session_payload(s) for s in rows]
+
+    @app.get("/report/session/{session_id}.csv")
+    def report_session_csv(session_id: int) -> PlainTextResponse:
+        session = ctx.store.session(session_id)
+        if session is None:
+            raise HTTPException(404, f"no session {session_id}")
+        return PlainTextResponse(
+            session_csv(_session_payload(session)),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="session-{session_id}.csv"'
+                )
             },
         )
 

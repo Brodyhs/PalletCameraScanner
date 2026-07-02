@@ -13,6 +13,37 @@
     <span id="generated" class="muted"></span>
   </header>
   <main>
+    <section id="session-section">
+      <h2>Session</h2>
+      <div id="session-idle">
+        <label>expected pallets
+          <input type="number" id="session-expected" min="1" step="1" value="1">
+        </label>
+        <button id="session-start">Start session</button>
+      </div>
+      <div id="session-open" hidden>
+        <div id="session-tiles" class="tile-grid"></div>
+        <p class="muted">
+          started <span id="session-started"></span>
+          · counts are business-level (cross-camera deduped)
+          · a miss appears ~2 s after its segment closes (post-roll)
+        </p>
+        <div id="session-ack" hidden>
+          <p class="warn-text">
+            Counts don't add up — close requires an acknowledgement note:
+          </p>
+          <input type="text" id="session-ack-note"
+                 placeholder="e.g. only 5 objects presented">
+        </div>
+        <button id="session-close">Close out</button>
+      </div>
+      <div id="session-last" hidden>
+        <p id="session-last-summary"></p>
+        <p class="downloads"><a id="session-last-csv" download>session report (csv)</a></p>
+      </div>
+      <p><span id="session-status" class="muted"></span></p>
+    </section>
+
     <section id="live-section">
       <h2>Live</h2>
       <div id="live-grid" class="live-grid"></div>

@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS miss_reviews (
 CREATE TABLE IF NOT EXISTS manifest (
     payload TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    expected_count INTEGER NOT NULL,
+    started_utc TEXT NOT NULL,
+    closed_utc TEXT,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+    ack_note TEXT,
+    summary_json TEXT
+);
 """
 
 
@@ -39,6 +48,11 @@ class ReadStoreError(RuntimeError):
 
     Raised from construction so the CLI can map it to a clean message +
     exit 2 instead of a raw sqlite3 traceback."""
+
+
+class SessionConflict(RuntimeError):
+    """Session lifecycle violation (a second open, or closing when none
+    is open) — the app layer maps this to HTTP 409."""
 
 
 class ReadStore:
@@ -186,3 +200,110 @@ class ReadStore:
         passes = [self._detail(r) for r in rows if r["kind"] == "pass"]
         misses = [self._detail(r) for r in rows if r["kind"] == "miss"]
         return passes, misses
+
+    # -- operator sessions -----------------------------------------------------
+
+    @staticmethod
+    def _session_row(row: sqlite3.Row) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "id": row["id"],
+            "expected_count": row["expected_count"],
+            "started_utc": row["started_utc"],
+            "closed_utc": row["closed_utc"],
+            "status": row["status"],
+            "ack_note": row["ack_note"],
+        }
+        if row["summary_json"] is not None:
+            try:
+                d["summary"] = json.loads(row["summary_json"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                log.warning(
+                    "ReadStore: corrupt summary_json on session %s", row["id"]
+                )
+                d["summary"] = {"corrupt": True}
+        else:
+            d["summary"] = None
+        return d
+
+    def open_session(self, expected_count: int) -> dict[str, Any]:
+        """Open a session; exactly one may be open at a time.
+
+        ``BEGIN IMMEDIATE`` serializes the check-then-insert against a
+        concurrent start (two operator tabs) — the loser sees the winner's
+        open row and gets :class:`SessionConflict`."""
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                open_row = conn.execute(
+                    "SELECT id FROM sessions WHERE status = 'open' LIMIT 1"
+                ).fetchone()
+                if open_row is not None:
+                    raise SessionConflict(
+                        f"session {open_row['id']} is already open — close "
+                        "it before starting a new one"
+                    )
+                cur = conn.execute(
+                    "INSERT INTO sessions (expected_count, started_utc, status)"
+                    " VALUES (?, ?, 'open')",
+                    (expected_count, now_iso()),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (cur.lastrowid,)
+                ).fetchone()
+            except BaseException:
+                conn.rollback()
+                raise
+        return self._session_row(row)
+
+    def current_session(self) -> dict[str, Any] | None:
+        """The open session, or None (newest wins if a legacy DB ever holds
+        more than one — new opens are serialized against that)."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE status = 'open' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else self._session_row(row)
+
+    def close_session(
+        self,
+        session_id: int,
+        *,
+        closed_utc: str,
+        ack_note: str | None,
+        summary_json: str,
+    ) -> dict[str, Any]:
+        """Close an open session; raises :class:`SessionConflict` if it is
+        not open (double close from a second tab)."""
+        with closing(self._connect()) as conn:
+            with conn:
+                cur = conn.execute(
+                    "UPDATE sessions SET status = 'closed', closed_utc = ?, "
+                    "ack_note = ?, summary_json = ? "
+                    "WHERE id = ? AND status = 'open'",
+                    (closed_utc, ack_note, summary_json, session_id),
+                )
+                if cur.rowcount == 0:
+                    raise SessionConflict(
+                        f"session {session_id} is not open"
+                    )
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return self._session_row(row)
+
+    def session(self, session_id: int) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return None if row is None else self._session_row(row)
+
+    def session_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Newest-first sessions (open first if one exists)."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._session_row(r) for r in rows]

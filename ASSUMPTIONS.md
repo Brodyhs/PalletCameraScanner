@@ -996,3 +996,24 @@ and where the review corrected it.
     guess would skew the very parity these knobs exist to protect.
     Station values for the A/B flip: open_s 0.055 / quiet_s 0.145
     (matching today's 3/8 frames at 55 fps).
+
+74. **Operator sessions are a reporting window, not a pipeline gate
+    (2026-07-02).** The session interface (dashboard Session panel; POST
+    /api/session/start with expected_count, GET /api/session, POST
+    /api/session/close, /report/session/<id>.csv) never starts or stops
+    scanning - it timestamps a window over the always-running pipeline
+    and reconciles inside it. Counts are BUSINESS-level via the existing
+    A/B window filter (compute_ab_report business passes/misses:
+    cross-camera deduped, so one pallet seen by both arms counts once);
+    shortfall = expected - (decoded + missed), negative when more objects
+    passed than declared. Close is acknowledge-to-close (owner choice):
+    a nonzero shortfall returns 409 requires_ack and the session only
+    closes with an operator note, stored on the row. The close stamp is
+    taken ONCE and used for both closed_utc and the persisted summary
+    window so they cannot drift. Sessions live in a web-owned `sessions`
+    table in the events SQLite DB (same pattern as miss_reviews/manifest),
+    with BEGIN IMMEDIATE serializing concurrent starts (one open session
+    at a time). When a manifest is loaded, the closeout summary stores the
+    payload-level reconcile() windowed to the session (rows_in_window) -
+    a whole-DB reconciliation would hide a payload scanned before the
+    session began.

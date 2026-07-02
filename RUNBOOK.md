@@ -368,6 +368,34 @@ carry real wall stamps that a live `run` started within the dedup window
 (~1 minute) could pick up as restart-dedup seeds and suppress a genuine
 first sighting. Tools get their own `--data-dir`.
 
+## 10.5 Operator sessions (dashboard)
+
+A **session** is how a counted batch of pallets is run: tell the system how
+many to expect, let them pass, close out with a reconciliation. Sessions are
+a reporting window over the always-running pipeline — starting or closing
+one never starts/stops scanning.
+
+1. Open the dashboard (`--dashboard`, or `palletscan dashboard` afterwards).
+2. **Session** panel → enter the expected pallet count → **Start session**.
+3. Watch the live tiles while pallets pass: *expected / decoded / missed /
+   shortfall*. Counts are business-level (a pallet seen by both cameras
+   counts once). A miss shows up ~2 s after its motion segment closes
+   (post-roll evidence harvest).
+4. **Close out**. If `decoded + missed == expected`, the session closes
+   and shows the final reconciliation. If not, the close is refused until
+   you type an acknowledgement note (e.g. "two pallets rerouted") —
+   the note is stored with the session.
+5. Download the per-session CSV from the panel (or
+   `/report/session/<id>.csv`); history is at `/api/session/history`.
+
+If a manifest CSV is loaded (dashboard upload or `report.manifest_path`),
+the closeout also stores payload-level matched/missing/unexpected for
+exactly the session's time window.
+
+Sessions live in the events database (`data\palletscan.db`), so
+`palletscan dashboard --config ... --data-dir ...` can review a finished
+trial's sessions offline.
+
 ## 11. Demo
 
 Full system on synthetic input — no hardware, opens the dashboard in a

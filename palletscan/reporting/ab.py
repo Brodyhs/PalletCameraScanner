@@ -111,6 +111,20 @@ def _in_window(
     return not (t_to is not None and stamp > t_to)
 
 
+def rows_in_window(
+    rows: list[dict[str, Any]],
+    window_from: str | None = None,
+    window_to: str | None = None,
+) -> list[dict[str, Any]]:
+    """The rows whose ``wall_time_iso`` falls inside the window — the same
+    filter :func:`compute_ab_report` applies, exposed for session summaries
+    (payload-level manifest reconciliation over a session's time box)."""
+    t_from, t_to = _parse_window(window_from), _parse_window(window_to)
+    return [
+        r for r in rows if _in_window(r.get("wall_time_iso"), t_from, t_to)
+    ]
+
+
 def compute_ab_report(
     pass_rows: list[dict[str, Any]],
     miss_rows: list[dict[str, Any]],
